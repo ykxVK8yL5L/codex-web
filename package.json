@@ -1,0 +1,16 @@
+{
+  "name": "codex-web-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --parallel --filter @codex-web/web --filter @codex-web/api dev",
+    "dev:web": "pnpm --filter @codex-web/web dev",
+    "dev:api": "pnpm --filter @codex-web/api dev",
+    "check": "pnpm --recursive check",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "packageManager": "pnpm@9.15.0",
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}

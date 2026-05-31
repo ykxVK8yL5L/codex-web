@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Codex Web Prototype</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="rail">
+        <div class="logo">C</div>
+        <button class="rail-button active" title="任务" aria-label="任务" data-page="taskPage">
+          <span>⌁</span><em>任务</em>
+        </button>
+        <button class="rail-button" title="搜索" aria-label="搜索" data-page="searchPage">
+          <span>⌕</span><em>搜索</em>
+        </button>
+        <button class="rail-button" title="全局文件管理" aria-label="全局文件管理" data-page="filesPage">
+          <span>▦</span><em>文件</em>
+        </button>
+        <button class="rail-button" title="全局终端" aria-label="全局终端" data-page="terminalPage">
+          <span>⌨</span><em>终端</em>
+        </button>
+        <button class="rail-button" title="项目" aria-label="项目" data-page="projectsPage">
+          <span>⇄</span><em>项目</em>
+        </button>
+        <button class="rail-button" title="扩展" aria-label="扩展" data-page="extensionsPage">
+          <span>⌘</span><em>扩展</em>
+        </button>
+        <button class="rail-button" title="自动化" aria-label="自动化" data-page="automationsPage">
+          <span>◷</span><em>自动</em>
+        </button>
+        <button class="rail-button" title="Provider" aria-label="Provider" data-page="providersPage">
+          <span>◈</span><em>模型</em>
+        </button>
+        <button class="rail-button auth-button" title="登录与鉴权" aria-label="登录与鉴权" data-page="authPage">
+          <span>●</span><em>鉴权</em>
+        </button>
+      </aside>
+
+      <aside class="threads">
+        <header class="threads-header">
+          <div>
+            <div class="product">Codex++</div>
+            <div class="subtle">1.0.8 · Docker Web</div>
+          </div>
+          <button class="new-task">+</button>
+        </header>
+
+        <section class="project-card">
+          <div class="project-row">
+            <span class="live-dot"></span>
+            <strong>runner-dev</strong>
+            <span class="pill">Docker</span>
+          </div>
+          <div class="subtle">/workspace · main · 8 changed</div>
+        </section>
+
+        <div class="thread-group-title">Today</div>
+        <button class="thread active">
+          <span class="thread-title">容器化启动流程</span>
+          <span class="thread-meta">running · 3 min</span>
+        </button>
+        <button class="thread">
+          <span class="thread-title">Provider 兼容层设计</span>
+          <span class="thread-meta">done · 18 min</span>
+        </button>
+        <button class="thread">
+          <span class="thread-title">终端会话恢复</span>
+          <span class="thread-meta">paused · 1 h</span>
+        </button>
+
+        <div class="thread-group-title">Providers</div>
+        <select id="providerSelect" class="provider-select">
+          <option>OpenAI · gpt-5-codex</option>
+          <option>Compatible · qwen-coder</option>
+          <option>Compatible · deepseek-coder</option>
+          <option>Local · ollama/coder</option>
+        </select>
+        <div id="providerHint" class="provider-hint">Responses API · tools enabled</div>
+      </aside>
+
+      <main class="conversation app-page active" id="taskPage">
+        <header class="task-header">
+          <div>
+            <div class="crumb">我想做一个 codex 的 web app 要怎样实现？</div>
+            <h1>容器化启动流程</h1>
+          </div>
+          <div class="header-actions">
+            <span class="app-health"><span></span>Codex++ 1.0.8</span>
+            <button class="ghost-button">Stop</button>
+            <button class="dark-button">Apply diff</button>
+          </div>
+        </header>
+
+        <section class="status-strip">
+          <div class="status-item">
+            <span class="status-label">Status</span>
+            <strong class="green">Running</strong>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Model</span>
+            <strong id="modelLabel">gpt-5-codex</strong>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Sandbox</span>
+            <strong>Docker</strong>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Branch</span>
+            <strong>main</strong>
+          </div>
+        </section>
+
+        <section class="timeline" id="timeline">
+          <article class="codex-result-card">
+            <div class="result-icon">◎</div>
+            <div>
+              <strong>网页预览</strong>
+              <div class="subtle">网站 · http://127.0.0.1:5173</div>
+            </div>
+            <button class="ghost-button">打开方式⌄</button>
+          </article>
+
+          <article class="codex-files-card">
+            <div class="files-card-head">
+              <div class="result-icon">⊞</div>
+              <div>
+                <strong>已编辑 5 个文件</strong>
+                <div><span class="additions">+1,062</span> <span class="deletions">-0</span></div>
+              </div>
+              <div class="review-actions">
+                <button class="ghost-button">撤销 ↶</button>
+                <button class="ghost-button">审核</button>
+              </div>
+            </div>
+            <div class="edited-file">
+              <span>docker/runner.Dockerfile</span>
+              <span><b class="additions">+128</b> <b class="deletions">-0</b>⌄</span>
+            </div>
+            <div class="edited-file">
+              <span>apps/api/src/docker/session.ts</span>
+              <span><b class="additions">+241</b> <b class="deletions">-0</b>⌄</span>
+            </div>
+            <div class="edited-file">
+              <span>apps/web/src/panels/Terminal.tsx</span>
+              <span><b class="additions">+162</b> <b class="deletions">-0</b>⌄</span>
+            </div>
+          </article>
+
+          <article class="bubble user">
+            <div class="avatar">你</div>
+            <div class="bubble-body">把项目启动流程容器化，并保留终端兜底。</div>
+          </article>
+
+          <article class="bubble assistant">
+            <div class="avatar">C</div>
+            <div class="bubble-body">
+              <p>我会先检查项目结构和 scripts，再补一个 runner 镜像、Hono 容器会话接口，以及前端终端入口。</p>
+              <div class="plan-card">
+                <div class="plan-row done"><span></span>检查 package scripts 和工作区结构</div>
+                <div class="plan-row active"><span></span>生成 Docker runner 和 session API</div>
+                <div class="plan-row"><span></span>连接终端兜底面板</div>
+                <div class="plan-row"><span></span>汇总 diff 和验证命令</div>
+              </div>
+            </div>
+          </article>
+
+          <article class="tool-call">
+            <button class="tool-head" data-target="tool-files">
+              <span>▸</span>
+              <strong>Read files</strong>
+              <em>package.json, apps/api/src/index.ts</em>
+            </button>
+            <pre id="tool-files" class="tool-output collapsed">package scripts found:
+dev       pnpm --parallel dev
+check     pnpm --recursive check
+api       tsx apps/api/src/index.ts</pre>
+          </article>
+
+          <article class="tool-call">
+            <button class="tool-head" data-target="tool-shell">
+              <span>▸</span>
+              <strong>Run command</strong>
+              <em>pnpm check</em>
+            </button>
+            <pre id="tool-shell" class="tool-output collapsed">api: typecheck passed
+web: lint passed
+runner: Dockerfile syntax ok</pre>
+          </article>
+
+          <article class="bubble assistant">
+            <div class="avatar">C</div>
+            <div class="bubble-body">
+              <p>我准备应用 5 个文件的改动。主要变化是把 Docker 会话抽象放在 API 层，前端只订阅任务事件和终端流。</p>
+              <div class="changed-files">
+                <span>+ docker/runner.Dockerfile</span>
+                <span>+ apps/api/src/docker/session.ts</span>
+                <span>~ apps/web/src/panels/Terminal.tsx</span>
+              </div>
+            </div>
+          </article>
+        </section>
+
+        <form class="composer" id="composer">
+          <textarea id="prompt" rows="2" placeholder="继续给 Codex 指令，或让它解释当前 diff"></textarea>
+          <div class="composer-actions">
+            <button type="button" class="plus-button">+</button>
+            <label class="check"><input type="checkbox" checked /> 允许终端</label>
+            <select class="permission-select">
+              <option>默认权限</option>
+              <option>只读</option>
+              <option>可编辑</option>
+              <option>可运行命令</option>
+            </select>
+            <button type="button" class="ghost-button" id="runCheck">Run check</button>
+            <select class="model-select">
+              <option>OpenAI using 8api · 5.5 中</option>
+              <option>Compatible · qwen-coder</option>
+              <option>Local · ollama/coder</option>
+            </select>
+            <button type="submit" class="dark-button">Send</button>
+          </div>
+        </form>
+      </main>
+
+      <main class="files-page app-page" id="filesPage">
+        <header class="page-header">
+          <div>
+            <div class="crumb">Global / Files</div>
+            <h1>全局文件管理</h1>
+          </div>
+          <div class="header-actions">
+            <button class="ghost-button">上传</button>
+            <button class="dark-button">挂载到 Workspace</button>
+          </div>
+        </header>
+        <section class="file-workbench">
+          <aside class="mounts-pane">
+            <div class="pane-title">挂载点</div>
+            <button class="mount active"><strong>Workspaces</strong><span>/workspaces</span></button>
+            <button class="mount"><strong>Shared</strong><span>/shared</span></button>
+            <button class="mount"><strong>Provider Configs</strong><span>/config/providers</span></button>
+            <button class="mount"><strong>Runner Cache</strong><span>/var/codex/cache</span></button>
+          </aside>
+          <section class="file-list-pane">
+            <div class="file-toolbar">
+              <strong>/workspaces/agent-workbench</strong>
+              <button class="ghost-button">新建</button>
+            </div>
+            <button class="file-list-item active"><span>◇ apps/api/src/docker/session.ts</span><em>12 KB · A</em></button>
+            <button class="file-list-item"><span>◇ apps/api/src/index.ts</span><em>3 KB · M</em></button>
+            <button class="file-list-item"><span>◇ apps/web/src/panels/Terminal.tsx</span><em>9 KB · M</em></button>
+            <button class="file-list-item"><span>▣ docker/runner.Dockerfile</span><em>2 KB · A</em></button>
+            <button class="file-list-item"><span>◇ packages/protocol/provider.ts</span><em>4 KB</em></button>
+          </section>
+          <section class="file-preview-pane">
+            <div class="file-preview-head">
+              <div>
+                <strong>apps/api/src/docker/session.ts</strong>
+                <div class="subtle">全局文件视图 · 可挂载到任意 workspace</div>
+              </div>
+              <button class="ghost-button">保存</button>
+            </div>
+            <pre class="large-code">import Docker from "dockerode";
+
+const docker = new Docker();
+
+export async function ensureWorkspaceContainer(id: string) {
+  const name = `codex-web-${id}`;
+  const container = await docker.createContainer({
+    Image: "codex-web-runner:latest",
+    name,
+    Tty: true,
+    WorkingDir: "/workspace",
+  });
+
+  await container.start();
+  return container;
+}</pre>
+          </section>
+        </section>
+      </main>
+
+      <main class="terminal-page app-page" id="terminalPage">
+        <header class="page-header">
+          <div>
+            <div class="crumb">Global / Terminal</div>
+            <h1>全局终端</h1>
+          </div>
+          <div class="header-actions">
+            <button class="ghost-button">新建会话</button>
+            <button class="dark-button">连接 Shell</button>
+          </div>
+        </header>
+        <section class="terminal-workbench">
+          <aside class="session-pane">
+            <div class="pane-title">会话</div>
+            <button class="session active"><strong>host shell</strong><span>platform · active</span></button>
+            <button class="session"><strong>runner-dev</strong><span>workspace · bash</span></button>
+            <button class="session"><strong>runner-preview</strong><span>preview · logs</span></button>
+            <button class="session"><strong>docker events</strong><span>daemon · stream</span></button>
+          </aside>
+          <section class="shell-pane">
+            <div class="shell-head">
+              <div>
+                <strong>host shell</strong>
+                <div class="subtle">平台级兜底入口 · 可查看 Docker、日志、运行状态</div>
+              </div>
+              <div class="shell-tabs">
+                <button class="mini-tab active">shell</button>
+                <button class="mini-tab">logs</button>
+                <button class="mini-tab">metrics</button>
+              </div>
+            </div>
+            <pre class="large-terminal">$ codexctl status
+workspaces: 4 running, 2 paused
+providers: openai, 8api, qwen-compatible
+
+$ docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+runner-dev          Up 23 minutes       0.0.0.0:5173->5173/tcp
+runner-preview      Up 8 minutes        0.0.0.0:8787->8787/tcp
+
+$ tail -f /var/log/codex-web/api.log
+[15:44:02] task started workspace=agent-workbench provider=openai
+[15:44:04] stream connected session=runner-dev
+
+$ </pre>
+          </section>
+        </section>
+      </main>
+
+      <main class="placeholder-page app-page" id="searchPage">
+        <header class="page-header">
+          <div>
+            <div class="crumb">Global / Search</div>
+            <h1>全局搜索</h1>
+          </div>
+        </header>
+        <section class="search-page-body">
+          <input class="search-input" value="docker runner provider" aria-label="搜索" />
+          <div class="search-results">
+            <div><strong>任务</strong><span>容器化启动流程 · running</span></div>
+            <div><strong>文件</strong><span>apps/api/src/docker/session.ts</span></div>
+            <div><strong>日志</strong><span>stream connected session=runner-dev</span></div>
+          </div>
+        </section>
+      </main>
+
+      <main class="placeholder-page app-page" id="projectsPage">
+        <header class="page-header">
+          <div>
+            <div class="crumb">Global / Projects</div>
+            <h1>项目</h1>
+          </div>
+          <button class="dark-button">导入 Git 仓库</button>
+        </header>
+        <section class="placeholder-grid">
+          <div class="provider-card"><strong>agent-workbench</strong><span>runner-dev · 8 changed</span></div>
+          <div class="provider-card"><strong>codex-web-api</strong><span>paused · Hono service</span></div>
+          <div class="provider-card"><strong>shared-prompts</strong><span>global library</span></div>
+        </section>
+      </main>
+
+      <main class="placeholder-page app-page" id="extensionsPage">
+        <header class="page-header">
+          <div>
+            <div class="crumb">Global / Extensions</div>
+            <h1>扩展</h1>
+          </div>
+          <button class="dark-button">安装扩展</button>
+        </header>
+        <section class="placeholder-grid">
+          <div class="provider-card"><strong>Plugins</strong><span>Codex CLI plugin 管理</span></div>
+          <div class="provider-card"><strong>Skills</strong><span>本地 skill 工作流与说明</span></div>
+          <div class="provider-card"><strong>MCP Servers</strong><span>外部工具服务器连接</span></div>
+        </section>
+      </main>
+
+      <main class="placeholder-page app-page" id="automationsPage">
+        <header class="page-header">
+          <div>
+            <div class="crumb">Global / Automations</div>
+            <h1>自动化</h1>
+          </div>
+          <button class="dark-button">新建自动化</button>
+        </header>
+        <section class="settings-list">
+          <div><strong>每日依赖检查</strong><span>每天 09:00 · 运行 pnpm check 并生成任务</span></div>
+          <div><strong>PR 监控</strong><span>每 30 分钟 · 检查失败 CI 并提示修复</span></div>
+          <div><strong>Runner 清理</strong><span>每周 · 清理停止容器和旧缓存</span></div>
+        </section>
+      </main>
+
+      <main class="placeholder-page app-page" id="providersPage">
+        <header class="page-header">
+          <div>
+            <div class="crumb">Global / Providers</div>
+            <h1>模型与 API</h1>
+          </div>
+        </header>
+        <section class="placeholder-grid">
+          <div class="provider-card"><strong>OpenAI</strong><span>Responses API · gpt-5-codex</span></div>
+          <div class="provider-card"><strong>8api Compatible</strong><span>Chat Completions · 5.5 中</span></div>
+          <div class="provider-card"><strong>Local</strong><span>Ollama · terminal only</span></div>
+        </section>
+      </main>
+
+      <main class="placeholder-page app-page" id="authPage">
+        <header class="page-header">
+          <div>
+            <div class="crumb">Global / Auth</div>
+            <h1>登录</h1>
+          </div>
+        </header>
+        <section class="auth-card">
+          <div>
+            <strong>Access Token</strong>
+            <input class="search-input" placeholder="请输入访问令牌" />
+          </div>
+          <div>
+            <strong>OTP</strong>
+            <input class="search-input" placeholder="6 位验证码" />
+          </div>
+          <button class="dark-button">验证并进入</button>
+        </section>
+      </main>
+
+      <aside class="context-panel" id="contextPanel">
+        <header class="context-header">
+          <div>
+            <strong>Workspace</strong>
+            <div class="subtle">container://runner-dev</div>
+          </div>
+          <button class="ghost-icon">↻</button>
+        </header>
+
+        <div class="context-tabs">
+          <button class="context-tab active" data-panel="diffPanel">Diff</button>
+          <button class="context-tab" data-panel="filesPanel">Files</button>
+          <button class="context-tab" data-panel="terminalPanel">Terminal</button>
+        </div>
+
+        <section id="diffPanel" class="panel active">
+          <div class="diff-summary">
+            <strong>5 files changed</strong>
+            <span class="pill warm">preview</span>
+          </div>
+          <div class="diff-file">
+            <div class="diff-file-head">docker/runner.Dockerfile</div>
+            <pre><span class="plus">+ FROM debian:bookworm-slim</span>
+<span class="plus">+ RUN apt-get update && apt-get install -y git curl ripgrep</span>
+<span class="plus">+ USER coder</span></pre>
+          </div>
+          <div class="diff-file">
+            <div class="diff-file-head">apps/api/src/docker/session.ts</div>
+            <pre><span class="plus">+ export async function ensureWorkspaceContainer(id: string)</span>
+<span class="plus">+ export async function execInContainer(id: string, cmd: string)</span></pre>
+          </div>
+        </section>
+
+        <section id="filesPanel" class="panel">
+          <div class="file-row active">◇ apps/api/src/index.ts <span>M</span></div>
+          <div class="file-row">◇ apps/api/src/docker/session.ts <span>A</span></div>
+          <div class="file-row">◇ apps/web/src/App.tsx <span>M</span></div>
+          <div class="file-row">▣ docker/runner.Dockerfile <span>A</span></div>
+          <div class="mini-editor">
+            <div class="mini-title">apps/api/src/index.ts</div>
+            <pre>const app = new Hono();
+app.route("/api/workspaces", workspaceRoutes);
+app.route("/api/providers", providerRoutes);</pre>
+          </div>
+        </section>
+
+        <section id="terminalPanel" class="panel">
+          <pre class="terminal" id="terminal">$ docker exec -it runner-dev bash
+coder@runner:/workspace$ pnpm check
+api: typecheck passed
+web: lint passed
+coder@runner:/workspace$ </pre>
+        </section>
+      </aside>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
