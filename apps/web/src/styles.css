@@ -3336,6 +3336,7 @@ button:disabled {
 .notification-center-item {
   display: grid;
   gap: 4px;
+  min-width: 0;
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -3343,6 +3344,15 @@ button:disabled {
   padding: 10px;
   color: var(--ink);
   text-align: left;
+}
+
+.notification-center-item strong,
+.notification-center-item span,
+.notification-center-item small {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .notification-center-item.unread {
@@ -3625,14 +3635,25 @@ button:disabled {
 .notification-delivery-details {
   display: flex;
   flex-wrap: wrap;
+  min-width: 0;
   gap: 6px 12px;
   color: var(--muted);
   font-size: 0.82rem;
   line-height: 1.35;
 }
 
+.notification-delivery-item strong,
+.notification-delivery-item span,
+.notification-delivery-details span {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 .notification-delivery-item .result-error {
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   word-break: break-word;
 }
 
