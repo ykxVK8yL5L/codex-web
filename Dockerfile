@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS build
+FROM node:24-bookworm-slim AS build
 
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
@@ -18,11 +18,12 @@ COPY packages/protocol/package.json packages/protocol/package.json
 
 RUN pnpm install --frozen-lockfile
 
-COPY . .
+COPY apps ./apps
+COPY packages ./packages
 
 RUN pnpm --filter @codex-web/web build
 
-FROM node:22-bookworm-slim AS runtime
+FROM node:24-bookworm-slim AS runtime
 
 ENV NODE_ENV=production
 ENV PNPM_HOME="/pnpm"

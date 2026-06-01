@@ -10217,7 +10217,9 @@ function codexProviderConfigArgs(provider?: ProviderRecord) {
     "-c", `model_providers.${providerKey}.requires_openai_auth=true`,
     "-c", `model_providers.${providerKey}.wire_api=${tomlString("responses")}`,
   ];
-  if (provider.apiKey && !usesLocalProxy) {
+  if (usesLocalProxy) {
+    args.push("-c", `model_providers.${providerKey}.experimental_bearer_token=${tomlString("codex-web-proxy")}`);
+  } else if (provider.apiKey) {
     args.push("-c", `model_providers.${providerKey}.experimental_bearer_token=${tomlString(provider.apiKey)}`);
   }
   return args;
@@ -10871,9 +10873,9 @@ app.post("/provider-proxy/:providerId/:proxyToken/v1/responses", async (c) => {
   if (!body) return c.json({ error: "invalid_responses_request" }, 400);
   incrementProviderProxyConcurrency(provider.id);
   try {
-    return provider.kind === "openai-compatible-chat"
+    return await (provider.kind === "openai-compatible-chat"
       ? proxyResponsesToChatCompletions(provider, body)
-      : proxyResponsesToResponses(provider, body);
+      : proxyResponsesToResponses(provider, body));
   } catch (error) {
     return c.json({ error: error instanceof Error ? error.message : "provider_proxy_failed" }, 502);
   } finally {
