@@ -106,6 +106,16 @@ import type {
   ExtensionDetail,
   ExtensionSummary,
   ExecutionContextSummary,
+  EnvironmentOverview,
+  EnvironmentBulkActionRequest,
+  EnvironmentPackageDetailResponse,
+  EnvironmentPackageManagerOption,
+  EnvironmentPackageRecord,
+  EnvironmentRestoreRun,
+  EnvironmentToolRecord,
+  EnvironmentToolRegistryItem,
+  EnvironmentToolProbe,
+  EnvironmentToolVersionItem,
   FileContentResponse,
   FileArchiveRequest,
   FileArchivePreviewResponse,
@@ -200,6 +210,7 @@ import type {
   UpdateAutomationRequest,
   UpdateAccessTokenRequest,
   UpdateCodexRuntimeSettingsRequest,
+  InstallEnvironmentToolRequest,
   UpdateRoomDecisionRequest,
   UpdateRoomHandoffRequest,
   UpdateSystemBackupSettingsRequest,
@@ -11419,7 +11430,7 @@ function SettingsPage({
   const [cleanupArchivedApprovalDays, setCleanupArchivedApprovalDays] = useState(30);
   const [cleanupApprovalAuditLog, setCleanupApprovalAuditLog] = useState(false);
   const [taskHealth, setTaskHealth] = useState<TaskHealthResponse | null>(null);
-  const [settingsTab, setSettingsTab] = useState<"account" | "runtime" | "network" | "notifications" | "maintenance" | "storage" | "backup">("account");
+  const [settingsTab, setSettingsTab] = useState<"account" | "runtime" | "environment" | "network" | "notifications" | "maintenance" | "storage" | "backup">("account");
   const [busy, setBusy] = useState("");
   const [codexRuntime, setCodexRuntime] = useState<CodexRuntimeSettings | null>(null);
   const [sandboxMode, setSandboxMode] = useState<CodexSandboxMode>("workspace-write");
@@ -11436,6 +11447,33 @@ function SettingsPage({
     minNewChars: "12000",
   });
   const [rateLimitSettings, setRateLimitSettings] = useState<RateLimitSettings | null>(null);
+  const [environmentOverview, setEnvironmentOverview] = useState<EnvironmentOverview | null>(null);
+  const [environmentRegistry, setEnvironmentRegistry] = useState<EnvironmentToolRegistryItem[]>([]);
+  const [environmentToolQuery, setEnvironmentToolQuery] = useState("");
+  const [environmentToolPickerOpen, setEnvironmentToolPickerOpen] = useState(false);
+  const [environmentVersions, setEnvironmentVersions] = useState<EnvironmentToolVersionItem[]>([]);
+  const [environmentVersionHistory, setEnvironmentVersionHistory] = useState<EnvironmentToolVersionItem[]>([]);
+  const [environmentVersionPickerOpen, setEnvironmentVersionPickerOpen] = useState(false);
+  const [environmentVersionError, setEnvironmentVersionError] = useState("");
+  const [environmentShowVersionHistory, setEnvironmentShowVersionHistory] = useState(false);
+  const [environmentProbe, setEnvironmentProbe] = useState<EnvironmentToolProbe | null>(null);
+  const [environmentPackagePanel, setEnvironmentPackagePanel] = useState<EnvironmentPackageDetailResponse | null>(null);
+  const [environmentPackageForm, setEnvironmentPackageForm] = useState({
+    manager: "",
+    packageName: "",
+    versionSpec: "",
+    notes: "",
+  });
+  const [environmentPackageProbe, setEnvironmentPackageProbe] = useState<{ installed: boolean; manager: string; packageName: string } | null>(null);
+  const [environmentInstallForm, setEnvironmentInstallForm] = useState({
+    tool: "",
+    version: "",
+    scope: "global",
+    autoRestore: true,
+    notes: "",
+  });
+  const environmentReconcileItems = environmentOverview?.reconcile ?? [];
+  const environmentProjectUsageItems = environmentOverview?.projectUsage ?? [];
   const [rateLimitEnabled, setRateLimitEnabled] = useState(true);
   const [rateLimitForm, setRateLimitForm] = useState({
     globalPerMinute: "300",
@@ -11607,6 +11645,20 @@ function SettingsPage({
         if (!settings) return;
         setBackupSettings(settings);
         setBackupIgnoreRules(settings.ignorePatterns.join("\n"));
+      })
+      .catch(() => undefined);
+    fetch("/api/settings/environment", { headers })
+      .then((response) => response.ok ? response.json() : null)
+      .then((overview: EnvironmentOverview | null) => {
+        if (!overview) return;
+        setEnvironmentOverview(overview);
+      })
+      .catch(() => undefined);
+    fetch("/api/settings/environment/tool-registry", { headers })
+      .then((response) => response.ok ? response.json() : null)
+      .then((result: { items: EnvironmentToolRegistryItem[] } | null) => {
+        if (!result) return;
+        setEnvironmentRegistry(result.items);
       })
       .catch(() => undefined);
     void loadNotifications();
@@ -12927,6 +12979,368 @@ function SettingsPage({
     }
   }
 
+  async function scanEnvironment() {
+    setBusy("environment-scan");
+    try {
+      const response = await fetch("/api/settings/environment/scan", {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) throw new Error("environment_scan_failed");
+      setEnvironmentOverview((await response.json()) as EnvironmentOverview);
+      notify(t("settings.environmentScanSuccess"), "success");
+    } catch {
+      notify(t("settings.environmentScanFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function installEnvironmentTool(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy("environment-install");
+    try {
+      const body: InstallEnvironmentToolRequest = {
+        tool: environmentInstallForm.tool,
+        version: environmentInstallForm.version,
+        scope: environmentInstallForm.scope as InstallEnvironmentToolRequest["scope"],
+        autoRestore: environmentInstallForm.autoRestore,
+        notes: environmentInstallForm.notes,
+      };
+      const endpoint = environmentProbe?.installed ? "/api/settings/environment/tools/register" : "/api/settings/environment/tools/install";
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          ...body,
+          detectedVersion: environmentProbe?.detectedVersion ?? null,
+          source: environmentProbe?.installed ? "system" : undefined,
+        }),
+      });
+      const result = await response.json().catch(() => null) as EnvironmentOverview | { error?: string; detail?: string; overview?: EnvironmentOverview } | null;
+      if (!response.ok) {
+        if (result && "overview" in result && result.overview) setEnvironmentOverview(result.overview);
+        notify(t("settings.environmentInstallFailed"), "error");
+        return;
+      }
+      setEnvironmentOverview(result as EnvironmentOverview);
+      notify((environmentProbe?.installed ? t("settings.environmentRecordSuccess") : t("settings.environmentInstallSuccess")).replace("{tool}", environmentInstallForm.tool), "success");
+    } catch {
+      notify(t("settings.environmentInstallFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function deleteEnvironmentToolRecord(tool: EnvironmentToolRecord) {
+    const confirmed = await dialog.confirm({
+      title: t("settings.environmentToolDeleteConfirm"),
+      message: `${tool.tool} ${tool.requestedVersion}\n${t("settings.environmentToolDeleteHint")}`,
+      confirmLabel: t("action.delete"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy(`environment-tool-delete:${tool.id}`);
+    try {
+      const response = await fetch(`/api/settings/environment/tools/${tool.id}`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) throw new Error("environment_tool_delete_failed");
+      setEnvironmentOverview((await response.json()) as EnvironmentOverview);
+      notify(t("settings.environmentToolDeleted"), "success");
+    } catch {
+      notify(t("settings.environmentToolDeleteFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function uninstallEnvironmentTool(tool: EnvironmentToolRecord) {
+    if (tool.source !== "mise") return;
+    const confirmed = await dialog.confirm({
+      title: t("settings.environmentToolUninstallConfirm"),
+      message: `${tool.tool} ${tool.requestedVersion}\n${t("settings.environmentToolUninstallHint")}`,
+      confirmLabel: t("settings.environmentToolUninstall"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy(`environment-tool-uninstall:${tool.id}`);
+    try {
+      const response = await fetch(`/api/settings/environment/tools/${tool.id}/uninstall`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      const result = await response.json().catch(() => null) as EnvironmentOverview | { error?: string; overview?: EnvironmentOverview } | null;
+      if (!response.ok) {
+        if (result && "overview" in result && result.overview) setEnvironmentOverview(result.overview);
+        notify(t("settings.environmentToolUninstallFailed"), "error");
+        return;
+      }
+      setEnvironmentOverview(result as EnvironmentOverview);
+      notify(t("settings.environmentToolUninstalled"), "success");
+    } catch {
+      notify(t("settings.environmentToolUninstallFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function setEnvironmentToolDefault(tool: EnvironmentToolRecord) {
+    setBusy(`environment-tool-default:${tool.id}`);
+    try {
+      const response = await fetch(`/api/settings/environment/tools/${tool.id}/set-default`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      const result = await response.json().catch(() => null) as EnvironmentOverview | { overview?: EnvironmentOverview } | null;
+      if (!response.ok) {
+        if (result && "overview" in result && result.overview) setEnvironmentOverview(result.overview);
+        notify(t("settings.environmentToolSetDefaultFailed"), "error");
+        return;
+      }
+      setEnvironmentOverview(result as EnvironmentOverview);
+      notify(t("settings.environmentToolSetDefaultSuccess").replace("{tool}", `${tool.tool}@${tool.requestedVersion}`), "success");
+    } catch {
+      notify(t("settings.environmentToolSetDefaultFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function openEnvironmentPackagePanel(tool: EnvironmentToolRecord) {
+    setBusy(`environment-packages:${tool.id}`);
+    try {
+      const response = await fetch(`/api/settings/environment/tools/${tool.id}/packages`, {
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) throw new Error("environment_packages_failed");
+      const detail = (await response.json()) as EnvironmentPackageDetailResponse;
+      setEnvironmentPackagePanel(detail);
+      setEnvironmentPackageForm({
+        manager: "",
+        packageName: "",
+        versionSpec: "",
+        notes: "",
+      });
+      setEnvironmentPackageProbe(null);
+    } catch {
+      notify(t("settings.environmentPackagesLoadFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  const selectedEnvironmentPackageManager = environmentPackagePanel?.managers.find((manager) => manager.id === environmentPackageForm.manager) ?? null;
+  const normalizedEnvironmentPackageName = environmentPackageForm.packageName.trim().toLowerCase();
+  const environmentPackageAlreadyTracked = environmentPackagePanel?.packages.some((pkg) => pkg.manager === environmentPackageForm.manager && pkg.packageName.trim().toLowerCase() === normalizedEnvironmentPackageName) ?? false;
+  const environmentPackageNeedsManualCleanup = (pkg: EnvironmentPackageRecord) => pkg.manager === "go-install" || pkg.manager === "shards";
+
+  async function runEnvironmentBulkAction(input: EnvironmentBulkActionRequest) {
+    setBusy(`environment-bulk:${input.action}`);
+    try {
+      const response = await fetch("/api/settings/environment/bulk", {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify(input),
+      });
+      const result = await response.json().catch(() => null) as EnvironmentOverview | { overview?: EnvironmentOverview } | null;
+      if (!response.ok) {
+        if (result && "overview" in result && result.overview) setEnvironmentOverview(result.overview);
+        notify(t("settings.environmentPackagesLoadFailed"), "error");
+        return;
+      }
+      setEnvironmentOverview(result as EnvironmentOverview);
+      if (environmentPackagePanel && input.toolRecordId === environmentPackagePanel.toolRecord.id) {
+        await openEnvironmentPackagePanel(environmentPackagePanel.toolRecord);
+      }
+    } catch {
+      notify(t("settings.environmentPackagesLoadFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function installEnvironmentPackage(event: React.FormEvent) {
+    event.preventDefault();
+    if (!environmentPackagePanel) return;
+    setBusy("environment-package-install");
+    try {
+      const response = await fetch("/api/settings/environment/packages/install", {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          toolRecordId: environmentPackagePanel.toolRecord.id,
+          manager: environmentPackageForm.manager,
+          packageName: environmentPackageForm.packageName,
+          versionSpec: environmentPackageForm.versionSpec,
+          notes: environmentPackageForm.notes,
+        }),
+      });
+      const result = await response.json().catch(() => null) as EnvironmentOverview | { overview?: EnvironmentOverview } | null;
+      if (!response.ok) {
+        if (result && "overview" in result && result.overview) setEnvironmentOverview(result.overview);
+        notify(t("settings.environmentPackageInstallFailed"), "error");
+        return;
+      }
+      const overview = result as EnvironmentOverview;
+      setEnvironmentOverview(overview);
+      await openEnvironmentPackagePanel(environmentPackagePanel.toolRecord);
+      setEnvironmentPackageProbe(null);
+      notify(t("settings.environmentPackageInstalled").replace("{name}", environmentPackageForm.packageName), "success");
+    } catch {
+      notify(t("settings.environmentPackageInstallFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function uninstallEnvironmentPackage(pkg: EnvironmentPackageRecord) {
+    const confirmed = await dialog.confirm({
+      title: t("settings.environmentPackageUninstallConfirm"),
+      message: `${pkg.packageName}\n${t("settings.environmentPackageUninstallHint")}`,
+      confirmLabel: t("settings.environmentPackageUninstall"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy(`environment-package-delete:${pkg.id}`);
+    try {
+      const response = await fetch(`/api/settings/environment/packages/${pkg.id}`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ manager: pkg.manager }),
+      });
+      const result = await response.json().catch(() => null) as EnvironmentOverview | { overview?: EnvironmentOverview } | null;
+      if (!response.ok) {
+        if (result && "overview" in result && result.overview) setEnvironmentOverview(result.overview);
+        notify(t("settings.environmentPackageUninstallFailed"), "error");
+        return;
+      }
+      setEnvironmentOverview(result as EnvironmentOverview);
+      if (environmentPackagePanel) await openEnvironmentPackagePanel(environmentPackagePanel.toolRecord);
+      notify(t("settings.environmentPackageUninstalled").replace("{name}", pkg.packageName), "success");
+    } catch {
+      notify(t("settings.environmentPackageUninstallFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function deleteEnvironmentRestoreRun(run: EnvironmentRestoreRun) {
+    const confirmed = await dialog.confirm({
+      title: t("settings.environmentRestoreDeleteConfirm"),
+      message: run.summary,
+      confirmLabel: t("action.delete"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy(`environment-restore-delete:${run.id}`);
+    try {
+      const response = await fetch(`/api/settings/environment/restore-runs/${run.id}`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) throw new Error("environment_restore_delete_failed");
+      setEnvironmentOverview((await response.json()) as EnvironmentOverview);
+      notify(t("settings.environmentRestoreDeleted"), "success");
+    } catch {
+      notify(t("settings.environmentRestoreDeleteFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function clearEnvironmentRestoreRuns() {
+    const confirmed = await dialog.confirm({
+      title: t("settings.environmentRestoreClearConfirm"),
+      message: t("settings.environmentRestoreClearHint"),
+      confirmLabel: t("settings.environmentRestoreClear"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy("environment-restore-clear");
+    try {
+      const response = await fetch("/api/settings/environment/restore-runs", {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) throw new Error("environment_restore_clear_failed");
+      setEnvironmentOverview((await response.json()) as EnvironmentOverview);
+      notify(t("settings.environmentRestoreCleared"), "success");
+    } catch {
+      notify(t("settings.environmentRestoreDeleteFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function loadEnvironmentRegistry(query = environmentToolQuery) {
+    try {
+      const params = new URLSearchParams();
+      if (query.trim()) params.set("q", query.trim());
+      const response = await fetch(`/api/settings/environment/tool-registry${params.toString() ? `?${params}` : ""}`, {
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) throw new Error("environment_registry_failed");
+      const result = (await response.json()) as { items: EnvironmentToolRegistryItem[]; mise?: EnvironmentOverview["mise"] };
+      setEnvironmentRegistry(result.items);
+      if (result.mise && environmentOverview) {
+        setEnvironmentOverview({ ...environmentOverview, mise: result.mise });
+      }
+    } catch {
+      notify(t("settings.environmentRegistryFailed"), "error");
+    }
+  }
+
+  async function loadEnvironmentVersions(tool = environmentInstallForm.tool) {
+    if (!tool.trim()) {
+      setEnvironmentVersions([]);
+      setEnvironmentVersionHistory([]);
+      setEnvironmentVersionError("");
+      return;
+    }
+    try {
+      const params = new URLSearchParams({ tool: tool.trim() });
+      const response = await fetch(`/api/settings/environment/tool-versions?${params}`, {
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) throw new Error("environment_versions_failed");
+      const result = (await response.json()) as { items: EnvironmentToolVersionItem[]; history?: EnvironmentToolVersionItem[]; error?: string | null; mise?: EnvironmentOverview["mise"] };
+      setEnvironmentVersions(result.items);
+      setEnvironmentVersionHistory(result.history ?? []);
+      setEnvironmentVersionError(result.error ?? "");
+      setEnvironmentShowVersionHistory(false);
+      if (result.mise && environmentOverview) {
+        setEnvironmentOverview({ ...environmentOverview, mise: result.mise });
+      }
+    } catch {
+      setEnvironmentVersions([]);
+      setEnvironmentVersionHistory([]);
+      setEnvironmentVersionError(t("settings.environmentVersionsFailed"));
+    }
+  }
+
+  async function probeEnvironmentTool(tool = environmentInstallForm.tool) {
+    if (!tool.trim()) {
+      setEnvironmentProbe(null);
+      return;
+    }
+    try {
+      const params = new URLSearchParams({ tool: tool.trim() });
+      const response = await fetch(`/api/settings/environment/tool-probe?${params}`, {
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) throw new Error("environment_probe_failed");
+      const result = (await response.json()) as { probe: EnvironmentToolProbe; mise?: EnvironmentOverview["mise"] };
+      setEnvironmentProbe(result.probe);
+      if (result.mise && environmentOverview) {
+        setEnvironmentOverview({ ...environmentOverview, mise: result.mise });
+      }
+    } catch {
+      setEnvironmentProbe(null);
+    }
+  }
+
   const visibleStorageItems = (storageScan?.items ?? [])
     .filter((item) => {
       const query = storageSearch.trim().toLowerCase();
@@ -12942,6 +13356,8 @@ function SettingsPage({
   const allVisibleStorageSelected = visibleStorageIds.length > 0 && visibleStorageIds.every((id) => selectedStorageIds.includes(id));
   const activeStorageItems = storageScan?.items.filter((item) => item.status === "active") ?? [];
   const orphanStorageItems = storageScan?.items.filter((item) => item.status === "orphan") ?? [];
+  const miseStatus = environmentOverview?.mise ?? null;
+  const miseInstalled = miseStatus?.installed === true;
 
   return (
     <main className="management-page">
@@ -12950,6 +13366,7 @@ function SettingsPage({
         <TabsList className="settings-tabs" aria-label={t("page.settings")}>
           <TabsTrigger className="settings-tab" value="account">{t("settings.tabAccount")}</TabsTrigger>
           <TabsTrigger className="settings-tab" value="runtime">{t("settings.tabRuntime")}</TabsTrigger>
+          <TabsTrigger className="settings-tab" value="environment">{t("settings.tabEnvironment")}</TabsTrigger>
           <TabsTrigger className="settings-tab" value="network">{t("settings.tabNetwork")}</TabsTrigger>
           <TabsTrigger className="settings-tab" value="notifications">{t("settings.tabNotifications")}</TabsTrigger>
           <TabsTrigger className="settings-tab" value="maintenance">{t("settings.tabMaintenance")}</TabsTrigger>
@@ -13052,6 +13469,330 @@ function SettingsPage({
             <button className="ghost-button" type="submit" disabled={busy === "session-compaction"}><IconText icon={Save}>{t("action.save")}</IconText></button>
           </div>
           </form>
+        </TabsContent>
+        <TabsContent className="settings-list" value="environment">
+          <section className="settings-feature-panel">
+            <div className="settings-feature-hero environment-hero">
+              <div>
+                <strong>{t("settings.environmentTitle")}</strong>
+                <span>{t("settings.environmentHelp")}</span>
+                <div className={`environment-mise-status ${miseInstalled ? "ok" : "warning"}`}>
+                  <span className={`pill ${miseInstalled ? "" : "warm"}`}>{miseInstalled ? t("settings.environmentMiseReady") : t("settings.environmentMiseMissing")}</span>
+                  <span>
+                    {miseInstalled
+                      ? t("settings.environmentMiseVersion").replace("{version}", miseStatus?.version ?? t("settings.environmentMissingVersion"))
+                      : t("settings.environmentMiseMissingHelp")}
+                  </span>
+                </div>
+              </div>
+              <div className="settings-actions">
+                <button className="ghost-button" type="button" disabled={busy === "environment-scan"} onClick={() => void scanEnvironment()}><IconText icon={RefreshCw}>{t("settings.environmentScan")}</IconText></button>
+              </div>
+            </div>
+            <div className="environment-layout">
+              <form className="provider-card environment-install-card" onSubmit={installEnvironmentTool}>
+                <div className="environment-card-head">
+                  <div>
+                    <strong>{t("settings.environmentInstall")}</strong>
+                    <span>{t("settings.environmentInstallHelp")}</span>
+                  </div>
+                </div>
+                <div className="environment-install-grid">
+                  <label>
+                    <span>{t("settings.environmentToolName")}</span>
+                    <div className="environment-tool-picker">
+                      <input
+                        className="search-input"
+                        value={environmentToolQuery || environmentInstallForm.tool}
+                        onFocus={() => {
+                          setEnvironmentToolPickerOpen(false);
+                        }}
+                        onChange={(event) => {
+                          const value = event.target.value;
+                          setEnvironmentToolQuery(value);
+                          setEnvironmentInstallForm((current) => ({ ...current, tool: value }));
+                          setEnvironmentToolPickerOpen(false);
+                        }}
+                        placeholder={t("settings.environmentToolPlaceholder")}
+                        required
+                      />
+                      <button
+                        className="environment-tool-search"
+                        type="button"
+                        onClick={() => {
+                          setEnvironmentToolPickerOpen(true);
+                          void loadEnvironmentRegistry(environmentToolQuery || environmentInstallForm.tool);
+                        }}
+                      >
+                        {t("settings.environmentSearchTools")}
+                      </button>
+                      {environmentToolPickerOpen && (
+                        <div className="environment-tool-menu">
+                          {environmentRegistry.length ? environmentRegistry.slice(0, 12).map((item) => (
+                            <button
+                              className="environment-tool-option"
+                              type="button"
+                              key={item.name}
+                              onMouseDown={(event) => event.preventDefault()}
+                              onClick={() => {
+                                setEnvironmentInstallForm((current) => ({ ...current, tool: item.name }));
+                                setEnvironmentToolQuery(item.name);
+                                setEnvironmentToolPickerOpen(false);
+                                setEnvironmentVersionPickerOpen(true);
+                                void loadEnvironmentVersions(item.name);
+                                void probeEnvironmentTool(item.name);
+                              }}
+                            >
+                              <strong>{item.name}</strong>
+                              {item.description && <span>{item.description}</span>}
+                            </button>
+                          )) : <div className="environment-tool-empty">{t("settings.environmentRegistryEmpty")}</div>}
+                        </div>
+                      )}
+                    </div>
+                  </label>
+                  <label>
+                    <span>{t("settings.environmentToolVersion")}</span>
+                    <div className="environment-tool-picker">
+                      <input
+                        className="search-input"
+                        value={environmentInstallForm.version}
+                        onFocus={() => {
+                          setEnvironmentVersionPickerOpen(false);
+                        }}
+                        onChange={(event) => setEnvironmentInstallForm((current) => ({ ...current, version: event.target.value }))}
+                        placeholder={t("settings.environmentVersionPlaceholder")}
+                        required
+                      />
+                      <button
+                        className="environment-tool-search"
+                        type="button"
+                        disabled={!environmentInstallForm.tool.trim()}
+                        onClick={() => {
+                          setEnvironmentVersionPickerOpen(true);
+                          void loadEnvironmentVersions();
+                        }}
+                      >
+                        {t("settings.environmentLoadVersions")}
+                      </button>
+                      {environmentVersionPickerOpen && (
+                        <div className="environment-tool-menu">
+                          {environmentVersions.length ? (
+                            <>
+                              {environmentVersions.map((item) => (
+                                <button
+                                  className="environment-tool-option"
+                                  type="button"
+                                  key={item.version}
+                                  onMouseDown={(event) => event.preventDefault()}
+                                  onClick={() => {
+                                    setEnvironmentInstallForm((current) => ({ ...current, version: item.version }));
+                                    setEnvironmentVersionPickerOpen(false);
+                                  }}
+                                >
+                                  <strong>{item.version}</strong>
+                                  {item.recommended && <span>{t("settings.environmentRecommendedVersion")}</span>}
+                                </button>
+                              ))}
+                              {Boolean(environmentVersionHistory.length) && (
+                                <>
+                                  <button
+                                    className="environment-tool-more"
+                                    type="button"
+                                    onMouseDown={(event) => event.preventDefault()}
+                                    onClick={() => setEnvironmentShowVersionHistory((current) => !current)}
+                                  >
+                                    {environmentShowVersionHistory ? t("settings.environmentHideHistory") : t("settings.environmentShowHistory")}
+                                  </button>
+                                  {environmentShowVersionHistory && environmentVersionHistory.map((item) => (
+                                    <button
+                                      className="environment-tool-option"
+                                      type="button"
+                                      key={`history-${item.version}`}
+                                      onMouseDown={(event) => event.preventDefault()}
+                                      onClick={() => {
+                                        setEnvironmentInstallForm((current) => ({ ...current, version: item.version }));
+                                        setEnvironmentVersionPickerOpen(false);
+                                      }}
+                                    >
+                                      <strong>{item.version}</strong>
+                                    </button>
+                                  ))}
+                                </>
+                              )}
+                            </>
+                          ) : <div className="environment-tool-empty">{environmentVersionError || t("settings.environmentVersionEmpty")}</div>}
+                        </div>
+                      )}
+                    </div>
+                  </label>
+                  <label>
+                    <span>{t("settings.environmentScope")}</span>
+                    <select className="search-input" value={environmentInstallForm.scope} onChange={(event) => setEnvironmentInstallForm((current) => ({ ...current, scope: event.target.value }))}>
+                      <option value="global">{t("settings.environmentScopeGlobal")}</option>
+                      <option value="workspace">{t("settings.environmentScopeWorkspace")}</option>
+                      <option value="room">{t("settings.environmentScopeRoom")}</option>
+                      <option value="session">{t("settings.environmentScopeSession")}</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>{t("settings.environmentNotes")}</span>
+                    <input className="search-input" value={environmentInstallForm.notes} onChange={(event) => setEnvironmentInstallForm((current) => ({ ...current, notes: event.target.value }))} placeholder={t("settings.environmentNotesPlaceholder")} />
+                  </label>
+                </div>
+                {environmentProbe?.tool === environmentInstallForm.tool && (
+                  <div className={`environment-detected-status ${environmentProbe.installed ? "ok" : "warning"}`}>
+                    <span className={`pill ${environmentProbe.installed ? "" : "warm"}`}>
+                      {environmentProbe.installed ? t("settings.environmentDetectedInstalled") : t("settings.environmentDetectedMissing")}
+                    </span>
+                    <span>
+                      {environmentProbe.installed
+                        ? t("settings.environmentDetectedVersion").replace("{version}", environmentProbe.detectedVersion ?? t("settings.environmentMissingVersion"))
+                        : t("settings.environmentDetectedMissingHelp")}
+                    </span>
+                  </div>
+                )}
+                <label className="checkbox-row environment-inline-toggle">
+                  <input type="checkbox" checked={environmentInstallForm.autoRestore} onChange={(event) => setEnvironmentInstallForm((current) => ({ ...current, autoRestore: event.target.checked }))} />
+                  <span>{t("settings.environmentAutoRestore")}</span>
+                </label>
+                <div className="settings-actions environment-actions">
+                  <button className="ghost-button" type="submit" disabled={busy === "environment-install"}>
+                    <IconText icon={busy === "environment-install" ? RefreshCw : Plus}>
+                      {busy === "environment-install"
+                        ? (environmentProbe?.installed ? t("settings.environmentRecording") : t("settings.environmentInstalling"))
+                        : (environmentProbe?.installed ? t("settings.environmentRecord") : t("settings.environmentInstall"))}
+                    </IconText>
+                  </button>
+                </div>
+              </form>
+              <div className="environment-summary-grid">
+                <section className="provider-card environment-summary-card">
+                  <div className="environment-card-head">
+                    <div>
+                      <strong>{t("settings.environmentReconcileTitle")}</strong>
+                      <span>{t("settings.environmentReconcileHelp")}</span>
+                    </div>
+                    <span className="pill">{environmentReconcileItems.length}</span>
+                  </div>
+                  {!environmentReconcileItems.length && <div className="empty-state">{t("settings.environmentEmptyReconcile")}</div>}
+                  {Boolean(environmentReconcileItems.length) && (
+                    <div className="environment-list">
+                      {environmentReconcileItems.map((item) => (
+                        <article className="environment-item" key={item.id}>
+                          <div className="environment-item-main">
+                            <div className="environment-item-head">
+                              <strong>{item.title}</strong>
+                              <span className="pill warm">{item.status}</span>
+                            </div>
+                            <span>{item.detail}</span>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                  )}
+                </section>
+                <section className="provider-card environment-summary-card">
+                  <div className="environment-card-head">
+                    <div>
+                      <strong>{t("settings.environmentTrackedTools")}</strong>
+                      <span>{t("settings.environmentTrackedToolsHelp")}</span>
+                    </div>
+                    <span className="pill">{environmentOverview?.tools.length ?? 0}</span>
+                  </div>
+                  {!environmentOverview?.tools.length && <div className="empty-state">{t("settings.environmentEmpty")}</div>}
+                  {Boolean(environmentOverview?.tools.length) && (
+                    <div className="environment-list">
+                      {environmentOverview?.tools.map((tool) => (
+                        <article className="environment-item" key={tool.id}>
+                          <div className="environment-item-main">
+                            <div className="environment-item-head">
+                              <strong>{tool.tool}</strong>
+                              <div className="provider-card-actions">
+                                {tool.isGlobalDefault && <span className="pill">{t("settings.environmentGlobalDefault")}</span>}
+                                <span className={`pill ${tool.status === "installed" ? "" : "warm"}`}>{tool.status}</span>
+                              </div>
+                            </div>
+                            <span>{tool.requestedVersion} · {tool.detectedVersion ?? t("settings.environmentMissingVersion")}</span>
+                            <span>{tool.scope} · {tool.source} · {tool.autoRestore ? t("settings.environmentAutoRestoreOn") : t("settings.environmentAutoRestoreOff")}</span>
+                            {tool.notes && <span>{tool.notes}</span>}
+                          </div>
+                          <div className="storage-actions">
+                            {!tool.isGlobalDefault && (
+                              <button className="ghost-button icon-only" type="button" disabled={busy === `environment-tool-default:${tool.id}`} title={t("settings.environmentSetGlobalDefault")} aria-label={t("settings.environmentSetGlobalDefault")} onClick={() => void setEnvironmentToolDefault(tool)}><IconText icon={Check}>{t("settings.environmentSetGlobalDefault")}</IconText></button>
+                            )}
+                            <button className="ghost-button icon-only" type="button" disabled={busy === `environment-packages:${tool.id}`} title={t("settings.environmentPackageManage")} aria-label={t("settings.environmentPackageManage")} onClick={() => void openEnvironmentPackagePanel(tool)}><IconText icon={Boxes}>{t("settings.environmentPackageManage")}</IconText></button>
+                            {tool.source === "mise" && (
+                              <button className="ghost-button danger-button icon-only" type="button" disabled={busy === `environment-tool-uninstall:${tool.id}`} title={t("settings.environmentToolUninstall")} aria-label={t("settings.environmentToolUninstall")} onClick={() => void uninstallEnvironmentTool(tool)}><IconText icon={RotateCcw}>{t("settings.environmentToolUninstall")}</IconText></button>
+                            )}
+                            <button className="ghost-button danger-button icon-only" type="button" disabled={busy === `environment-tool-delete:${tool.id}`} title={t("action.delete")} aria-label={t("action.delete")} onClick={() => void deleteEnvironmentToolRecord(tool)}><IconText icon={Trash2}>{t("action.delete")}</IconText></button>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                  )}
+                </section>
+                <section className="provider-card environment-summary-card">
+                  <div className="environment-card-head">
+                    <div>
+                      <strong>{t("settings.environmentProjectUsageTitle")}</strong>
+                      <span>{t("settings.environmentProjectUsageHelp")}</span>
+                    </div>
+                    <span className="pill">{environmentProjectUsageItems.length}</span>
+                  </div>
+                  {!environmentProjectUsageItems.length && <div className="empty-state">{t("settings.environmentEmptyProjectUsage")}</div>}
+                  {Boolean(environmentProjectUsageItems.length) && (
+                    <div className="environment-list">
+                      {environmentProjectUsageItems.map((item) => (
+                        <article className="environment-item" key={item.projectId}>
+                          <div className="environment-item-main">
+                            <div className="environment-item-head">
+                              <strong>{item.projectName}</strong>
+                              <span className="pill">{item.matchedTools.join(", ")}</span>
+                            </div>
+                            <span>{item.workspacePath}</span>
+                            <span>{item.detectedFiles.join(" · ")}</span>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                  )}
+                </section>
+                <section className="provider-card environment-summary-card">
+                  <div className="environment-card-head">
+                    <div>
+                      <strong>{t("settings.environmentRestoreHistory")}</strong>
+                      <span>{t("settings.environmentRestoreHistoryHelp")}</span>
+                    </div>
+                    <div className="provider-card-actions">
+                      <span className="pill">{environmentOverview?.restoreRuns.length ?? 0}</span>
+                      <button className="ghost-button danger-button" type="button" disabled={busy === "environment-bulk:cleanup_stale_records"} onClick={() => void runEnvironmentBulkAction({ action: "cleanup_stale_records" })}>{t("settings.environmentBulkCleanupStale")}</button>
+                      <button className="ghost-button danger-button" type="button" disabled={busy === "environment-restore-clear" || !(environmentOverview?.restoreRuns.length ?? 0)} onClick={() => void clearEnvironmentRestoreRuns()}>{t("settings.environmentRestoreClear")}</button>
+                    </div>
+                  </div>
+                  {!environmentOverview?.restoreRuns.length && <div className="empty-state">{t("settings.environmentRestoreEmpty")}</div>}
+                  {Boolean(environmentOverview?.restoreRuns.length) && (
+                    <div className="environment-list">
+                      {environmentOverview?.restoreRuns.map((run) => (
+                        <article className="environment-item" key={run.id}>
+                          <div className="environment-item-main">
+                            <div className="environment-item-head">
+                              <strong>{run.summary}</strong>
+                              <span className={`pill ${run.status === "success" ? "" : "warm"}`}>{run.status}</span>
+                            </div>
+                            <span>{formatShortDate(run.createdAt)}</span>
+                          </div>
+                          <div className="storage-actions">
+                            <button className="ghost-button danger-button icon-only" type="button" disabled={busy === `environment-restore-delete:${run.id}`} title={t("action.delete")} aria-label={t("action.delete")} onClick={() => void deleteEnvironmentRestoreRun(run)}><IconText icon={Trash2}>{t("action.delete")}</IconText></button>
+                          </div>
+                        </article>
+                      ))}
+                    </div>
+                  )}
+                </section>
+              </div>
+            </div>
+          </section>
         </TabsContent>
         <TabsContent className="settings-list" value="network">
           <form className="provider-card" onSubmit={savePreviewAccessSettings}>
@@ -13829,6 +14570,127 @@ function SettingsPage({
                     )}
                   </div>
                 </div>
+              ))}
+            </div>
+          </section>
+        </div>
+      )}
+      {environmentPackagePanel && (
+        <div className="dialog-layer" role="presentation">
+          <button className="dialog-backdrop" type="button" aria-label={t("action.close")} onClick={() => setEnvironmentPackagePanel(null)} />
+          <section className="dialog-card environment-package-dialog" role="dialog" aria-modal="true" aria-label={t("settings.environmentPackageManage")}>
+            <div className="dialog-head">
+              <div>
+                <strong>{t("settings.environmentPackageManage")}</strong>
+                <p>{`${environmentPackagePanel.toolRecord.tool}@${environmentPackagePanel.toolRecord.requestedVersion}`}</p>
+                <p>{t("settings.environmentPackageSupportHint")}</p>
+              </div>
+              <div className="dialog-head-actions">
+                <button className="drawer-close" type="button" aria-label={t("action.close")} onClick={() => setEnvironmentPackagePanel(null)}><X size={16} /></button>
+              </div>
+            </div>
+            <form className="environment-package-form" onSubmit={installEnvironmentPackage}>
+              <label>
+                <span>{t("settings.environmentPackageManager")}</span>
+                <select value={environmentPackageForm.manager} onChange={(event) => {
+                  const manager = event.target.value;
+                  setEnvironmentPackageForm((current) => ({ ...current, manager }));
+                  setEnvironmentPackageProbe(environmentPackagePanel.packages.some((pkg) => pkg.packageName.toLowerCase() === environmentPackageForm.packageName.trim().toLowerCase() && pkg.manager === manager)
+                    ? { installed: true, manager, packageName: environmentPackageForm.packageName.trim() }
+                    : null);
+                }} required>
+                  <option value="">{t("settings.environmentPackageManagerPlaceholder")}</option>
+                  {environmentPackagePanel.managers.map((manager) => (
+                    <option key={manager.id} value={manager.id}>{manager.label}{manager.detectedVersion ? ` · ${manager.detectedVersion} · ${t("settings.environmentPackageManagerRecommended")}` : ""}</option>
+                  ))}
+                </select>
+              </label>
+              {selectedEnvironmentPackageManager && (
+                <div className="environment-package-manager-hint">
+                  <span className="pill">{selectedEnvironmentPackageManager.label}</span>
+                  {selectedEnvironmentPackageManager.detectedVersion && <span className="pill">{`${t("settings.environmentDetectedVersion")} ${selectedEnvironmentPackageManager.detectedVersion}`}</span>}
+                  <span className="subtle">{selectedEnvironmentPackageManager.installCommandExample}</span>
+                </div>
+              )}
+              <label>
+                <span>{t("settings.environmentPackageName")}</span>
+                <input value={environmentPackageForm.packageName} onChange={(event) => {
+                  const value = event.target.value;
+                  setEnvironmentPackageForm((current) => ({ ...current, packageName: value }));
+                  setEnvironmentPackageProbe(environmentPackagePanel.packages.some((pkg) => pkg.packageName.toLowerCase() === value.trim().toLowerCase() && pkg.manager === environmentPackageForm.manager)
+                    ? { installed: true, manager: environmentPackageForm.manager, packageName: value.trim() }
+                    : null);
+                }} placeholder={t("settings.environmentPackageNamePlaceholder")} required />
+              </label>
+              {normalizedEnvironmentPackageName && (
+                <div className="environment-package-inline-state">
+                  {environmentPackageAlreadyTracked
+                    ? <span className="pill">{t("settings.environmentPackageAlreadyTracked")}</span>
+                    : environmentPackageProbe?.installed
+                      ? <span className="pill">{t("settings.environmentPackageDetected")}</span>
+                      : <span className="subtle">{t("settings.environmentPackageWillInstall")}</span>}
+                </div>
+              )}
+              <label>
+                <span>{t("settings.environmentPackageVersion")}</span>
+                <input value={environmentPackageForm.versionSpec} onChange={(event) => setEnvironmentPackageForm((current) => ({ ...current, versionSpec: event.target.value }))} placeholder={t("settings.environmentPackageVersionPlaceholder")} />
+              </label>
+              <label>
+                <span>{t("settings.environmentNotes")}</span>
+                <input value={environmentPackageForm.notes} onChange={(event) => setEnvironmentPackageForm((current) => ({ ...current, notes: event.target.value }))} placeholder={t("settings.environmentNotesPlaceholder")} />
+              </label>
+              <div className="dialog-actions">
+                <button className="ghost-button" type="submit" disabled={busy === "environment-package-install" || !environmentPackageForm.manager}><IconText icon={Plus}>{environmentPackageProbe?.installed ? t("settings.environmentPackageRecord") : t("settings.environmentPackageInstall")}</IconText></button>
+                <button className="ghost-button" type="button" disabled={busy === "environment-bulk:record_detected_packages"} onClick={() => void runEnvironmentBulkAction({ action: "record_detected_packages", toolRecordId: environmentPackagePanel.toolRecord.id })}>{t("settings.environmentBulkRecordDetected")}</button>
+                <button className="ghost-button" type="button" disabled={busy === "environment-bulk:install_missing_packages"} onClick={() => void runEnvironmentBulkAction({ action: "install_missing_packages", toolRecordId: environmentPackagePanel.toolRecord.id })}>{t("settings.environmentBulkInstallMissing")}</button>
+              </div>
+            </form>
+            <div className="environment-package-list">
+              <div className="environment-card-head">
+                <div>
+                  <strong>{t("settings.environmentRestorePreviewTitle")}</strong>
+                  <span>{t("settings.environmentRestorePreviewHelp")}</span>
+                </div>
+              </div>
+              {!environmentPackagePanel.restorePreview.length && <div className="empty-state">{t("settings.environmentPreviewEmpty")}</div>}
+              {environmentPackagePanel.restorePreview.map((item) => (
+                <article className="environment-item" key={item.id}>
+                  <div className="environment-item-main">
+                    <div className="environment-item-head">
+                      <strong>{item.title}</strong>
+                      <span className={`pill ${item.action === "manual" ? "warm" : ""}`}>
+                        {item.action === "install" ? t("settings.environmentActionInstall")
+                          : item.action === "record" ? t("settings.environmentActionRecord")
+                            : item.action === "manual" ? t("settings.environmentActionManual")
+                              : t("settings.environmentActionSkip")}
+                      </span>
+                    </div>
+                    <span>{item.detail}</span>
+                    {item.command && <code>{item.command}</code>}
+                  </div>
+                </article>
+              ))}
+            </div>
+            <div className="environment-package-list">
+              {!environmentPackagePanel.packages.length && <div className="empty-state">{t("settings.environmentPackageEmpty")}</div>}
+              {environmentPackagePanel.packages.map((pkg) => (
+                <article className="environment-item" key={pkg.id}>
+                  <div className="environment-item-main">
+                    <div className="environment-item-head">
+                      <strong>{pkg.packageName}</strong>
+                      <div className="provider-card-actions">
+                        <span className={`pill ${pkg.status === "failed" ? "warm" : ""}`}>{pkg.manager}</span>
+                        <span className="pill">{pkg.persisted ? t("settings.environmentPackageRecorded") : t("settings.environmentPackageDetected")}</span>
+                      </div>
+                    </div>
+                    <span>{pkg.installedVersion ?? pkg.versionSpec ?? t("settings.environmentMissingVersion")}</span>
+                    <span>{pkg.targetLabel}</span>
+                    {pkg.notes && <span>{pkg.notes}</span>}
+                  </div>
+                  <div className="storage-actions">
+                    <button className="ghost-button danger-button icon-only" type="button" disabled={busy === `environment-package-delete:${pkg.id}` || environmentPackageNeedsManualCleanup(pkg)} title={environmentPackageNeedsManualCleanup(pkg) ? t("settings.environmentPackageManualCleanup") : t("settings.environmentPackageUninstall")} aria-label={environmentPackageNeedsManualCleanup(pkg) ? t("settings.environmentPackageManualCleanup") : t("settings.environmentPackageUninstall")} onClick={() => void uninstallEnvironmentPackage(pkg)}><IconText icon={Trash2}>{environmentPackageNeedsManualCleanup(pkg) ? t("settings.environmentPackageManualCleanup") : t("settings.environmentPackageUninstall")}</IconText></button>
+                  </div>
+                </article>
               ))}
             </div>
           </section>

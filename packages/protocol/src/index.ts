@@ -328,6 +328,172 @@ export interface RateLimitSettings {
   updatedAt: string;
 }
 
+export type EnvironmentToolStatus = "installed" | "missing" | "version_mismatch" | "unknown";
+export type EnvironmentToolSource = "mise" | "manual" | "system" | "external";
+export type EnvironmentRecordScope = "global" | "workspace" | "room" | "session";
+
+export interface EnvironmentToolRecord {
+  id: string;
+  tool: string;
+  requestedVersion: string;
+  detectedVersion?: string | null;
+  isGlobalDefault?: boolean;
+  status: EnvironmentToolStatus;
+  source: EnvironmentToolSource;
+  scope: EnvironmentRecordScope;
+  autoRestore: boolean;
+  notes?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EnvironmentPackageRecord {
+  id: string;
+  toolRecordId?: string | null;
+  tool: string;
+  runtimeVersion?: string | null;
+  ecosystem: string;
+  manager: string;
+  packageName: string;
+  versionSpec?: string | null;
+  installedVersion?: string | null;
+  installCommand: string;
+  uninstallCommand?: string | null;
+  targetLabel: string;
+  scope: EnvironmentRecordScope;
+  autoRestore: boolean;
+  persisted: boolean;
+  status?: "installed" | "missing" | "failed";
+  notes?: string | null;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export type EnvironmentReconcileStatus =
+  | "ok"
+  | "missing_runtime"
+  | "runtime_version_mismatch"
+  | "untracked_runtime"
+  | "missing_package"
+  | "package_version_mismatch"
+  | "untracked_package";
+
+export interface EnvironmentReconcileItem {
+  id: string;
+  kind: "tool" | "package";
+  status: EnvironmentReconcileStatus;
+  title: string;
+  detail: string;
+  toolRecordId?: string | null;
+  packageRecordId?: string | null;
+  projectIds?: string[];
+}
+
+export interface EnvironmentProjectUsage {
+  projectId: string;
+  projectName: string;
+  workspacePath: string;
+  matchedTools: string[];
+  detectedFiles: string[];
+}
+
+export interface EnvironmentRestorePreviewItem {
+  id: string;
+  kind: "tool" | "package";
+  action: "install" | "record" | "manual" | "skip";
+  title: string;
+  detail: string;
+  command?: string | null;
+  toolRecordId?: string | null;
+  packageRecordId?: string | null;
+}
+
+export interface EnvironmentBulkActionRequest {
+  action: "record_detected_packages" | "install_missing_packages" | "cleanup_stale_records";
+  toolRecordId?: string;
+  packageIds?: string[];
+}
+
+export interface EnvironmentRestoreRun {
+  id: string;
+  status: "success" | "failed" | "partial";
+  summary: string;
+  createdAt: string;
+}
+
+export interface EnvironmentOverview {
+  tools: EnvironmentToolRecord[];
+  packageRecords: EnvironmentPackageRecord[];
+  restoreRuns: EnvironmentRestoreRun[];
+  reconcile: EnvironmentReconcileItem[];
+  projectUsage: EnvironmentProjectUsage[];
+  mise: {
+    installed: boolean;
+    version?: string | null;
+    warning?: string | null;
+  };
+  updatedAt: string;
+}
+
+export interface InstallEnvironmentToolRequest {
+  tool: string;
+  version: string;
+  scope?: EnvironmentRecordScope;
+  autoRestore?: boolean;
+  notes?: string;
+}
+
+export interface RegisterEnvironmentToolRequest extends InstallEnvironmentToolRequest {
+  detectedVersion?: string | null;
+  source?: EnvironmentToolSource;
+}
+
+export interface EnvironmentToolRegistryItem {
+  name: string;
+  description: string | null;
+  backend: string | null;
+}
+
+export interface EnvironmentToolVersionItem {
+  version: string;
+  recommended?: boolean;
+}
+
+export interface EnvironmentToolProbe {
+  tool: string;
+  detectedVersion: string | null;
+  installed: boolean;
+}
+
+export interface EnvironmentPackageManagerOption {
+  id: string;
+  label: string;
+  installCommandExample: string;
+  uninstallCommandExample: string;
+  supported: boolean;
+  detectedVersion?: string | null;
+}
+
+export interface EnvironmentPackageDetailResponse {
+  toolRecord: EnvironmentToolRecord;
+  packages: EnvironmentPackageRecord[];
+  managers: EnvironmentPackageManagerOption[];
+  restorePreview: EnvironmentRestorePreviewItem[];
+}
+
+export interface InstallEnvironmentPackageRequest {
+  toolRecordId: string;
+  manager: string;
+  packageName: string;
+  versionSpec?: string;
+  notes?: string;
+  autoRestore?: boolean;
+}
+
+export interface UninstallEnvironmentPackageRequest {
+  manager?: string;
+}
+
 export type ApprovalStatus = "pending" | "approved" | "denied";
 export type ApprovalRisk = "low" | "medium" | "high" | "critical";
 export type ApprovalActionType = "codex-runtime-update" | "preview-command-run" | "preview-access" | "project-delete-files" | "room-run-merge" | "project-git-operation";
