@@ -1,5 +1,90 @@
 export type SessionKind = "project" | "scratch";
 export type ConversationType = "codex" | "agent" | "room";
+export type GoalOwnerType = "session" | "agent_session" | "room";
+export type GoalMode = "reference" | "tracked" | "managed" | "orchestrated";
+export type GoalStatus = "active" | "paused" | "completed" | "cancelled" | "archived";
+export type GoalFocusStatus = "active" | "completed" | "cancelled" | "paused";
+export type GoalItemStatus = "planned" | "active" | "blocked" | "completed" | "failed" | "cancelled";
+
+export interface GoalProgress {
+  totalItems: number;
+  activeItems: number;
+  completedItems: number;
+  failedItems: number;
+  blockedItems: number;
+  latestSummary?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface GoalFocusSummary {
+  id: string;
+  goalId: string;
+  text: string;
+  status: GoalFocusStatus;
+  ownerAgentId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string | null;
+  cancelledAt?: string | null;
+}
+
+export interface GoalSummary {
+  id: string;
+  ownerType: GoalOwnerType;
+  ownerId: string;
+  text: string;
+  mode: GoalMode;
+  status: GoalStatus;
+  managerAgentId?: string | null;
+  coordinatorAgentId?: string | null;
+  currentFocus?: GoalFocusSummary | null;
+  progress: GoalProgress;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string | null;
+  cancelledAt?: string | null;
+}
+
+export interface GoalItemSummary {
+  id: string;
+  goalId: string;
+  roomTaskId?: string | null;
+  title: string;
+  description?: string | null;
+  status: GoalItemStatus;
+  assignedAgentId?: string | null;
+  priority: number;
+  dependsOnItemId?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string | null;
+  cancelledAt?: string | null;
+}
+
+export interface GoalEventSummary {
+  id: string;
+  goalId: string;
+  type: string;
+  actorType?: string | null;
+  actorId?: string | null;
+  payload: unknown;
+  createdAt: string;
+}
+
+export type GoalProposalStatus = "pending" | "approved" | "rejected";
+export type GoalProposalKind = "goal_update" | "focus" | "item" | "plan";
+
+export interface GoalProposalSummary {
+  id: string;
+  goalId: string;
+  kind: GoalProposalKind;
+  status: GoalProposalStatus;
+  title: string;
+  payload: unknown;
+  proposedByAgentId?: string | null;
+  createdAt: string;
+  resolvedAt?: string | null;
+}
 
 export interface SessionSummary {
   id: string;
@@ -14,6 +99,7 @@ export interface SessionSummary {
   model?: string | null;
   codexSessionId?: string | null;
   notificationsEnabled?: boolean;
+  goal?: GoalSummary | null;
   status: "running" | "paused" | "done" | "interrupted";
   createdAt?: string;
   updatedAt: string;
@@ -591,11 +677,70 @@ export interface CreateSessionRequest {
   projectId: string | null;
   conversationType?: ConversationType;
   roomId?: string | null;
+  goal?: Omit<CreateGoalRequest, "ownerType" | "ownerId"> | null;
 }
 
 export interface UpdateSessionRequest {
   title?: string;
   notificationsEnabled?: boolean;
+}
+
+export interface CreateGoalRequest {
+  ownerType: GoalOwnerType;
+  ownerId: string;
+  text: string;
+  mode?: GoalMode;
+  managerAgentId?: string | null;
+  coordinatorAgentId?: string | null;
+  focusText?: string | null;
+  focusOwnerAgentId?: string | null;
+}
+
+export interface UpdateGoalRequest {
+  text?: string;
+  mode?: GoalMode;
+  status?: GoalStatus;
+  managerAgentId?: string | null;
+  coordinatorAgentId?: string | null;
+  progressSummary?: string | null;
+}
+
+export interface CreateGoalFocusRequest {
+  text: string;
+  ownerAgentId?: string | null;
+}
+
+export interface UpdateGoalFocusRequest {
+  text?: string;
+  status?: GoalFocusStatus;
+  ownerAgentId?: string | null;
+}
+
+export interface CreateGoalItemRequest {
+  title: string;
+  description?: string | null;
+  status?: GoalItemStatus;
+  assignedAgentId?: string | null;
+  priority?: number;
+  dependsOnItemId?: string | null;
+}
+
+export interface UpdateGoalItemRequest {
+  title?: string;
+  description?: string | null;
+  status?: GoalItemStatus;
+  assignedAgentId?: string | null;
+  priority?: number;
+  dependsOnItemId?: string | null;
+  roomTaskId?: string | null;
+}
+
+export interface GoalDetailResponse {
+  goal: GoalSummary;
+  focuses: GoalFocusSummary[];
+  items: GoalItemSummary[];
+  events: GoalEventSummary[];
+  proposals: GoalProposalSummary[];
 }
 
 export interface CreateCodexTaskRequest {
@@ -640,6 +785,7 @@ export interface QueuedMessage {
   providerId?: string | null;
   model?: string | null;
   replyToMessageId?: string | null;
+  orderIndex: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -656,6 +802,10 @@ export interface UpdateQueuedMessageRequest {
   providerId?: string | null;
   model?: string | null;
   replyToMessageId?: string | null;
+}
+
+export interface ReorderQueuedMessagesRequest {
+  orderedIds: string[];
 }
 
 export interface SessionMessage {
@@ -1299,6 +1449,7 @@ export interface RoomSummary {
   projectId?: string | null;
   status: RoomStatus;
   sharedContext?: string | null;
+  goal?: GoalSummary | null;
   orchestration: RoomOrchestrationSettings;
   createdAt: string;
   updatedAt: string;
@@ -1320,6 +1471,7 @@ export interface CreateRoomRequest {
   circleId?: string | null;
   projectId?: string | null;
   sharedContext?: string | null;
+  goal?: Omit<CreateGoalRequest, "ownerType" | "ownerId"> | null;
 }
 
 export type UpdateRoomRequest = Partial<Pick<CreateRoomRequest, "name" | "sharedContext">> & { status?: RoomStatus; orchestration?: Partial<RoomOrchestrationSettings> };
@@ -1425,6 +1577,7 @@ export interface AgentRunSummary {
   roomId: string;
   agentId: string;
   taskId?: string | null;
+  goalId?: string | null;
   sessionId?: string | null;
   status: AgentRunStatus;
   providerId?: string | null;
@@ -1459,6 +1612,7 @@ export type RoomScheduleStatus = "active" | "paused" | "done";
 export interface RoomTaskSummary {
   id: string;
   roomId: string;
+  goalItemId?: string | null;
   title: string;
   prompt: string;
   assignedAgentId?: string | null;

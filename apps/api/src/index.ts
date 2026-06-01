@@ -117,6 +117,7 @@ import type {
   RateLimitSettings,
   RecoverCodexTaskRequest,
   RenameFileRequest,
+  ReorderQueuedMessagesRequest,
   RevertWorkspaceFileRequest,
   RoomEventSummary,
   RoomArtifactSummary,
@@ -185,8 +186,27 @@ import type {
   WorkspaceChanges,
   WorkspaceGitFileRequest,
   FileMount,
+  CreateGoalFocusRequest,
+  CreateGoalItemRequest,
+  CreateGoalRequest,
+  GoalDetailResponse,
+  GoalEventSummary,
+  GoalFocusStatus,
+  GoalFocusSummary,
+  GoalItemStatus,
+  GoalItemSummary,
+  GoalMode,
+  GoalOwnerType,
+  GoalProposalKind,
+  GoalProposalStatus,
+  GoalProposalSummary,
+  GoalStatus,
+  GoalSummary,
   ResetOtpResponse,
   ConfirmOtpResetRequest,
+  UpdateGoalFocusRequest,
+  UpdateGoalItemRequest,
+  UpdateGoalRequest,
 } from "@codex-web/protocol";
 import { createAuthHelpers, type AuthConfig } from "./auth.js";
 import { archiveExcluder, createZipArchive, createZipArchiveWithEntries, listArchiveIgnoreTemplates, parseStoredZipArchive, previewZipArchive } from "./archive.js";
@@ -418,6 +438,7 @@ function openDatabase() {
       prompt text not null,
       provider_id text,
       model text,
+      order_index integer not null default 0,
       created_at text not null,
       updated_at text not null
     );
@@ -832,6 +853,7 @@ function openDatabase() {
     create table if not exists room_tasks (
       id text primary key,
       room_id text not null,
+      goal_item_id text,
       title text not null,
       prompt text not null default '',
       status text not null,
@@ -845,6 +867,72 @@ function openDatabase() {
       created_at text not null,
       updated_at text not null
     );
+    create table if not exists goals (
+      id text primary key,
+      owner_type text not null,
+      owner_id text not null,
+      text text not null,
+      mode text not null,
+      status text not null,
+      manager_agent_id text,
+      coordinator_agent_id text,
+      progress_summary text,
+      created_at text not null,
+      updated_at text not null,
+      completed_at text,
+      cancelled_at text
+    );
+    create index if not exists goals_owner_updated_idx on goals(owner_type, owner_id, updated_at desc, id desc);
+    create table if not exists goal_events (
+      id text primary key,
+      goal_id text not null,
+      type text not null,
+      actor_type text,
+      actor_id text,
+      payload text not null,
+      created_at text not null
+    );
+    create index if not exists goal_events_goal_created_idx on goal_events(goal_id, created_at desc, id desc);
+    create table if not exists goal_proposals (
+      id text primary key,
+      goal_id text not null,
+      kind text not null,
+      status text not null,
+      title text not null,
+      payload text not null,
+      proposed_by_agent_id text,
+      created_at text not null,
+      resolved_at text
+    );
+    create index if not exists goal_proposals_goal_status_created_idx on goal_proposals(goal_id, status, created_at desc, id desc);
+    create table if not exists goal_focuses (
+      id text primary key,
+      goal_id text not null,
+      text text not null,
+      status text not null,
+      owner_agent_id text,
+      created_at text not null,
+      updated_at text not null,
+      completed_at text,
+      cancelled_at text
+    );
+    create index if not exists goal_focuses_goal_updated_idx on goal_focuses(goal_id, updated_at desc, id desc);
+    create table if not exists goal_items (
+      id text primary key,
+      goal_id text not null,
+      room_task_id text,
+      title text not null,
+      description text,
+      status text not null,
+      assigned_agent_id text,
+      priority integer not null default 0,
+      depends_on_item_id text,
+      created_at text not null,
+      updated_at text not null,
+      completed_at text,
+      cancelled_at text
+    );
+    create index if not exists goal_items_goal_updated_idx on goal_items(goal_id, updated_at desc, id desc);
     create table if not exists room_schedules (
       id text primary key,
       room_id text not null,
@@ -890,6 +978,7 @@ function openDatabase() {
       room_id text not null,
       agent_id text not null,
       task_id text,
+      goal_id text,
       session_id text,
       status text not null,
       provider_id text,
@@ -995,11 +1084,13 @@ function openDatabase() {
   if (!agentColumns.some((column) => column.name === "permission_profile_id")) database.prepare("alter table agents add column permission_profile_id text").run();
   const agentRunColumns = database.prepare("pragma table_info(agent_runs)").all() as Array<{ name: string }>;
   if (!agentRunColumns.some((column) => column.name === "task_id")) database.prepare("alter table agent_runs add column task_id text").run();
+  if (!agentRunColumns.some((column) => column.name === "goal_id")) database.prepare("alter table agent_runs add column goal_id text").run();
   const agentGroupMemberColumns = database.prepare("pragma table_info(agent_group_members)").all() as Array<{ name: string }>;
   if (!agentGroupMemberColumns.some((column) => column.name === "listen_mode")) database.prepare("alter table agent_group_members add column listen_mode text not null default 'passive'").run();
   const roomAgentColumns = database.prepare("pragma table_info(room_agents)").all() as Array<{ name: string }>;
   if (!roomAgentColumns.some((column) => column.name === "listen_mode")) database.prepare("alter table room_agents add column listen_mode text not null default 'passive'").run();
   const roomTaskColumns = database.prepare("pragma table_info(room_tasks)").all() as Array<{ name: string }>;
+  if (!roomTaskColumns.some((column) => column.name === "goal_item_id")) database.prepare("alter table room_tasks add column goal_item_id text").run();
   if (!roomTaskColumns.some((column) => column.name === "prompt")) database.prepare("alter table room_tasks add column prompt text not null default ''").run();
   if (!roomTaskColumns.some((column) => column.name === "priority")) database.prepare("alter table room_tasks add column priority integer not null default 0").run();
   if (!roomTaskColumns.some((column) => column.name === "depends_on_task_id")) database.prepare("alter table room_tasks add column depends_on_task_id text").run();
@@ -1029,6 +1120,17 @@ function openDatabase() {
   if (!messageColumns.some((column) => column.name === "reply_to_message_id")) database.prepare("alter table messages add column reply_to_message_id text").run();
   const queueColumns = database.prepare("pragma table_info(message_queue)").all() as Array<{ name: string }>;
   if (!queueColumns.some((column) => column.name === "reply_to_message_id")) database.prepare("alter table message_queue add column reply_to_message_id text").run();
+  if (!queueColumns.some((column) => column.name === "order_index")) {
+    database.prepare("alter table message_queue add column order_index integer not null default 0").run();
+    const rows = database.prepare("select id, session_id from message_queue order by session_id asc, created_at asc, id asc").all() as Array<{ id: string; session_id: string }>;
+    const updateOrder = database.prepare("update message_queue set order_index = ? where id = ?");
+    const sessionCounts = new Map<string, number>();
+    for (const row of rows) {
+      const next = (sessionCounts.get(row.session_id) ?? 0) + 1;
+      sessionCounts.set(row.session_id, next);
+      updateOrder.run(next * 1000, row.id);
+    }
+  }
   database.exec(`
     create table if not exists message_cards (
       id text primary key,
@@ -1561,7 +1663,7 @@ function sessionFromRow(row: Record<string, unknown>, projects: ProjectSummary[]
   const project = projectId ? projects.find((item) => item.id === projectId) : null;
   const storedWorkspacePath = row.workspace_path ? String(row.workspace_path) : "";
   const directAgent = db.prepare("select agent_id from agent_sessions where session_id = ?").get(String(row.id)) as { agent_id?: string } | undefined;
-  return {
+  const session = {
     id: String(row.id),
     kind: row.kind as SessionSummary["kind"],
     conversationType: conversationType(row.conversation_type),
@@ -1578,6 +1680,7 @@ function sessionFromRow(row: Record<string, unknown>, projects: ProjectSummary[]
     createdAt: row.created_at ? String(row.created_at) : undefined,
     updatedAt: String(row.updated_at),
   };
+  return { ...session, goal: activeGoalForSession(session) };
 }
 
 function projectFromRow(row: Record<string, unknown>): ProjectSummary {
@@ -2051,6 +2154,12 @@ function finishAgentRun(sessionId: string, exitCode: number | null, stopped: boo
   if (run?.task_id) {
     const taskStatus = status === "done" ? "done" : status === "stopped" ? "cancelled" : "failed";
     db.prepare("update room_tasks set status = ?, finished_at = ?, updated_at = ? where id = ?").run(taskStatus, now, now, String(run.task_id));
+    const goalTask = db.prepare("select goal_item_id from room_tasks where id = ?").get(String(run.task_id)) as { goal_item_id?: string | null } | undefined;
+    if (goalTask?.goal_item_id) {
+      const goalItemStatusValue: GoalItemStatus = taskStatus === "done" ? "completed" : taskStatus === "cancelled" ? "cancelled" : "failed";
+      const item = db.prepare("select goal_id from goal_items where id = ?").get(String(goalTask.goal_item_id)) as { goal_id?: string } | undefined;
+      if (item?.goal_id) updateGoalItem(String(item.goal_id), String(goalTask.goal_item_id), { status: goalItemStatusValue }, "system");
+    }
     const roomSession = db.prepare("select session_id from rooms where id = ?").get(String(run.room_id)) as { session_id?: string | null } | undefined;
     const agent = db.prepare("select name from agents where id = ?").get(String(run.agent_id)) as { name?: string } | undefined;
     const task = db.prepare("select payload from room_tasks where id = ?").get(String(run.task_id)) as { payload?: string | null } | undefined;
@@ -2307,10 +2416,13 @@ function startRoomTaskRun(roomId: string, taskId: string) {
   appData.sessions.unshift(session);
   upsertSession(session);
   const runId = `agent-run-${randomUUID()}`;
+  const taskGoal = task.goal_item_id
+    ? db.prepare("select goal_id from goal_items where id = ?").get(String(task.goal_item_id)) as { goal_id?: string } | undefined
+    : null;
   db.prepare(`
-    insert into agent_runs (id, room_id, agent_id, task_id, session_id, status, provider_id, model, workspace_path, started_at)
-    values (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)
-  `).run(runId, roomId, agent.id, taskId, sessionId, provider?.id ?? null, selectedModel, workspace.agentWorkspace, now);
+    insert into agent_runs (id, room_id, agent_id, task_id, goal_id, session_id, status, provider_id, model, workspace_path, started_at)
+    values (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)
+  `).run(runId, roomId, agent.id, taskId, taskGoal?.goal_id ?? null, sessionId, provider?.id ?? null, selectedModel, workspace.agentWorkspace, now);
   db.prepare("update room_tasks set status = 'running', started_at = ?, updated_at = ? where id = ?").run(now, now, taskId);
   setRoomParentSessionStatus(roomId, "running", now);
   roomEvent(roomId, "agent.started", { runId, taskId, sessionId }, null, agent.id);
@@ -3390,6 +3502,34 @@ function compactPayload(value: unknown, limit = 360) {
   return truncateContextText(text, limit).replace(/\s+/g, " ").trim();
 }
 
+function goalContextMarkdown(goal?: GoalSummary | null) {
+  if (!goal) return "";
+  const items = (db.prepare("select * from goal_items where goal_id = ? order by priority desc, updated_at desc, id desc limit 16").all(goal.id) as Array<Record<string, unknown>>).map(goalItemFromRow);
+  return [
+    "# Current Goal",
+    `- id: ${goal.id}`,
+    `- owner: ${goal.ownerType}/${goal.ownerId}`,
+    `- mode: ${goal.mode}`,
+    `- status: ${goal.status}`,
+    goal.managerAgentId ? `- manager agent: ${goal.managerAgentId}` : "",
+    goal.coordinatorAgentId ? `- coordinator agent: ${goal.coordinatorAgentId}` : "",
+    `- goal: ${truncateContextText(goal.text, 1800)}`,
+    goal.currentFocus ? `- current focus: ${truncateContextText(goal.currentFocus.text, 1000)}` : "",
+    "",
+    "Goal rules:",
+    "- Goals are optional guidance. The user's latest instruction has priority.",
+    "- Do not cancel, rewrite, or mark the whole goal complete unless the user clearly asks or the evidence is strong.",
+    "- In managed mode, help maintain the plan, focus, status, and progress.",
+    "- In orchestrated Room mode, use Goal items and Room tasks for planning, assignment, execution, and progress tracking.",
+    "- Agents should propose high-impact changes to the main Goal for user/manager approval instead of silently replacing it.",
+    "- Agents may update their assigned Goal items and report status, but main Goal changes should flow through Goal proposals.",
+    "- When an agent calls Goal APIs directly, include x-codex-agent-id with the agent id so the server can enforce Goal permissions.",
+    "",
+    "## Goal Items",
+    ...(items.length ? items.map((item) => `- [${item.status}] ${item.title}${item.assignedAgentId ? ` -> ${item.assignedAgentId}` : ""}${item.roomTaskId ? ` task=${item.roomTaskId}` : ""}: ${truncateContextText(item.description ?? "", 360)}`) : ["- none"]),
+  ].filter((line) => line !== "").join("\n");
+}
+
 function fitManagedContextForPrompt(value: string, limit = managedContextPromptChars) {
   if (value.length <= limit) return value;
   const head = Math.floor(limit * 0.62);
@@ -3439,6 +3579,7 @@ function roomBlackboardContext(roomId: string, agentId?: string | null) {
   const artifacts = db.prepare("select * from room_artifacts where room_id = ? order by created_at desc, id desc limit 8").all(roomId) as Array<Record<string, unknown>>;
   const handoffs = db.prepare("select * from room_handoffs where room_id = ? and status in ('open', 'accepted', 'returned') order by created_at desc, id desc limit 8").all(roomId) as Array<Record<string, unknown>>;
   const thread = agentId ? readRoomAgentThreadId(roomId, agentId) : null;
+  const goalContext = goalContextMarkdown(activeGoalForOwner("room", roomId));
   const lines = [
     "# Room Blackboard",
     `- room: ${String(room.name)}`,
@@ -3450,6 +3591,8 @@ function roomBlackboardContext(roomId: string, agentId?: string | null) {
     thread ? `- current agent codex thread: ${thread}` : "",
     room.shared_context ? `- shared context: ${truncateContextText(String(room.shared_context), 1600)}` : "",
     "",
+    goalContext,
+    goalContext ? "" : "",
     "## Active And Recent Tasks",
     ...(tasks.length ? tasks.map((row) => {
       const task = roomTaskFromRow(row);
@@ -3659,6 +3802,7 @@ function writeExecutionContextPack(
   const roomContext = roomId ? roomBlackboardContext(roomId, agentId) : "";
   const notificationContext = notificationSkillContext(session);
   const crossSessionContext = crossSessionSkillContext(session);
+  const goalContext = goalContextMarkdown(activeGoalForSession(session));
   const persistentMemory = latestSessionMemoryMarkdown(session.id);
   const workspaceState = workspaceStateMarkdown(cwd);
   const currentRequest = ["# Current Request", prompt.trim()].join("\n\n");
@@ -3688,6 +3832,7 @@ function writeExecutionContextPack(
     "- conversation-transcript.md: longer prior conversation transcript",
     "- current-request.md: exact request sent to Codex for this run",
     replyContext ? "- reply-target.md: message being replied to" : "",
+    goalContext ? "- goal.md: current Goal, current focus, and Goal items" : "",
   ].filter((line) => line !== "").join("\n");
   const pack = [
     "# Codex Web Context Pack",
@@ -3711,6 +3856,7 @@ function writeExecutionContextPack(
     "- workspace-state.md",
     "- current-request.md",
     replyContext ? "- reply-target.md" : "",
+    goalContext ? "- goal.md" : "",
     roomContext ? "- room-blackboard.md" : "",
     roomId ? "- decisions.md" : "",
     notificationContext ? "- notification-skill.md" : "",
@@ -3726,6 +3872,8 @@ function writeExecutionContextPack(
     notificationContext,
     "",
     crossSessionContext,
+    "",
+    goalContext,
     "",
     roomContext,
     "",
@@ -3744,6 +3892,7 @@ function writeExecutionContextPack(
   writeSessionContextFile(session.id, "current-request.md", currentRequest);
   if (replyContext) writeSessionContextFile(session.id, "reply-target.md", replyContext);
   writeSessionContextFile(session.id, "workspace-state.md", workspaceState);
+  if (goalContext) writeSessionContextFile(session.id, "goal.md", goalContext);
   if (notificationContext) writeSessionContextFile(session.id, "notification-skill.md", notificationContext);
   if (crossSessionContext) writeSessionContextFile(session.id, "cross-session-skill.md", crossSessionContext);
   if (roomContext) writeSessionContextFile(session.id, "room-blackboard.md", roomContext);
@@ -4209,9 +4358,24 @@ function deleteSessionMessages(sessionId: string) {
   db.prepare("delete from message_cards where session_id = ?").run(sessionId);
 }
 
+function deleteGoalsForOwner(ownerType: GoalOwnerType, ownerId: string) {
+  const rows = db.prepare("select id from goals where owner_type = ? and owner_id = ?").all(ownerType, ownerId) as Array<{ id: string }>;
+  let deleted = 0;
+  for (const row of rows) {
+    deleted += db.prepare("delete from goal_events where goal_id = ?").run(row.id).changes;
+    deleted += db.prepare("delete from goal_proposals where goal_id = ?").run(row.id).changes;
+    deleted += db.prepare("delete from goal_focuses where goal_id = ?").run(row.id).changes;
+    deleted += db.prepare("delete from goal_items where goal_id = ?").run(row.id).changes;
+    deleted += db.prepare("delete from goals where id = ?").run(row.id).changes;
+  }
+  return deleted;
+}
+
 function deleteSessionDatabaseRows(sessionId: string) {
   deletePreviewsForScope("session", sessionId);
   deleteSessionMessages(sessionId);
+  deleteGoalsForOwner("session", sessionId);
+  deleteGoalsForOwner("agent_session", sessionId);
   db.prepare("delete from message_queue where session_id = ?").run(sessionId);
   db.prepare("delete from task_activities where session_id = ?").run(sessionId);
   db.prepare("delete from execution_contexts where session_id = ?").run(sessionId);
@@ -4436,6 +4600,7 @@ function queuedMessageFromRow(row: Record<string, unknown>): QueuedMessage {
     providerId: row.provider_id ? String(row.provider_id) : null,
     model: row.model ? String(row.model) : null,
     replyToMessageId: row.reply_to_message_id ? String(row.reply_to_message_id) : null,
+    orderIndex: Number(row.order_index ?? 0),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
@@ -4443,16 +4608,16 @@ function queuedMessageFromRow(row: Record<string, unknown>): QueuedMessage {
 
 function listQueuedMessages(sessionId: string) {
   return (db.prepare(`
-    select id, session_id, prompt, provider_id, model, reply_to_message_id, created_at, updated_at
+    select id, session_id, prompt, provider_id, model, reply_to_message_id, order_index, created_at, updated_at
     from message_queue
     where session_id = ?
-    order by created_at asc, id asc
+    order by order_index asc, created_at asc, id asc
   `).all(sessionId) as Array<Record<string, unknown>>).map(queuedMessageFromRow);
 }
 
 function getQueuedMessage(sessionId: string, queueId: string) {
   const row = db.prepare(`
-    select id, session_id, prompt, provider_id, model, reply_to_message_id, created_at, updated_at
+    select id, session_id, prompt, provider_id, model, reply_to_message_id, order_index, created_at, updated_at
     from message_queue
     where session_id = ? and id = ?
   `).get(sessionId, queueId) as Record<string, unknown> | undefined;
@@ -4461,6 +4626,7 @@ function getQueuedMessage(sessionId: string, queueId: string) {
 
 function enqueueMessage(session: SessionSummary, input: QueueMessageRequest) {
   const now = new Date().toISOString();
+  const orderIndex = Number((db.prepare("select coalesce(max(order_index), 0) as max_order from message_queue where session_id = ?").get(session.id) as { max_order?: number } | undefined)?.max_order ?? 0) + 1000;
   const item: QueuedMessage = {
     id: randomUUID(),
     sessionId: session.id,
@@ -4468,13 +4634,14 @@ function enqueueMessage(session: SessionSummary, input: QueueMessageRequest) {
     providerId: input.providerId ?? session.providerId ?? null,
     model: input.model ?? session.model ?? null,
     replyToMessageId: input.replyToMessageId ?? null,
+    orderIndex,
     createdAt: now,
     updatedAt: now,
   };
   db.prepare(`
-    insert into message_queue (id, session_id, prompt, provider_id, model, reply_to_message_id, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(item.id, item.sessionId, item.prompt, item.providerId ?? null, item.model ?? null, item.replyToMessageId ?? null, item.createdAt, item.updatedAt);
+    insert into message_queue (id, session_id, prompt, provider_id, model, reply_to_message_id, order_index, created_at, updated_at)
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(item.id, item.sessionId, item.prompt, item.providerId ?? null, item.model ?? null, item.replyToMessageId ?? null, item.orderIndex, item.createdAt, item.updatedAt);
   publishTaskEvent(session.id, { type: "queue", queue: listQueuedMessages(session.id), session });
   return item;
 }
@@ -4504,12 +4671,26 @@ function deleteQueuedMessage(session: SessionSummary, queueId: string) {
   publishTaskEvent(session.id, { type: "queue", queue: listQueuedMessages(session.id), session });
 }
 
+function reorderQueuedMessages(session: SessionSummary, orderedIds: string[]) {
+  const currentIds = new Set(listQueuedMessages(session.id).map((item) => item.id));
+  const nextIds = orderedIds.filter((id) => currentIds.has(id));
+  if (nextIds.length !== currentIds.size) return null;
+  const updatedAt = new Date().toISOString();
+  const updateOrder = db.prepare("update message_queue set order_index = ?, updated_at = ? where session_id = ? and id = ?");
+  db.transaction(() => {
+    nextIds.forEach((id, index) => updateOrder.run((index + 1) * 1000, updatedAt, session.id, id));
+  })();
+  const queue = listQueuedMessages(session.id);
+  publishTaskEvent(session.id, { type: "queue", queue, session });
+  return queue;
+}
+
 function popNextQueuedMessage(sessionId: string) {
   const row = db.prepare(`
-    select id, session_id, prompt, provider_id, model, reply_to_message_id, created_at, updated_at
+    select id, session_id, prompt, provider_id, model, reply_to_message_id, order_index, created_at, updated_at
     from message_queue
     where session_id = ?
-    order by created_at asc, id asc
+    order by order_index asc, created_at asc, id asc
     limit 1
   `).get(sessionId) as Record<string, unknown> | undefined;
   if (!row) return null;
@@ -4778,6 +4959,7 @@ function deletePreviewsForScope(scopeType: PreviewRecord["scopeType"], scopeId: 
 
 function deleteRoomDatabaseRows(roomId: string) {
   let deleted = 0;
+  deleted += deleteGoalsForOwner("room", roomId);
   for (const table of [
     "room_agents",
     "room_events",
@@ -5685,6 +5867,477 @@ function jsonPayload(value: unknown): unknown {
   } catch {
     return { raw: value };
   }
+}
+
+function goalMode(value: unknown, fallback: GoalMode = "reference"): GoalMode {
+  return value === "tracked" || value === "managed" || value === "orchestrated" || value === "reference" ? value : fallback;
+}
+
+function goalStatus(value: unknown, fallback: GoalStatus = "active"): GoalStatus {
+  return value === "paused" || value === "completed" || value === "cancelled" || value === "archived" || value === "active" ? value : fallback;
+}
+
+function goalFocusStatus(value: unknown, fallback: GoalFocusStatus = "active"): GoalFocusStatus {
+  return value === "completed" || value === "cancelled" || value === "paused" || value === "active" ? value : fallback;
+}
+
+function goalItemStatus(value: unknown, fallback: GoalItemStatus = "planned"): GoalItemStatus {
+  return value === "active" || value === "blocked" || value === "completed" || value === "failed" || value === "cancelled" || value === "planned" ? value : fallback;
+}
+
+function goalOwnerType(value: unknown): GoalOwnerType | null {
+  return value === "session" || value === "agent_session" || value === "room" ? value : null;
+}
+
+function goalFocusFromRow(row: Record<string, unknown>): GoalFocusSummary {
+  return {
+    id: String(row.id),
+    goalId: String(row.goal_id),
+    text: String(row.text),
+    status: goalFocusStatus(row.status),
+    ownerAgentId: row.owner_agent_id ? String(row.owner_agent_id) : null,
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+    completedAt: row.completed_at ? String(row.completed_at) : null,
+    cancelledAt: row.cancelled_at ? String(row.cancelled_at) : null,
+  };
+}
+
+function goalItemFromRow(row: Record<string, unknown>): GoalItemSummary {
+  return {
+    id: String(row.id),
+    goalId: String(row.goal_id),
+    roomTaskId: row.room_task_id ? String(row.room_task_id) : null,
+    title: String(row.title),
+    description: row.description ? String(row.description) : null,
+    status: goalItemStatus(row.status),
+    assignedAgentId: row.assigned_agent_id ? String(row.assigned_agent_id) : null,
+    priority: Number(row.priority) || 0,
+    dependsOnItemId: row.depends_on_item_id ? String(row.depends_on_item_id) : null,
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+    completedAt: row.completed_at ? String(row.completed_at) : null,
+    cancelledAt: row.cancelled_at ? String(row.cancelled_at) : null,
+  };
+}
+
+function goalEventFromRow(row: Record<string, unknown>): GoalEventSummary {
+  return {
+    id: String(row.id),
+    goalId: String(row.goal_id),
+    type: String(row.type),
+    actorType: row.actor_type ? String(row.actor_type) : null,
+    actorId: row.actor_id ? String(row.actor_id) : null,
+    payload: jsonPayload(row.payload),
+    createdAt: String(row.created_at),
+  };
+}
+
+function goalProposalKind(value: unknown): GoalProposalKind {
+  return value === "focus" || value === "item" || value === "plan" || value === "goal_update" ? value : "goal_update";
+}
+
+function goalProposalStatus(value: unknown): GoalProposalStatus {
+  return value === "approved" || value === "rejected" || value === "pending" ? value : "pending";
+}
+
+function goalProposalFromRow(row: Record<string, unknown>): GoalProposalSummary {
+  return {
+    id: String(row.id),
+    goalId: String(row.goal_id),
+    kind: goalProposalKind(row.kind),
+    status: goalProposalStatus(row.status),
+    title: String(row.title),
+    payload: jsonPayload(row.payload),
+    proposedByAgentId: row.proposed_by_agent_id ? String(row.proposed_by_agent_id) : null,
+    createdAt: String(row.created_at),
+    resolvedAt: row.resolved_at ? String(row.resolved_at) : null,
+  };
+}
+
+function goalProgress(goalId: string, progressSummary?: string | null): GoalSummary["progress"] {
+  const rows = db.prepare("select status, updated_at from goal_items where goal_id = ?").all(goalId) as Array<{ status?: string; updated_at?: string }>;
+  const activeStatuses = new Set(["planned", "active"]);
+  return {
+    totalItems: rows.length,
+    activeItems: rows.filter((item) => activeStatuses.has(String(item.status))).length,
+    completedItems: rows.filter((item) => item.status === "completed").length,
+    failedItems: rows.filter((item) => item.status === "failed").length,
+    blockedItems: rows.filter((item) => item.status === "blocked").length,
+    latestSummary: progressSummary ?? null,
+    updatedAt: rows.map((item) => item.updated_at ? String(item.updated_at) : "").filter(Boolean).sort().pop() ?? null,
+  };
+}
+
+function currentGoalFocus(goalId: string) {
+  const row = db.prepare(`
+    select * from goal_focuses
+    where goal_id = ? and status in ('active', 'paused')
+    order by updated_at desc, id desc
+    limit 1
+  `).get(goalId) as Record<string, unknown> | undefined;
+  return row ? goalFocusFromRow(row) : null;
+}
+
+function goalFromRow(row: Record<string, unknown>): GoalSummary {
+  return {
+    id: String(row.id),
+    ownerType: goalOwnerType(row.owner_type) ?? "session",
+    ownerId: String(row.owner_id),
+    text: String(row.text),
+    mode: goalMode(row.mode),
+    status: goalStatus(row.status),
+    managerAgentId: row.manager_agent_id ? String(row.manager_agent_id) : null,
+    coordinatorAgentId: row.coordinator_agent_id ? String(row.coordinator_agent_id) : null,
+    currentFocus: currentGoalFocus(String(row.id)),
+    progress: goalProgress(String(row.id), row.progress_summary ? String(row.progress_summary) : null),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+    completedAt: row.completed_at ? String(row.completed_at) : null,
+    cancelledAt: row.cancelled_at ? String(row.cancelled_at) : null,
+  };
+}
+
+function activeGoalForOwner(ownerType: GoalOwnerType, ownerId?: string | null) {
+  if (!ownerId) return null;
+  const row = db.prepare(`
+    select * from goals
+    where owner_type = ? and owner_id = ? and status in ('active', 'paused')
+    order by updated_at desc, id desc
+    limit 1
+  `).get(ownerType, ownerId) as Record<string, unknown> | undefined;
+  return row ? goalFromRow(row) : null;
+}
+
+function activeGoalForSession(session: Pick<SessionSummary, "id" | "conversationType" | "roomId" | "directAgentId">) {
+  if (session.roomId) return activeGoalForOwner("room", session.roomId);
+  if (session.conversationType === "agent" || session.directAgentId) return activeGoalForOwner("agent_session", session.id);
+  return activeGoalForOwner("session", session.id);
+}
+
+function assertGoalOwner(ownerType: GoalOwnerType, ownerId: string) {
+  if (ownerType === "room") {
+    if (!db.prepare("select id from rooms where id = ?").get(ownerId)) throw new Error("room_not_found");
+    return;
+  }
+  if (!appData.sessions.some((session) => session.id === ownerId)) throw new Error("session_not_found");
+}
+
+type GoalActor = { type: "user"; agentId: null } | { type: "agent"; agentId: string };
+
+function goalActorFromRequest(c: { req: { header: (name: string) => string | undefined } }, body?: Record<string, unknown> | null): GoalActor {
+  const agentId = c.req.header("x-codex-agent-id")?.trim()
+    || c.req.header("x-agent-id")?.trim()
+    || (typeof body?.actorAgentId === "string" ? body.actorAgentId.trim() : "")
+    || (typeof body?.proposedByAgentId === "string" ? body.proposedByAgentId.trim() : "");
+  if (!agentId) return { type: "user", agentId: null };
+  if (!db.prepare("select id from agents where id = ?").get(agentId)) throw new Error("agent_actor_not_found");
+  return { type: "agent", agentId };
+}
+
+function canAgentManageGoal(goal: GoalSummary, agentId: string) {
+  if (goal.managerAgentId === agentId || goal.coordinatorAgentId === agentId) return true;
+  if (goal.ownerType !== "room") return false;
+  const membership = db.prepare("select listen_mode from room_agents where room_id = ? and agent_id = ?").get(goal.ownerId, agentId) as { listen_mode?: string } | undefined;
+  if (!membership) return false;
+  if (membership.listen_mode === "orchestrator") return true;
+  const agent = db.prepare("select name, role_id from agents where id = ?").get(agentId) as { name?: string; role_id?: string } | undefined;
+  const roleId = agent?.role_id?.toLowerCase() ?? "";
+  const name = agent?.name?.toLowerCase() ?? "";
+  return roleId.includes("product") || roleId.includes("manager") || name.includes("pm") || name.includes("product");
+}
+
+function assertCanManageGoal(goal: GoalSummary, actor: GoalActor) {
+  if (actor.type === "user") return;
+  if (canAgentManageGoal(goal, actor.agentId)) return;
+  throw new Error("goal_agent_must_propose");
+}
+
+function assertCanUpdateGoalItem(goalId: string, itemId: string, actor: GoalActor) {
+  if (actor.type === "user") return;
+  const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(goalId) as Record<string, unknown>);
+  if (canAgentManageGoal(goal, actor.agentId)) return;
+  const item = db.prepare("select assigned_agent_id from goal_items where id = ? and goal_id = ?").get(itemId, goalId) as { assigned_agent_id?: string | null } | undefined;
+  if (item?.assigned_agent_id === actor.agentId) return;
+  throw new Error("goal_item_agent_not_assigned");
+}
+
+function recordGoalEvent(goalId: string, type: string, payload: unknown = {}, actorType?: string | null, actorId?: string | null) {
+  const now = new Date().toISOString();
+  db.prepare(`
+    insert into goal_events (id, goal_id, type, actor_type, actor_id, payload, created_at)
+    values (?, ?, ?, ?, ?, ?, ?)
+  `).run(`goal-event-${randomUUID()}`, goalId, type, actorType ?? null, actorId ?? null, JSON.stringify(payload ?? {}), now);
+}
+
+function ownerDefaultGoalMode(ownerType: GoalOwnerType, requested?: GoalMode): GoalMode {
+  if (requested) return requested;
+  return ownerType === "room" ? "orchestrated" : "reference";
+}
+
+function createGoal(input: CreateGoalRequest, actorType = "user", actorId?: string | null): GoalSummary {
+  const ownerType = goalOwnerType(input.ownerType);
+  const ownerId = String(input.ownerId ?? "");
+  const text = String(input.text ?? "").trim();
+  if (!ownerType || !ownerId || !text) throw new Error("invalid_goal");
+  assertGoalOwner(ownerType, ownerId);
+  const now = new Date().toISOString();
+  const existing = activeGoalForOwner(ownerType, ownerId);
+  if (existing) {
+    db.prepare("update goals set status = 'archived', updated_at = ? where id = ?").run(now, existing.id);
+    recordGoalEvent(existing.id, "goal.archived", { reason: "replaced", replacementOwnerType: ownerType, replacementOwnerId: ownerId }, actorType, actorId);
+  }
+  const id = `goal-${randomUUID()}`;
+  db.prepare(`
+    insert into goals (id, owner_type, owner_id, text, mode, status, manager_agent_id, coordinator_agent_id, progress_summary, created_at, updated_at, completed_at, cancelled_at)
+    values (?, ?, ?, ?, ?, 'active', ?, ?, null, ?, ?, null, null)
+  `).run(id, ownerType, ownerId, text, ownerDefaultGoalMode(ownerType, input.mode), input.managerAgentId ?? null, input.coordinatorAgentId ?? null, now, now);
+  recordGoalEvent(id, "goal.created", { ownerType, ownerId, text }, actorType, actorId);
+  if (input.focusText?.trim()) createGoalFocus(id, { text: input.focusText, ownerAgentId: input.focusOwnerAgentId ?? null }, actorType, actorId);
+  return goalFromRow(db.prepare("select * from goals where id = ?").get(id) as Record<string, unknown>);
+}
+
+function updateGoal(id: string, input: UpdateGoalRequest, actorType = "user", actorId?: string | null): GoalSummary {
+  const current = db.prepare("select * from goals where id = ?").get(id) as Record<string, unknown> | undefined;
+  if (!current) throw new Error("goal_not_found");
+  const now = new Date().toISOString();
+  const nextStatus = input.status ? goalStatus(input.status, goalStatus(current.status)) : goalStatus(current.status);
+  const completedAt = nextStatus === "completed" ? String(current.completed_at ?? now) : (nextStatus === "active" || nextStatus === "paused" ? null : current.completed_at ?? null);
+  const cancelledAt = nextStatus === "cancelled" ? String(current.cancelled_at ?? now) : (nextStatus === "active" || nextStatus === "paused" ? null : current.cancelled_at ?? null);
+  db.prepare(`
+    update goals
+    set text = ?, mode = ?, status = ?, manager_agent_id = ?, coordinator_agent_id = ?, progress_summary = ?, completed_at = ?, cancelled_at = ?, updated_at = ?
+    where id = ?
+  `).run(
+    input.text !== undefined ? String(input.text).trim() || String(current.text) : String(current.text),
+    input.mode ? goalMode(input.mode, goalMode(current.mode)) : goalMode(current.mode),
+    nextStatus,
+    input.managerAgentId !== undefined ? input.managerAgentId : current.manager_agent_id ?? null,
+    input.coordinatorAgentId !== undefined ? input.coordinatorAgentId : current.coordinator_agent_id ?? null,
+    input.progressSummary !== undefined ? input.progressSummary?.trim() || null : current.progress_summary ?? null,
+    completedAt,
+    cancelledAt,
+    now,
+    id,
+  );
+  recordGoalEvent(id, "goal.updated", input, actorType, actorId);
+  return goalFromRow(db.prepare("select * from goals where id = ?").get(id) as Record<string, unknown>);
+}
+
+function createGoalFocus(goalId: string, input: CreateGoalFocusRequest, actorType = "user", actorId?: string | null): GoalFocusSummary {
+  const goal = db.prepare("select * from goals where id = ?").get(goalId) as Record<string, unknown> | undefined;
+  if (!goal) throw new Error("goal_not_found");
+  const text = String(input.text ?? "").trim();
+  if (!text) throw new Error("invalid_goal_focus");
+  const now = new Date().toISOString();
+  db.prepare("update goal_focuses set status = 'completed', completed_at = coalesce(completed_at, ?), updated_at = ? where goal_id = ? and status in ('active', 'paused')").run(now, now, goalId);
+  const id = `goal-focus-${randomUUID()}`;
+  db.prepare(`
+    insert into goal_focuses (id, goal_id, text, status, owner_agent_id, created_at, updated_at, completed_at, cancelled_at)
+    values (?, ?, ?, 'active', ?, ?, ?, null, null)
+  `).run(id, goalId, text, input.ownerAgentId ?? null, now, now);
+  db.prepare("update goals set updated_at = ? where id = ?").run(now, goalId);
+  recordGoalEvent(goalId, "focus.created", { focusId: id, text, ownerAgentId: input.ownerAgentId ?? null }, actorType, actorId);
+  return goalFocusFromRow(db.prepare("select * from goal_focuses where id = ?").get(id) as Record<string, unknown>);
+}
+
+function updateGoalFocus(goalId: string, focusId: string, input: UpdateGoalFocusRequest, actorType = "user", actorId?: string | null): GoalFocusSummary {
+  const current = db.prepare("select * from goal_focuses where id = ? and goal_id = ?").get(focusId, goalId) as Record<string, unknown> | undefined;
+  if (!current) throw new Error("goal_focus_not_found");
+  const now = new Date().toISOString();
+  const nextStatus = input.status ? goalFocusStatus(input.status, goalFocusStatus(current.status)) : goalFocusStatus(current.status);
+  db.prepare(`
+    update goal_focuses
+    set text = ?, status = ?, owner_agent_id = ?, completed_at = ?, cancelled_at = ?, updated_at = ?
+    where id = ? and goal_id = ?
+  `).run(
+    input.text !== undefined ? String(input.text).trim() || String(current.text) : String(current.text),
+    nextStatus,
+    input.ownerAgentId !== undefined ? input.ownerAgentId : current.owner_agent_id ?? null,
+    nextStatus === "completed" ? String(current.completed_at ?? now) : (nextStatus === "active" || nextStatus === "paused" ? null : current.completed_at ?? null),
+    nextStatus === "cancelled" ? String(current.cancelled_at ?? now) : (nextStatus === "active" || nextStatus === "paused" ? null : current.cancelled_at ?? null),
+    now,
+    focusId,
+    goalId,
+  );
+  db.prepare("update goals set updated_at = ? where id = ?").run(now, goalId);
+  recordGoalEvent(goalId, "focus.updated", { focusId, ...input }, actorType, actorId);
+  return goalFocusFromRow(db.prepare("select * from goal_focuses where id = ?").get(focusId) as Record<string, unknown>);
+}
+
+function createGoalItem(goalId: string, input: CreateGoalItemRequest, actorType = "user", actorId?: string | null): GoalItemSummary {
+  if (!db.prepare("select id from goals where id = ?").get(goalId)) throw new Error("goal_not_found");
+  const title = String(input.title ?? "").trim();
+  if (!title) throw new Error("invalid_goal_item");
+  const now = new Date().toISOString();
+  const id = `goal-item-${randomUUID()}`;
+  db.prepare(`
+    insert into goal_items (id, goal_id, room_task_id, title, description, status, assigned_agent_id, priority, depends_on_item_id, created_at, updated_at, completed_at, cancelled_at)
+    values (?, ?, null, ?, ?, ?, ?, ?, ?, ?, ?, null, null)
+  `).run(id, goalId, title, input.description?.trim() || null, goalItemStatus(input.status), input.assignedAgentId ?? null, Number(input.priority ?? 0) || 0, input.dependsOnItemId ?? null, now, now);
+  db.prepare("update goals set updated_at = ? where id = ?").run(now, goalId);
+  recordGoalEvent(goalId, "item.created", { itemId: id, title }, actorType, actorId);
+  return goalItemFromRow(db.prepare("select * from goal_items where id = ?").get(id) as Record<string, unknown>);
+}
+
+function updateGoalItem(goalId: string, itemId: string, input: UpdateGoalItemRequest, actorType = "user", actorId?: string | null): GoalItemSummary {
+  const current = db.prepare("select * from goal_items where id = ? and goal_id = ?").get(itemId, goalId) as Record<string, unknown> | undefined;
+  if (!current) throw new Error("goal_item_not_found");
+  const now = new Date().toISOString();
+  const nextStatus = input.status ? goalItemStatus(input.status, goalItemStatus(current.status)) : goalItemStatus(current.status);
+  db.prepare(`
+    update goal_items
+    set room_task_id = ?, title = ?, description = ?, status = ?, assigned_agent_id = ?, priority = ?, depends_on_item_id = ?, completed_at = ?, cancelled_at = ?, updated_at = ?
+    where id = ? and goal_id = ?
+  `).run(
+    input.roomTaskId !== undefined ? input.roomTaskId : current.room_task_id ?? null,
+    input.title !== undefined ? String(input.title).trim() || String(current.title) : String(current.title),
+    input.description !== undefined ? input.description?.trim() || null : current.description ?? null,
+    nextStatus,
+    input.assignedAgentId !== undefined ? input.assignedAgentId : current.assigned_agent_id ?? null,
+    input.priority !== undefined ? Number(input.priority) || 0 : Number(current.priority ?? 0) || 0,
+    input.dependsOnItemId !== undefined ? input.dependsOnItemId : current.depends_on_item_id ?? null,
+    nextStatus === "completed" ? String(current.completed_at ?? now) : (nextStatus === "planned" || nextStatus === "active" || nextStatus === "blocked" ? null : current.completed_at ?? null),
+    nextStatus === "cancelled" ? String(current.cancelled_at ?? now) : (nextStatus === "planned" || nextStatus === "active" || nextStatus === "blocked" ? null : current.cancelled_at ?? null),
+    now,
+    itemId,
+    goalId,
+  );
+  db.prepare("update goals set updated_at = ? where id = ?").run(now, goalId);
+  if (input.roomTaskId !== undefined) db.prepare("update room_tasks set goal_item_id = ? where id = ?").run(itemId, input.roomTaskId);
+  recordGoalEvent(goalId, "item.updated", { itemId, ...input }, actorType, actorId);
+  if ((nextStatus === "blocked" || nextStatus === "failed") && String(current.status) !== nextStatus) {
+    createReplanProposal(goalId, itemId, nextStatus, actorType, actorId);
+  }
+  return goalItemFromRow(db.prepare("select * from goal_items where id = ?").get(itemId) as Record<string, unknown>);
+}
+
+function listGoalProposals(goalId: string) {
+  return (db.prepare("select * from goal_proposals where goal_id = ? order by status asc, created_at desc, id desc").all(goalId) as Array<Record<string, unknown>>).map(goalProposalFromRow);
+}
+
+function createGoalProposal(goalId: string, input: { kind?: unknown; title?: unknown; payload?: unknown; proposedByAgentId?: unknown }, actorType = "agent", actorId?: string | null) {
+  if (!db.prepare("select id from goals where id = ?").get(goalId)) throw new Error("goal_not_found");
+  const kind = goalProposalKind(input.kind);
+  const title = String(input.title ?? "").trim() || kind;
+  const id = `goal-proposal-${randomUUID()}`;
+  const now = new Date().toISOString();
+  db.prepare(`
+    insert into goal_proposals (id, goal_id, kind, status, title, payload, proposed_by_agent_id, created_at, resolved_at)
+    values (?, ?, ?, 'pending', ?, ?, ?, ?, null)
+  `).run(id, goalId, kind, title, JSON.stringify(input.payload ?? {}), input.proposedByAgentId ? String(input.proposedByAgentId) : actorId ?? null, now);
+  recordGoalEvent(goalId, "proposal.created", { proposalId: id, kind, title }, actorType, actorId);
+  return goalProposalFromRow(db.prepare("select * from goal_proposals where id = ?").get(id) as Record<string, unknown>);
+}
+
+function applyGoalProposal(goalId: string, proposalId: string, actorType = "user", actorId?: string | null) {
+  const row = db.prepare("select * from goal_proposals where id = ? and goal_id = ?").get(proposalId, goalId) as Record<string, unknown> | undefined;
+  if (!row) throw new Error("goal_proposal_not_found");
+  const proposal = goalProposalFromRow(row);
+  if (proposal.status !== "pending") return proposal;
+  const payload = proposal.payload && typeof proposal.payload === "object" ? proposal.payload as Record<string, unknown> : {};
+  if (proposal.kind === "goal_update") {
+    updateGoal(goalId, {
+      text: typeof payload.text === "string" ? payload.text : undefined,
+      mode: payload.mode === "reference" || payload.mode === "tracked" || payload.mode === "managed" || payload.mode === "orchestrated" ? payload.mode : undefined,
+      progressSummary: typeof payload.progressSummary === "string" ? payload.progressSummary : undefined,
+    }, actorType, actorId);
+  } else if (proposal.kind === "focus") {
+    createGoalFocus(goalId, { text: String(payload.text ?? proposal.title), ownerAgentId: typeof payload.ownerAgentId === "string" ? payload.ownerAgentId : null }, actorType, actorId);
+  } else if (proposal.kind === "item") {
+    createGoalItem(goalId, {
+      title: String(payload.title ?? proposal.title),
+      description: typeof payload.description === "string" ? payload.description : null,
+      assignedAgentId: typeof payload.assignedAgentId === "string" ? payload.assignedAgentId : null,
+      priority: Number(payload.priority ?? 0) || 0,
+    }, actorType, actorId);
+  } else if (proposal.kind === "plan") {
+    const rawItems = Array.isArray(payload.items) ? payload.items : [];
+    for (const rawItem of rawItems.slice(0, 20)) {
+      if (!rawItem || typeof rawItem !== "object") continue;
+      const item = rawItem as Record<string, unknown>;
+      const title = String(item.title ?? "").trim();
+      if (!title) continue;
+      createGoalItem(goalId, {
+        title,
+        description: typeof item.description === "string" ? item.description : null,
+        assignedAgentId: typeof item.assignedAgentId === "string" ? item.assignedAgentId : null,
+        priority: Number(item.priority ?? 0) || 0,
+      }, actorType, actorId);
+    }
+  }
+  const now = new Date().toISOString();
+  db.prepare("update goal_proposals set status = 'approved', resolved_at = ? where id = ? and goal_id = ?").run(now, proposalId, goalId);
+  recordGoalEvent(goalId, "proposal.approved", { proposalId, kind: proposal.kind }, actorType, actorId);
+  return goalProposalFromRow(db.prepare("select * from goal_proposals where id = ?").get(proposalId) as Record<string, unknown>);
+}
+
+function rejectGoalProposal(goalId: string, proposalId: string, actorType = "user", actorId?: string | null) {
+  const row = db.prepare("select * from goal_proposals where id = ? and goal_id = ?").get(proposalId, goalId) as Record<string, unknown> | undefined;
+  if (!row) throw new Error("goal_proposal_not_found");
+  const now = new Date().toISOString();
+  db.prepare("update goal_proposals set status = 'rejected', resolved_at = ? where id = ? and goal_id = ? and status = 'pending'").run(now, proposalId, goalId);
+  recordGoalEvent(goalId, "proposal.rejected", { proposalId }, actorType, actorId);
+  return goalProposalFromRow(db.prepare("select * from goal_proposals where id = ?").get(proposalId) as Record<string, unknown>);
+}
+
+function createDefaultGoalPlan(goalId: string, actorType = "user", actorId?: string | null) {
+  const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(goalId) as Record<string, unknown>);
+  const existing = (db.prepare("select * from goal_items where goal_id = ? and status not in ('cancelled')").all(goalId) as Array<Record<string, unknown>>).map(goalItemFromRow);
+  if (existing.length) return existing;
+  const roomAgents = goal.ownerType === "room"
+    ? (db.prepare("select agent_id from room_agents where room_id = ? order by joined_at asc").all(goal.ownerId) as Array<{ agent_id: string }>).map((row) => row.agent_id)
+    : [];
+  const templates = [
+    { title: "需求澄清与范围确认", description: goal.text, priority: 50, assignedAgentId: roomAgents[0] ?? null },
+    { title: "方案设计与任务拆解", description: goal.currentFocus?.text ?? goal.text, priority: 40, assignedAgentId: roomAgents[1] ?? roomAgents[0] ?? null },
+    { title: "实现与验证", description: goal.text, priority: 30, assignedAgentId: roomAgents[2] ?? roomAgents[0] ?? null },
+    { title: "审查、修正与交付总结", description: goal.text, priority: 20, assignedAgentId: roomAgents[3] ?? roomAgents[0] ?? null },
+  ];
+  const items = templates.map((item) => createGoalItem(goalId, { ...item, status: "planned" }, actorType, actorId));
+  recordGoalEvent(goalId, "goal.planned", { itemIds: items.map((item) => item.id) }, actorType, actorId);
+  return items;
+}
+
+function createReplanProposal(goalId: string, itemId: string, status: "blocked" | "failed", actorType = "system", actorId?: string | null) {
+  const item = goalItemFromRow(db.prepare("select * from goal_items where id = ? and goal_id = ?").get(itemId, goalId) as Record<string, unknown>);
+  const duplicate = (db.prepare(`
+    select id from goal_proposals
+    where goal_id = ? and status = 'pending' and kind = 'plan' and json_extract(payload, '$.sourceItemId') = ?
+    limit 1
+  `).get(goalId, itemId) as { id?: string } | undefined);
+  if (duplicate) return null;
+  const title = status === "blocked" ? `重新规划阻塞项：${item.title}` : `重新规划失败项：${item.title}`;
+  const payload = {
+    sourceItemId: item.id,
+    sourceStatus: status,
+    reason: status === "blocked" ? "Goal item was marked blocked" : "Goal item or linked Room task failed",
+    items: [
+      {
+        title: `诊断并解除阻塞：${item.title}`,
+        description: item.description || item.title,
+        assignedAgentId: item.assignedAgentId ?? null,
+        priority: item.priority + 10,
+      },
+      {
+        title: `验证替代方案：${item.title}`,
+        description: "确认重新规划后的方案可以继续推进，并更新 Goal item 状态。",
+        assignedAgentId: item.assignedAgentId ?? null,
+        priority: item.priority + 5,
+      },
+    ],
+  };
+  return createGoalProposal(goalId, { kind: "plan", title, payload, proposedByAgentId: actorType === "agent" ? actorId : null }, actorType, actorId);
+}
+
+function goalDetail(goalId: string): GoalDetailResponse {
+  const row = db.prepare("select * from goals where id = ?").get(goalId) as Record<string, unknown> | undefined;
+  if (!row) throw new Error("goal_not_found");
+  const focuses = (db.prepare("select * from goal_focuses where goal_id = ? order by updated_at desc, id desc").all(goalId) as Array<Record<string, unknown>>).map(goalFocusFromRow);
+  const items = (db.prepare("select * from goal_items where goal_id = ? order by priority desc, updated_at desc, id desc").all(goalId) as Array<Record<string, unknown>>).map(goalItemFromRow);
+  const events = (db.prepare("select * from goal_events where goal_id = ? order by created_at desc, id desc limit 80").all(goalId) as Array<Record<string, unknown>>).map(goalEventFromRow);
+  const proposals = listGoalProposals(goalId);
+  return { goal: goalFromRow(row), focuses, items, events, proposals };
 }
 
 const defaultAgentPermissions: AgentPermissionSettings = {
@@ -7454,6 +8107,7 @@ function roomFromRow(row: Record<string, unknown>): RoomSummary {
     projectId: row.project_id ? String(row.project_id) : null,
     status: roomStatus(row.status),
     sharedContext: row.shared_context ? String(row.shared_context) : null,
+    goal: activeGoalForOwner("room", String(row.id)),
     orchestration: roomOrchestrationSettings(row.orchestration_settings),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
@@ -7595,6 +8249,7 @@ function roomTaskFromRow(row: Record<string, unknown>): RoomTaskSummary {
   return {
     id: String(row.id),
     roomId: String(row.room_id),
+    goalItemId: row.goal_item_id ? String(row.goal_item_id) : null,
     title: String(row.title),
     prompt: String(row.prompt ?? ""),
     assignedAgentId: row.assigned_agent_id ? String(row.assigned_agent_id) : null,
@@ -7630,6 +8285,7 @@ function agentRunFromRow(row: Record<string, unknown>): AgentRunSummary {
     roomId: String(row.room_id),
     agentId: String(row.agent_id),
     taskId: row.task_id ? String(row.task_id) : null,
+    goalId: row.goal_id ? String(row.goal_id) : null,
     sessionId: row.session_id ? String(row.session_id) : null,
     status: String(row.status) as AgentRunSummary["status"],
     providerId: row.provider_id ? String(row.provider_id) : null,
@@ -11946,6 +12602,254 @@ app.post("/api/approvals/:id/deny", (c) => {
   return c.json(response);
 });
 
+app.get("/api/goals", (c) => {
+  const ownerType = goalOwnerType(c.req.query("ownerType"));
+  const ownerId = c.req.query("ownerId")?.trim();
+  const status = c.req.query("status");
+  const limit = parsePageLimit(c.req.query("limit"), 30);
+  const rows = db.prepare(`
+    select * from goals
+    where (@ownerType is null or owner_type = @ownerType)
+      and (@ownerId is null or owner_id = @ownerId)
+      and (@status is null or status = @status)
+    order by updated_at desc, id desc
+    limit @limit
+  `).all({ ownerType, ownerId: ownerId || null, status: status || null, limit }) as Array<Record<string, unknown>>;
+  return c.json(rows.map(goalFromRow));
+});
+
+app.post("/api/goals", async (c) => {
+  const body = await c.req.json<CreateGoalRequest>().catch(() => null);
+  if (!body) return c.json({ error: "invalid_goal" }, 400);
+  try {
+    const actor = goalActorFromRequest(c, body as unknown as Record<string, unknown>);
+    if (actor.type === "agent") return c.json({ error: "goal_agent_must_propose" }, 403);
+    return c.json(createGoal(body, actor.type, actor.agentId), 201);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "goal_create_failed";
+    return c.json({ error: message }, message.endsWith("_not_found") ? 404 : 400);
+  }
+});
+
+app.get("/api/goals/:id", (c) => {
+  try {
+    return c.json(goalDetail(c.req.param("id")));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "goal_not_found" }, 404);
+  }
+});
+
+app.patch("/api/goals/:id", async (c) => {
+  const body = await c.req.json<UpdateGoalRequest>().catch(() => null);
+  if (!body) return c.json({ error: "invalid_goal_update" }, 400);
+  try {
+    const actor = goalActorFromRequest(c, body as unknown as Record<string, unknown>);
+    const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>);
+    assertCanManageGoal(goal, actor);
+    return c.json(updateGoal(c.req.param("id"), body, actor.type, actor.agentId));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "goal_update_failed";
+    return c.json({ error: message }, message === "goal_agent_must_propose" || message === "agent_actor_not_found" ? 403 : 404);
+  }
+});
+
+app.delete("/api/goals/:id", (c) => {
+  try {
+    const actor = goalActorFromRequest(c);
+    const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>);
+    assertCanManageGoal(goal, actor);
+    return c.json(updateGoal(c.req.param("id"), { status: "cancelled" }, actor.type, actor.agentId));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "goal_cancel_failed";
+    return c.json({ error: message }, message === "goal_agent_must_propose" || message === "agent_actor_not_found" ? 403 : 404);
+  }
+});
+
+app.get("/api/goals/:id/events", (c) => {
+  const rows = db.prepare("select * from goal_events where goal_id = ? order by created_at desc, id desc limit ?").all(c.req.param("id"), parsePageLimit(c.req.query("limit"), 80)) as Array<Record<string, unknown>>;
+  return c.json(rows.map(goalEventFromRow));
+});
+
+app.post("/api/goals/:id/focuses", async (c) => {
+  const body = await c.req.json<CreateGoalFocusRequest>().catch(() => null);
+  if (!body) return c.json({ error: "invalid_goal_focus" }, 400);
+  try {
+    const actor = goalActorFromRequest(c, body as unknown as Record<string, unknown>);
+    const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>);
+    assertCanManageGoal(goal, actor);
+    return c.json(createGoalFocus(c.req.param("id"), body, actor.type, actor.agentId), 201);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "goal_focus_create_failed";
+    return c.json({ error: message }, message === "goal_agent_must_propose" || message === "agent_actor_not_found" ? 403 : 400);
+  }
+});
+
+app.patch("/api/goals/:id/focuses/:focusId", async (c) => {
+  const body = await c.req.json<UpdateGoalFocusRequest>().catch(() => null);
+  if (!body) return c.json({ error: "invalid_goal_focus_update" }, 400);
+  try {
+    const actor = goalActorFromRequest(c, body as unknown as Record<string, unknown>);
+    const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>);
+    assertCanManageGoal(goal, actor);
+    return c.json(updateGoalFocus(c.req.param("id"), c.req.param("focusId"), body, actor.type, actor.agentId));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "goal_focus_update_failed";
+    return c.json({ error: message }, message === "goal_agent_must_propose" || message === "agent_actor_not_found" ? 403 : 404);
+  }
+});
+
+app.get("/api/goals/:id/items", (c) => {
+  const rows = db.prepare("select * from goal_items where goal_id = ? order by priority desc, updated_at desc, id desc").all(c.req.param("id")) as Array<Record<string, unknown>>;
+  return c.json(rows.map(goalItemFromRow));
+});
+
+app.post("/api/goals/:id/items", async (c) => {
+  const body = await c.req.json<CreateGoalItemRequest>().catch(() => null);
+  if (!body) return c.json({ error: "invalid_goal_item" }, 400);
+  try {
+    const actor = goalActorFromRequest(c, body as unknown as Record<string, unknown>);
+    const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>);
+    assertCanManageGoal(goal, actor);
+    return c.json(createGoalItem(c.req.param("id"), body, actor.type, actor.agentId), 201);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "goal_item_create_failed";
+    return c.json({ error: message }, message === "goal_agent_must_propose" || message === "agent_actor_not_found" ? 403 : 400);
+  }
+});
+
+app.patch("/api/goals/:id/items/:itemId", async (c) => {
+  const body = await c.req.json<UpdateGoalItemRequest>().catch(() => null);
+  if (!body) return c.json({ error: "invalid_goal_item_update" }, 400);
+  try {
+    const actor = goalActorFromRequest(c, body as unknown as Record<string, unknown>);
+    assertCanUpdateGoalItem(c.req.param("id"), c.req.param("itemId"), actor);
+    return c.json(updateGoalItem(c.req.param("id"), c.req.param("itemId"), body, actor.type, actor.agentId));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "goal_item_update_failed";
+    return c.json({ error: message }, message === "goal_item_agent_not_assigned" || message === "agent_actor_not_found" ? 403 : 404);
+  }
+});
+
+app.delete("/api/goals/:id/items/:itemId", (c) => {
+  try {
+    const actor = goalActorFromRequest(c);
+    assertCanUpdateGoalItem(c.req.param("id"), c.req.param("itemId"), actor);
+    return c.json(updateGoalItem(c.req.param("id"), c.req.param("itemId"), { status: "cancelled" }, actor.type, actor.agentId));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "goal_item_cancel_failed";
+    return c.json({ error: message }, message === "goal_item_agent_not_assigned" || message === "agent_actor_not_found" ? 403 : 404);
+  }
+});
+
+app.get("/api/goals/:id/proposals", (c) => {
+  return c.json(listGoalProposals(c.req.param("id")));
+});
+
+app.post("/api/goals/:id/proposals", async (c) => {
+  const body = await c.req.json<{ kind?: unknown; title?: unknown; payload?: unknown; proposedByAgentId?: unknown }>().catch(() => null);
+  if (!body) return c.json({ error: "invalid_goal_proposal" }, 400);
+  try {
+    const actor = goalActorFromRequest(c, body);
+    return c.json(createGoalProposal(c.req.param("id"), body, actor.type === "agent" ? "agent" : "user", actor.agentId), 201);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "goal_proposal_create_failed";
+    return c.json({ error: message }, message === "agent_actor_not_found" ? 403 : 400);
+  }
+});
+
+app.post("/api/goals/:id/proposals/:proposalId/approve", (c) => {
+  try {
+    const actor = goalActorFromRequest(c);
+    const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>);
+    assertCanManageGoal(goal, actor);
+    return c.json(applyGoalProposal(c.req.param("id"), c.req.param("proposalId"), actor.type, actor.agentId));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "goal_proposal_approve_failed";
+    return c.json({ error: message }, message === "goal_agent_must_propose" || message === "agent_actor_not_found" ? 403 : 404);
+  }
+});
+
+app.post("/api/goals/:id/proposals/:proposalId/reject", (c) => {
+  try {
+    const actor = goalActorFromRequest(c);
+    const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>);
+    assertCanManageGoal(goal, actor);
+    return c.json(rejectGoalProposal(c.req.param("id"), c.req.param("proposalId"), actor.type, actor.agentId));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "goal_proposal_reject_failed";
+    return c.json({ error: message }, message === "goal_agent_must_propose" || message === "agent_actor_not_found" ? 403 : 404);
+  }
+});
+
+app.post("/api/goals/:id/plan", (c) => {
+  try {
+    const actor = goalActorFromRequest(c);
+    const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>);
+    assertCanManageGoal(goal, actor);
+    const items = createDefaultGoalPlan(c.req.param("id"), actor.type, actor.agentId);
+    return c.json({ goal: goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>), items }, 201);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "goal_plan_failed";
+    return c.json({ error: message }, message === "goal_agent_must_propose" || message === "agent_actor_not_found" ? 403 : 400);
+  }
+});
+
+app.post("/api/goals/:id/orchestrate", (c) => {
+  const goalRow = db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
+  if (!goalRow) return c.json({ error: "goal_not_found" }, 404);
+  const goal = goalFromRow(goalRow);
+  try {
+    assertCanManageGoal(goal, goalActorFromRequest(c));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "goal_orchestrate_forbidden";
+    return c.json({ error: message }, 403);
+  }
+  if (goal.ownerType !== "room") return c.json({ error: "goal_owner_not_room" }, 400);
+  const room = db.prepare("select * from rooms where id = ?").get(goal.ownerId) as Record<string, unknown> | undefined;
+  if (!room) return c.json({ error: "room_not_found" }, 404);
+  let items = (db.prepare("select * from goal_items where goal_id = ? and room_task_id is null and status not in ('completed', 'cancelled') order by priority desc, updated_at asc").all(goal.id) as Array<Record<string, unknown>>).map(goalItemFromRow);
+  if (!items.length) {
+    items = [createGoalItem(goal.id, {
+      title: goal.currentFocus?.text || goal.text.slice(0, 120),
+      description: goal.currentFocus ? goal.text : null,
+      status: "planned",
+      assignedAgentId: goal.coordinatorAgentId ?? goal.managerAgentId ?? null,
+      priority: 1,
+    }, "system")];
+  }
+  const now = new Date().toISOString();
+  const created: RoomTaskSummary[] = [];
+  for (const item of items) {
+    const assignedAgentId = item.assignedAgentId && db.prepare("select agent_id from room_agents where room_id = ? and agent_id = ?").get(goal.ownerId, item.assignedAgentId)
+      ? item.assignedAgentId
+      : goal.coordinatorAgentId ?? goal.managerAgentId ?? null;
+    const taskId = `room-task-${randomUUID()}`;
+    db.prepare(`
+      insert into room_tasks (id, room_id, goal_item_id, title, prompt, status, assigned_agent_id, priority, depends_on_task_id, scheduled_at, payload, created_at, updated_at)
+      values (?, ?, ?, ?, ?, ?, ?, ?, null, null, ?, ?, ?)
+    `).run(
+      taskId,
+      goal.ownerId,
+      item.id,
+      item.title,
+      [item.description, "", `Goal: ${goal.text}`, goal.currentFocus ? `Current focus: ${goal.currentFocus.text}` : ""].filter(Boolean).join("\n"),
+      assignedAgentId ? "assigned" : "queued",
+      assignedAgentId,
+      item.priority,
+      JSON.stringify({ source: "goal-orchestrated", goalId: goal.id, goalItemId: item.id }),
+      now,
+      now,
+    );
+    updateGoalItem(goal.id, item.id, { roomTaskId: taskId, status: "active", assignedAgentId }, "system");
+    const task = roomTaskFromRow(db.prepare("select * from room_tasks where id = ?").get(taskId) as Record<string, unknown>);
+    created.push(task);
+    roomEvent(goal.ownerId, "goal.task.created", { goalId: goal.id, goalItemId: item.id, taskId, title: item.title }, assignedAgentId);
+  }
+  recordGoalEvent(goal.id, "goal.orchestrated", { roomId: goal.ownerId, taskIds: created.map((task) => task.id) }, "system");
+  if (created.length) orchestrateRoom(goal.ownerId, "goal.orchestrated");
+  return c.json({ goal: goalFromRow(db.prepare("select * from goals where id = ?").get(goal.id) as Record<string, unknown>), tasks: created }, 201);
+});
+
 app.get("/api/previews", (c) => {
   const scopeType = c.req.query("scopeType");
   const scopeId = c.req.query("scopeId");
@@ -12152,6 +13056,10 @@ app.post("/api/sessions", async (c) => {
     updatedAt: new Date().toISOString(),
   };
   appData.sessions.unshift(session);
+  if (body.goal?.text?.trim()) {
+    const ownerType: GoalOwnerType = session.conversationType === "agent" ? "agent_session" : "session";
+    session.goal = createGoal({ ...body.goal, ownerType, ownerId: session.id }, "user");
+  }
   saveAppData();
   return c.json(session, 201);
 });
@@ -12425,6 +13333,15 @@ app.patch("/api/codex/tasks/:id/queue/:queueId", async (c) => {
   const item = updateQueuedMessage(session, c.req.param("queueId"), body);
   if (!item) return c.json({ error: "queued_message_not_found" }, 404);
   return c.json(item);
+});
+app.patch("/api/codex/tasks/:id/queue", async (c) => {
+  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
+  if (!session) return c.json({ error: "task_not_found" }, 404);
+  const body = await c.req.json<ReorderQueuedMessagesRequest>().catch(() => null);
+  if (!Array.isArray(body?.orderedIds)) return c.json({ error: "ordered_ids_required" }, 400);
+  const queue = reorderQueuedMessages(session, body.orderedIds);
+  if (!queue) return c.json({ error: "queued_message_order_mismatch" }, 409);
+  return c.json(queue);
 });
 app.delete("/api/codex/tasks/:id/queue/:queueId", (c) => {
   const session = appData.sessions.find((item) => item.id === c.req.param("id"));
@@ -13425,6 +14342,9 @@ app.post("/api/rooms", async (c) => {
     insert into rooms (id, session_id, name, group_id, circle_id, project_id, status, shared_context, orchestration_settings, created_at, updated_at)
     values (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)
   `).run(id, sessionId, body.name.trim(), groupId, body.circleId ?? null, project?.id ?? null, body.sharedContext?.trim() || null, JSON.stringify(defaultRoomOrchestration), now, now);
+  if (body.goal?.text?.trim()) {
+    session.goal = createGoal({ ...body.goal, ownerType: "room", ownerId: id, mode: body.goal.mode ?? "orchestrated" }, "user");
+  }
   const group = groupId ? agentGroupFromRow(db.prepare("select * from agent_groups where id = ?").get(groupId) as Record<string, unknown>) : null;
   const insertRoomAgent = db.prepare("insert or ignore into room_agents (room_id, agent_id, listen_mode) values (?, ?, ?)");
   for (const agentId of group?.agentIds ?? []) insertRoomAgent.run(id, agentId, listenMode(group?.memberListenModes?.[agentId]));
@@ -13814,6 +14734,10 @@ app.post("/api/rooms/:id/tasks/retry-failed", (c) => {
   `).all(c.req.param("id")) as Array<Record<string, unknown>>;
   for (const task of tasks) {
     db.prepare("update room_tasks set status = 'assigned', started_at = null, finished_at = null, updated_at = ? where id = ?").run(now, String(task.id));
+    if (task.goal_item_id) {
+      const item = db.prepare("select goal_id from goal_items where id = ?").get(String(task.goal_item_id)) as { goal_id?: string } | undefined;
+      if (item?.goal_id) updateGoalItem(String(item.goal_id), String(task.goal_item_id), { status: "active" }, "system");
+    }
     roomEvent(c.req.param("id"), "task.retry", { taskId: String(task.id), batch: true }, task.assigned_agent_id ? String(task.assigned_agent_id) : null);
   }
   if (tasks.length) orchestrateRoom(c.req.param("id"), "task.retry");
@@ -13847,6 +14771,13 @@ app.patch("/api/rooms/:id/tasks/:taskId", async (c) => {
     c.req.param("taskId"),
     c.req.param("id"),
   );
+  if (task.goal_item_id && (nextStatus === "done" || nextStatus === "failed" || nextStatus === "cancelled")) {
+    const item = db.prepare("select goal_id from goal_items where id = ?").get(String(task.goal_item_id)) as { goal_id?: string } | undefined;
+    if (item?.goal_id) {
+      const status: GoalItemStatus = nextStatus === "done" ? "completed" : nextStatus === "cancelled" ? "cancelled" : "failed";
+      updateGoalItem(String(item.goal_id), String(task.goal_item_id), { status }, "system");
+    }
+  }
   roomEvent(c.req.param("id"), "task.updated", { taskId: c.req.param("taskId"), status: nextStatus }, body.assignedAgentId !== undefined ? body.assignedAgentId : task.assigned_agent_id ? String(task.assigned_agent_id) : null);
   orchestrateRoom(c.req.param("id"), "task.updated");
   return c.json(roomTaskFromRow(db.prepare("select * from room_tasks where id = ?").get(c.req.param("taskId")) as Record<string, unknown>));
@@ -13870,6 +14801,10 @@ app.post("/api/rooms/:id/tasks/:taskId/cancel", (c) => {
   }
   const now = new Date().toISOString();
   db.prepare("update room_tasks set status = 'cancelled', finished_at = ?, updated_at = ? where id = ?").run(now, now, c.req.param("taskId"));
+  if (task.goal_item_id) {
+    const item = db.prepare("select goal_id from goal_items where id = ?").get(String(task.goal_item_id)) as { goal_id?: string } | undefined;
+    if (item?.goal_id) updateGoalItem(String(item.goal_id), String(task.goal_item_id), { status: "cancelled" }, "system");
+  }
   roomEvent(c.req.param("id"), "task.cancelled", { taskId: c.req.param("taskId") }, task.assigned_agent_id ? String(task.assigned_agent_id) : null);
   roomEvent(c.req.param("id"), "audit.operation", { action: "task-cancelled", taskId: c.req.param("taskId"), runId: run?.id ?? null }, task.assigned_agent_id ? String(task.assigned_agent_id) : null);
   return c.json(roomTaskFromRow(db.prepare("select * from room_tasks where id = ?").get(c.req.param("taskId")) as Record<string, unknown>));
@@ -13879,6 +14814,10 @@ app.post("/api/rooms/:id/tasks/:taskId/retry", (c) => {
   if (!task) return c.json({ error: "room_task_not_found" }, 404);
   if (!task.assigned_agent_id) return c.json({ error: "room_task_unassigned" }, 400);
   db.prepare("update room_tasks set status = 'assigned', started_at = null, finished_at = null, updated_at = ? where id = ?").run(new Date().toISOString(), c.req.param("taskId"));
+  if (task.goal_item_id) {
+    const item = db.prepare("select goal_id from goal_items where id = ?").get(String(task.goal_item_id)) as { goal_id?: string } | undefined;
+    if (item?.goal_id) updateGoalItem(String(item.goal_id), String(task.goal_item_id), { status: "active" }, "system");
+  }
   roomEvent(c.req.param("id"), "task.retry", { taskId: c.req.param("taskId") }, String(task.assigned_agent_id));
   roomEvent(c.req.param("id"), "audit.operation", { action: "task-retry", taskId: c.req.param("taskId") }, String(task.assigned_agent_id));
   orchestrateRoom(c.req.param("id"), "task.retry");

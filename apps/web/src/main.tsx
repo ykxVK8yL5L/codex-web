@@ -18,6 +18,7 @@ import {
   FolderPlus,
   GitPullRequest,
   Globe,
+  GripVertical,
   History,
   Info,
   Lock,
@@ -111,6 +112,12 @@ import type {
   FileEntry,
   FileListResponse,
   FileMount,
+  GoalDetailResponse,
+  GoalFocusStatus,
+  GoalItemStatus,
+  GoalMode,
+  GoalStatus,
+  GoalSummary,
   LoginResponse,
   MaintenanceCleanupResponse,
   MessageCardSummary,
@@ -145,6 +152,7 @@ import type {
   QueueMessageRequest,
   RateLimitSettings,
   RenameFileRequest,
+  ReorderQueuedMessagesRequest,
   AgentRunSummary,
   RecoverCodexTaskRequest,
   RoomEventSummary,
@@ -215,6 +223,7 @@ type ComposerFileReference = {
 };
 const workspaceChangedEvent = "codex-workspace-changed";
 const taskActivityChangedEvent = "codex-task-activity-changed";
+const sessionInfoRequestedEvent = "codex-session-info-requested";
 const browserNotificationsEnabledKey = "codex-web-browser-notifications-enabled";
 const suppressedAppNotificationsKey = "codex-web-suppressed-app-notifications";
 
@@ -249,6 +258,21 @@ function readableNotificationEvent(type: NotificationEventType, t: TFunction) {
   if (type === "needs_approval") return t("session.notifyEventApproval");
   if (type === "auth_login") return t("session.notifyEventLogin");
   return type;
+}
+
+function readableGoalMode(mode: GoalMode, t: TFunction) {
+  if (mode === "tracked") return t("goal.modeTracked");
+  if (mode === "managed") return t("goal.modeManaged");
+  if (mode === "orchestrated") return t("goal.modeOrchestrated");
+  return t("goal.modeReference");
+}
+
+function readableGoalStatus(status: GoalStatus | GoalFocusStatus, t: TFunction) {
+  if (status === "paused") return t("goal.statusPaused");
+  if (status === "completed") return t("goal.statusCompleted");
+  if (status === "cancelled") return t("goal.statusCancelled");
+  if (status === "archived") return t("goal.statusArchived");
+  return t("goal.statusActive");
 }
 
 const storageItemTypeLabels: Record<StorageItemSummary["type"], TranslationKey> = {
@@ -1132,6 +1156,31 @@ function App() {
     }));
   }
 
+  async function reorderQueuedMessages(sessionId: string, orderedIds: string[]) {
+    const body: ReorderQueuedMessagesRequest = { orderedIds };
+    const previousQueue = messageQueues[sessionId] ?? [];
+    const optimisticQueue = orderedIds
+      .map((id) => previousQueue.find((item) => item.id === id))
+      .filter((item): item is QueuedMessage => Boolean(item));
+    if (optimisticQueue.length === previousQueue.length) {
+      setMessageQueues((items) => ({ ...items, [sessionId]: optimisticQueue }));
+    }
+    const response = await fetch(`/api/codex/tasks/${sessionId}/queue`, {
+      method: "PATCH",
+      headers: {
+        authorization: `Bearer ${sessionToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      setMessageQueues((items) => ({ ...items, [sessionId]: previousQueue }));
+      return;
+    }
+    const queue = (await response.json()) as QueuedMessage[];
+    setMessageQueues((items) => ({ ...items, [sessionId]: queue }));
+  }
+
   async function deleteQueuedMessage(sessionId: string, queueId: string) {
     const response = await fetch(`/api/codex/tasks/${sessionId}/queue/${queueId}`, {
       method: "DELETE",
@@ -1319,8 +1368,8 @@ function App() {
           />
         </div>
       )}
-      {page === "sessions" && (routeSessionPending ? <SessionLoadingPage t={t} onOpenMainNav={() => setMainNavOpen(true)} onOpenSessionNav={() => setSessionNavOpen(true)} /> : <SessionPage sessionToken={sessionToken} t={t} notify={notify} session={activeSession} project={activeSession ? projects.find((project) => project.id === activeSession.projectId) : projects.find((project) => project.id === draftTaskProjectId)} projects={projects} draftProjectId={draftTaskProjectId} onDraftProjectId={setDraftTaskProjectId} providers={providers} selectedProviderId={selectedProviderId} onSelectProvider={setSelectedProviderId} taskDetail={activeSession ? taskDetails[activeSession.id] : undefined} optimisticMessages={activeSession ? optimisticMessages[activeSession.id] ?? [] : []} queuedMessages={activeSession ? messageQueues[activeSession.id] ?? [] : []} onQueueChange={(sessionId, queue) => setMessageQueues((items) => ({ ...items, [sessionId]: queue }))} onTaskDetail={handleTaskDetail} onSubmitTask={createCodexTask} onContinueTask={continueCodexTask} onRecoverTask={recoverCodexTask} onUpdateQueuedMessage={updateQueuedMessage} onDeleteQueuedMessage={deleteQueuedMessage} onStopTask={stopCodexTask} onDeleteSession={deleteSession} onSessionUpdated={(nextSession) => setSessions((items) => items.map((item) => item.id === nextSession.id ? nextSession : item))} onOpenSession={navigateSession} onOpenMainNav={() => setMainNavOpen(true)} onOpenSessionNav={() => setSessionNavOpen(true)} />)}
-      {page === "sessions" && <ContextPanel sessionToken={sessionToken} session={activeSession} t={t} onOpenFile={(path) => {
+      {page === "sessions" && (routeSessionPending ? <SessionLoadingPage t={t} onOpenMainNav={() => setMainNavOpen(true)} onOpenSessionNav={() => setSessionNavOpen(true)} /> : <SessionPage sessionToken={sessionToken} t={t} notify={notify} session={activeSession} project={activeSession ? projects.find((project) => project.id === activeSession.projectId) : projects.find((project) => project.id === draftTaskProjectId)} projects={projects} draftProjectId={draftTaskProjectId} onDraftProjectId={setDraftTaskProjectId} providers={providers} selectedProviderId={selectedProviderId} onSelectProvider={setSelectedProviderId} taskDetail={activeSession ? taskDetails[activeSession.id] : undefined} optimisticMessages={activeSession ? optimisticMessages[activeSession.id] ?? [] : []} queuedMessages={activeSession ? messageQueues[activeSession.id] ?? [] : []} onQueueChange={(sessionId, queue) => setMessageQueues((items) => ({ ...items, [sessionId]: queue }))} onTaskDetail={handleTaskDetail} onSubmitTask={createCodexTask} onContinueTask={continueCodexTask} onRecoverTask={recoverCodexTask} onUpdateQueuedMessage={updateQueuedMessage} onReorderQueuedMessages={reorderQueuedMessages} onDeleteQueuedMessage={deleteQueuedMessage} onStopTask={stopCodexTask} onDeleteSession={deleteSession} onSessionUpdated={(nextSession) => setSessions((items) => items.map((item) => item.id === nextSession.id ? nextSession : item))} onOpenSession={navigateSession} onOpenMainNav={() => setMainNavOpen(true)} onOpenSessionNav={() => setSessionNavOpen(true)} />)}
+      {page === "sessions" && <ContextPanel sessionToken={sessionToken} session={activeSession} taskDetail={activeSession ? taskDetails[activeSession.id] : undefined} queuedMessages={activeSession ? messageQueues[activeSession.id] ?? [] : []} onUpdateQueuedMessage={updateQueuedMessage} onReorderQueuedMessages={reorderQueuedMessages} onDeleteQueuedMessage={deleteQueuedMessage} t={t} onOpenFile={(path) => {
         const params = new URLSearchParams({ path });
         if (activeSession?.workspacePath) {
           params.set("rootPath", activeSession.workspacePath);
@@ -1530,6 +1579,393 @@ function SessionLoadingPage({ t, onOpenMainNav, onOpenSessionNav }: { t: TFuncti
   );
 }
 
+function GoalPanel({
+  sessionToken,
+  goal,
+  ownerType,
+  ownerId,
+  t,
+  notify,
+  onGoalChange,
+  agents = [],
+  compact = false,
+  expandSignal = 0,
+}: {
+  sessionToken: string;
+  goal?: GoalSummary | null;
+  ownerType: "session" | "agent_session" | "room";
+  ownerId: string;
+  t: TFunction;
+  notify: (message: string, tone?: ToastTone) => void;
+  onGoalChange: (goal: GoalSummary | null) => void;
+  agents?: Array<{ id: string; name: string }>;
+  compact?: boolean;
+  expandSignal?: number;
+}) {
+  const [text, setText] = useState(goal?.text ?? "");
+  const [mode, setMode] = useState<GoalMode>(goal?.mode ?? (ownerType === "room" ? "orchestrated" : "reference"));
+  const [focusText, setFocusText] = useState("");
+  const [itemTitle, setItemTitle] = useState("");
+  const [itemAgentId, setItemAgentId] = useState("");
+  const [managerAgentId, setManagerAgentId] = useState(goal?.managerAgentId ?? "");
+  const [coordinatorAgentId, setCoordinatorAgentId] = useState(goal?.coordinatorAgentId ?? "");
+  const [detail, setDetail] = useState<GoalDetailResponse | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [expanded, setExpanded] = useState(false);
+  useEffect(() => {
+    if (expandSignal > 0) setExpanded(true);
+  }, [expandSignal]);
+  useEffect(() => {
+    setText(goal?.text ?? "");
+    setMode(goal?.mode ?? (ownerType === "room" ? "orchestrated" : "reference"));
+    setManagerAgentId(goal?.managerAgentId ?? "");
+    setCoordinatorAgentId(goal?.coordinatorAgentId ?? "");
+  }, [goal?.id, goal?.text, goal?.mode, goal?.managerAgentId, goal?.coordinatorAgentId, ownerType]);
+  useEffect(() => {
+    if (!goal?.id) {
+      setDetail(null);
+      return;
+    }
+    const goalId = goal.id;
+    let cancelled = false;
+    async function loadGoalDetail() {
+      const response = await fetch(`/api/goals/${goalId}`, { headers: { authorization: `Bearer ${sessionToken}` } });
+      if (!response.ok || cancelled) return;
+      setDetail(await response.json() as GoalDetailResponse);
+    }
+    void loadGoalDetail();
+    return () => {
+      cancelled = true;
+    };
+  }, [goal?.id, sessionToken]);
+  const items = detail?.items ?? [];
+  const focuses = detail?.focuses ?? [];
+  const events = detail?.events ?? [];
+  const proposals = detail?.proposals ?? [];
+  const pendingProposals = proposals.filter((proposal) => proposal.status === "pending");
+  async function refreshGoal(goalId: string) {
+    const response = await fetch(`/api/goals/${goalId}`, { headers: { authorization: `Bearer ${sessionToken}` } });
+    if (!response.ok) return;
+    const next = await response.json() as GoalDetailResponse;
+    setDetail(next);
+    onGoalChange(next.goal);
+  }
+  async function saveGoal(event: React.FormEvent) {
+    event.preventDefault();
+    const nextText = text.trim();
+    if (!nextText) return;
+    setBusy(true);
+    try {
+      const response = await fetch(goal ? `/api/goals/${goal.id}` : "/api/goals", {
+        method: goal ? "PATCH" : "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${sessionToken}` },
+        body: JSON.stringify(goal
+          ? { text: nextText, mode, managerAgentId: managerAgentId || null, coordinatorAgentId: coordinatorAgentId || null }
+          : { ownerType, ownerId, text: nextText, mode, managerAgentId: managerAgentId || null, coordinatorAgentId: coordinatorAgentId || null }),
+      });
+      if (!response.ok) throw new Error("goal_save_failed");
+      const next = await response.json() as GoalSummary;
+      onGoalChange(next);
+      notify(t(goal ? "goal.updated" : "goal.created"), "success");
+    } catch {
+      notify(t("goal.saveFailed"), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function updateGoalStatus(status: GoalStatus) {
+    if (!goal) return;
+    setBusy(true);
+    try {
+      const response = await fetch(`/api/goals/${goal.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", authorization: `Bearer ${sessionToken}` },
+        body: JSON.stringify({ status }),
+      });
+      if (!response.ok) throw new Error("goal_status_failed");
+      onGoalChange(await response.json() as GoalSummary);
+    } catch {
+      notify(t("goal.saveFailed"), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function createFocus(event: React.FormEvent) {
+    event.preventDefault();
+    if (!goal?.id || !focusText.trim()) return;
+    setBusy(true);
+    try {
+      const response = await fetch(`/api/goals/${goal.id}/focuses`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${sessionToken}` },
+        body: JSON.stringify({ text: focusText.trim() }),
+      });
+      if (!response.ok) throw new Error("goal_focus_failed");
+      setFocusText("");
+      await refreshGoal(goal.id);
+    } catch {
+      notify(t("goal.saveFailed"), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function createItem(event: React.FormEvent) {
+    event.preventDefault();
+    if (!goal?.id || !itemTitle.trim()) return;
+    setBusy(true);
+    try {
+      const response = await fetch(`/api/goals/${goal.id}/items`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${sessionToken}` },
+        body: JSON.stringify({ title: itemTitle.trim(), assignedAgentId: itemAgentId || null, status: "planned" }),
+      });
+      if (!response.ok) throw new Error("goal_item_failed");
+      setItemTitle("");
+      await refreshGoal(goal.id);
+    } catch {
+      notify(t("goal.saveFailed"), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function updateFocusStatus(focusId: string, status: GoalFocusStatus) {
+    if (!goal?.id) return;
+    setBusy(true);
+    try {
+      const response = await fetch(`/api/goals/${goal.id}/focuses/${focusId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", authorization: `Bearer ${sessionToken}` },
+        body: JSON.stringify({ status }),
+      });
+      if (!response.ok) throw new Error("goal_focus_update_failed");
+      await refreshGoal(goal.id);
+    } catch {
+      notify(t("goal.saveFailed"), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function updateItemStatus(itemId: string, status: GoalItemStatus) {
+    if (!goal?.id) return;
+    setBusy(true);
+    try {
+      const response = await fetch(`/api/goals/${goal.id}/items/${itemId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", authorization: `Bearer ${sessionToken}` },
+        body: JSON.stringify({ status }),
+      });
+      if (!response.ok) throw new Error("goal_item_update_failed");
+      await refreshGoal(goal.id);
+    } catch {
+      notify(t("goal.saveFailed"), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function approveProposal(proposalId: string) {
+    if (!goal?.id) return;
+    setBusy(true);
+    try {
+      const response = await fetch(`/api/goals/${goal.id}/proposals/${proposalId}/approve`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) throw new Error("goal_proposal_approve_failed");
+      await refreshGoal(goal.id);
+    } catch {
+      notify(t("goal.saveFailed"), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function rejectProposal(proposalId: string) {
+    if (!goal?.id) return;
+    setBusy(true);
+    try {
+      const response = await fetch(`/api/goals/${goal.id}/proposals/${proposalId}/reject`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) throw new Error("goal_proposal_reject_failed");
+      await refreshGoal(goal.id);
+    } catch {
+      notify(t("goal.saveFailed"), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function planGoal() {
+    if (!goal?.id) return;
+    setBusy(true);
+    try {
+      const response = await fetch(`/api/goals/${goal.id}/plan`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) throw new Error("goal_plan_failed");
+      await refreshGoal(goal.id);
+    } catch {
+      notify(t("goal.saveFailed"), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function orchestrateGoal() {
+    if (!goal?.id) return;
+    setBusy(true);
+    try {
+      const response = await fetch(`/api/goals/${goal.id}/orchestrate`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) throw new Error("goal_orchestrate_failed");
+      const result = await response.json() as { goal: GoalSummary; tasks: unknown[] };
+      onGoalChange(result.goal);
+      notify(t("goal.orchestrated").replace("{count}", String(result.tasks.length)), "success");
+      await refreshGoal(result.goal.id);
+    } catch {
+      notify(t("goal.orchestrateFailed"), "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <section className={`goal-panel ${compact ? "compact" : ""}`}>
+      <div className="goal-panel-head">
+        <div>
+          <strong>{t("goal.title")}</strong>
+          <span>{goal ? `${readableGoalMode(goal.mode, t)} · ${readableGoalStatus(goal.status, t)}` : t("goal.optional")}</span>
+        </div>
+        <button className={`ghost-button icon-only goal-toggle ${expanded ? "open" : ""}`} type="button" onClick={() => setExpanded((value) => !value)} title={expanded ? t("action.collapse") : t("action.details")} aria-label={expanded ? t("action.collapse") : t("action.details")}>
+          <ChevronDown size={16} />
+        </button>
+      </div>
+      {expanded && <form className="goal-form" onSubmit={saveGoal}>
+        <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder={t("goal.placeholder")} rows={compact ? 2 : 3} />
+        <div className="goal-form-row">
+          <select value={mode} onChange={(event) => setMode(event.target.value as GoalMode)}>
+            <option value="reference">{t("goal.modeReference")}</option>
+            <option value="tracked">{t("goal.modeTracked")}</option>
+            <option value="managed">{t("goal.modeManaged")}</option>
+            <option value="orchestrated">{t("goal.modeOrchestrated")}</option>
+          </select>
+          <button className="ghost-button" type="submit" disabled={busy || !text.trim()}>{goal ? t("goal.update") : t("goal.create")}</button>
+        </div>
+        {agents.length > 0 && (
+          <div className="goal-form-row">
+            <select value={managerAgentId} onChange={(event) => setManagerAgentId(event.target.value)}>
+              <option value="">{t("goal.noManager")}</option>
+              {agents.map((agent) => <option key={agent.id} value={agent.id}>{t("goal.manager")}: {agent.name}</option>)}
+            </select>
+            <select value={coordinatorAgentId} onChange={(event) => setCoordinatorAgentId(event.target.value)}>
+              <option value="">{t("goal.noCoordinator")}</option>
+              {agents.map((agent) => <option key={agent.id} value={agent.id}>{t("goal.coordinator")}: {agent.name}</option>)}
+            </select>
+          </div>
+        )}
+      </form>}
+      {expanded && goal && (
+        <>
+          <div className="goal-panel-actions">
+            <button className="ghost-button" type="button" disabled={busy} onClick={() => void planGoal()}>{t("goal.plan")}</button>
+            <button className="ghost-button" type="button" disabled={busy} onClick={() => void updateGoalStatus("completed")}>{t("goal.complete")}</button>
+            <button className="ghost-button" type="button" disabled={busy} onClick={() => void updateGoalStatus("cancelled")}>{t("goal.cancel")}</button>
+            {ownerType === "room" && <button className="ghost-button" type="button" disabled={busy} onClick={() => void orchestrateGoal()}>{t("goal.orchestrate")}</button>}
+          </div>
+          <div className="goal-progress">
+            <span>{t("goal.items")}: {goal.progress.totalItems}</span>
+            <span>{t("goal.active")}: {goal.progress.activeItems}</span>
+            <span>{t("goal.completed")}: {goal.progress.completedItems}</span>
+            <span>{t("goal.blocked")}: {goal.progress.blockedItems}</span>
+            <span>{t("goal.failed")}: {goal.progress.failedItems}</span>
+          </div>
+          {goal.currentFocus && (
+            <div className="goal-current-focus">
+              <div>
+                <strong>{t("progress.currentFocus")}</strong>
+                <span>{goal.currentFocus.text}</span>
+              </div>
+              <button className="ghost-button" type="button" disabled={busy} onClick={() => void updateFocusStatus(goal.currentFocus!.id, "completed")}>{t("goal.complete")}</button>
+            </div>
+          )}
+          <form className="goal-form inline" onSubmit={createFocus}>
+            <input value={focusText} onChange={(event) => setFocusText(event.target.value)} placeholder={goal.currentFocus?.text ?? t("goal.focusPlaceholder")} />
+            <button className="ghost-button" type="submit" disabled={busy || !focusText.trim()}>{t("goal.setFocus")}</button>
+          </form>
+          {pendingProposals.length > 0 && (
+            <div className="goal-proposal-list">
+              <strong>{t("goal.proposals")}</strong>
+              {pendingProposals.slice(0, 6).map((proposal) => (
+                <div className="goal-proposal" key={proposal.id}>
+                  <div>
+                    <strong>{proposal.title}</strong>
+                    <span>{proposal.kind} · {proposal.proposedByAgentId ?? "agent"} · {formatShortDate(proposal.createdAt)}</span>
+                  </div>
+                  <div className="goal-item-actions">
+                    <button className="ghost-button" type="button" disabled={busy} onClick={() => void approveProposal(proposal.id)}>{t("goal.approveProposal")}</button>
+                    <button className="ghost-button" type="button" disabled={busy} onClick={() => void rejectProposal(proposal.id)}>{t("goal.rejectProposal")}</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          {focuses.length > 1 && (
+            <details className="goal-history">
+              <summary>{t("goal.focusHistory")} · {focuses.length}</summary>
+              <div className="goal-item-list">
+                {focuses.slice(0, 6).map((focus) => (
+                  <div className="goal-item" key={focus.id}>
+                    <strong>{focus.text}</strong>
+                    <span>{readableGoalStatus(focus.status, t)} · {formatShortDate(focus.updatedAt)}</span>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
+          <form className="goal-form inline" onSubmit={createItem}>
+            <input value={itemTitle} onChange={(event) => setItemTitle(event.target.value)} placeholder={t("goal.itemPlaceholder")} />
+            {agents.length > 0 && (
+              <select value={itemAgentId} onChange={(event) => setItemAgentId(event.target.value)}>
+                <option value="">{t("room.unassigned")}</option>
+                {agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
+              </select>
+            )}
+            <button className="ghost-button" type="submit" disabled={busy || !itemTitle.trim()}>{t("goal.addItem")}</button>
+          </form>
+          {items.length > 0 && (
+            <div className="goal-item-list">
+              {items.slice(0, compact ? 4 : 8).map((item) => (
+                <div className="goal-item" key={item.id}>
+                  <strong>{item.title}</strong>
+                  <span>{item.status}{item.assignedAgentId ? ` · ${agents.find((agent) => agent.id === item.assignedAgentId)?.name ?? item.assignedAgentId}` : ""}{item.roomTaskId ? ` · ${item.roomTaskId}` : ""}</span>
+                  <div className="goal-item-actions">
+                    {item.status !== "completed" && <button className="ghost-button" type="button" disabled={busy} onClick={() => void updateItemStatus(item.id, "completed")}>{t("goal.complete")}</button>}
+                    {item.status !== "blocked" && item.status !== "completed" && <button className="ghost-button" type="button" disabled={busy} onClick={() => void updateItemStatus(item.id, "blocked")}>{t("goal.blocked")}</button>}
+                    {item.status === "blocked" && <button className="ghost-button" type="button" disabled={busy} onClick={() => void updateItemStatus(item.id, "active")}>{t("goal.active")}</button>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          {events.length > 0 && (
+            <details className="goal-history">
+              <summary>{t("goal.events")} · {events.length}</summary>
+              <div className="goal-event-list">
+                {events.slice(0, 8).map((event) => (
+                  <div className="goal-event" key={event.id}>
+                    <strong>{event.type}</strong>
+                    <span>{event.actorType ?? "system"} · {formatShortDate(event.createdAt)}</span>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
 function SessionPage({
   sessionToken,
   t,
@@ -1551,6 +1987,7 @@ function SessionPage({
   onContinueTask,
   onRecoverTask,
   onUpdateQueuedMessage,
+  onReorderQueuedMessages,
   onDeleteQueuedMessage,
   onStopTask,
   onDeleteSession,
@@ -1579,6 +2016,7 @@ function SessionPage({
   onContinueTask: (sessionId: string, prompt: string, providerId: string | null, model: string | null, replyToMessageId?: string | null, attachments?: UploadAttachmentInput[], displayPrompt?: string) => Promise<void>;
   onRecoverTask: (sessionId: string, prompt: string, providerId: string | null, model: string | null) => Promise<void>;
   onUpdateQueuedMessage: (sessionId: string, queueId: string, prompt: string, providerId: string | null, model: string | null, replyToMessageId?: string | null) => Promise<void>;
+  onReorderQueuedMessages: (sessionId: string, orderedIds: string[]) => Promise<void>;
   onDeleteQueuedMessage: (sessionId: string, queueId: string) => Promise<void>;
   onStopTask: (sessionId: string) => Promise<void>;
   onDeleteSession: (sessionId: string) => Promise<void>;
@@ -1607,7 +2045,8 @@ function SessionPage({
   const [messageCards, setMessageCards] = useState<MessageCardSummary[]>([]);
   const [workspacePanel, setWorkspacePanel] = useState<"files" | "terminal" | null>(null);
   const [infoOpen, setInfoOpen] = useState(false);
-  const [mobileContextPanel, setMobileContextPanel] = useState<"changes" | "activity" | null>(null);
+  const [goalInfoExpandSignal, setGoalInfoExpandSignal] = useState(0);
+  const [mobileContextPanel, setMobileContextPanel] = useState<"progress" | "changes" | "activity" | null>(null);
   const [roomConsoleOpen, setRoomConsoleOpen] = useState(false);
   const [taskLogPanel, setTaskLogPanel] = useState<{ log: string } | null>(null);
   const [taskContextPanel, setTaskContextPanel] = useState<{ files: TaskContextResponse["files"]; selectedName: string; content: string } | null>(null);
@@ -1627,6 +2066,7 @@ function SessionPage({
   const [roomMessageMode, setRoomMessageMode] = useState<"sse" | "polling">(() => readLocalStorageValue("codex-web-room-message-mode", "sse") === "polling" ? "polling" : "sse");
   const [roomDisplayName, setRoomDisplayName] = useState("");
   const [replyTarget, setReplyTarget] = useState<SessionMessage | null>(null);
+  const [draggedQueueId, setDraggedQueueId] = useState<string | null>(null);
   const [compactingMemory, setCompactingMemory] = useState(false);
   const [slashMenuTarget, setSlashMenuTarget] = useState<"prompt" | "room" | null>(null);
   const [slashMenuIndex, setSlashMenuIndex] = useState(0);
@@ -1688,6 +2128,12 @@ function SessionPage({
     ? (session.title.includes(":") ? session.title.split(":")[0]?.trim() || session.title : session.title)
     : "C";
   const pageSessionTitle = session?.title;
+  const goalOwnerType: "session" | "agent_session" | "room" = session?.roomId
+    ? "room"
+    : session?.conversationType === "agent"
+      ? "agent_session"
+      : "session";
+  const goalOwnerId = goalOwnerType === "room" ? session?.roomId ?? "" : session?.id ?? "";
   const taskFailed = session?.status === "paused" && typeof taskDetail?.exitCode === "number" && taskDetail.exitCode !== 0;
   const taskInterrupted = session?.status === "interrupted";
   const realtimeNotice = isRoomSession ? roomEventStreamNotice : eventStreamNotice;
@@ -1696,6 +2142,16 @@ function SessionPage({
   const visibleMessages = session
     ? mergeMessages(persistedMessages.length ? persistedMessages : fallbackMessages, optimisticMessages)
     : draftSubmittedMessages;
+  useEffect(() => {
+    function handleSessionInfoRequested(event: Event) {
+      const detail = (event as CustomEvent<{ sessionId?: string; expandGoal?: boolean }>).detail;
+      if (!session?.id || detail?.sessionId !== session.id) return;
+      setInfoOpen(true);
+      if (detail?.expandGoal) setGoalInfoExpandSignal((value) => value + 1);
+    }
+    window.addEventListener(sessionInfoRequestedEvent, handleSessionInfoRequested);
+    return () => window.removeEventListener(sessionInfoRequestedEvent, handleSessionInfoRequested);
+  }, [session?.id]);
   const notifyRecipients = (notifySettings?.recipients ?? []).filter((recipient) => recipient.enabled);
   const notifyRecipientKinds = [...new Set(notifyRecipients.map((recipient) => recipient.kind))];
   const filteredNotifyRecipients = notifyRecipients.filter((recipient) => recipient.kind === notifyChannelKind);
@@ -1718,6 +2174,12 @@ function SessionPage({
     if (!sender || sender === assistantDisplayName) return;
     const mention = roomMentionToken(sender);
     setRoomMessage((current) => current.includes(mention) ? current : `${mention} ${current}`);
+  }
+
+  function handleSessionGoalChange(goal: GoalSummary | null) {
+    if (!session) return;
+    onSessionUpdated({ ...session, goal, updatedAt: new Date().toISOString() });
+    if (session.roomId) setRoomRefreshKey((current) => current + 1);
   }
   const sessionInfoItems = [
     { label: t("session.infoTitleLabel"), value: pageSessionTitle ?? t("session.untitled") },
@@ -1975,6 +2437,7 @@ function SessionPage({
     });
     if (!response.ok) return;
     setMessageCards((await response.json()) as MessageCardSummary[]);
+    window.dispatchEvent(new CustomEvent(taskActivityChangedEvent, { detail: { sessionId: session.id } }));
   }
 
   async function deleteMessageCard(cardId: string) {
@@ -2699,6 +3162,18 @@ function SessionPage({
     }
   }
 
+  function reorderQueuedMessage(dragId: string | null, dropId: string) {
+    if (!session?.id || !dragId || dragId === dropId) return;
+    const dragIndex = queuedMessages.findIndex((item) => item.id === dragId);
+    const dropIndex = queuedMessages.findIndex((item) => item.id === dropId);
+    if (dragIndex < 0 || dropIndex < 0) return;
+    const nextQueue = [...queuedMessages];
+    const [moved] = nextQueue.splice(dragIndex, 1);
+    nextQueue.splice(dropIndex, 0, moved);
+    setDraggedQueueId(null);
+    void onReorderQueuedMessages(session.id, nextQueue.map((item) => item.id));
+  }
+
   function openWorkspaceFiles() {
     if (!session?.workspacePath) return;
     setWorkspacePanel("files");
@@ -2995,6 +3470,7 @@ function SessionPage({
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 <DropdownMenuItem onSelect={() => setInfoOpen(true)}><IconText icon={Info}>{t("session.infoTitle")}</IconText></DropdownMenuItem>
+                <DropdownMenuItem disabled={!session} onSelect={() => setMobileContextPanel("progress")}><IconText icon={Check}>{t("progress.title")}</IconText></DropdownMenuItem>
                 <DropdownMenuItem disabled={!session} onSelect={() => setMobileContextPanel("activity")}><IconText icon={Activity}>{t("session.activityTitle")}</IconText></DropdownMenuItem>
                 <DropdownMenuItem disabled={!session} onSelect={() => setMobileContextPanel("changes")}><IconText icon={FolderGit2}>{t("workspace.changes")}</IconText></DropdownMenuItem>
                 <DropdownMenuItem disabled={!session} onSelect={() => void openSessionPreviews()}><IconText icon={Globe}>{t("project.preview")}</IconText></DropdownMenuItem>
@@ -3064,6 +3540,10 @@ function SessionPage({
                   key={item.id}
                   item={item}
                   index={index}
+                  dragging={draggedQueueId === item.id}
+                  onDragStart={() => setDraggedQueueId(item.id)}
+                  onDragEnd={() => setDraggedQueueId(null)}
+                  onDropOn={() => reorderQueuedMessage(draggedQueueId, item.id)}
                   onSave={(nextPrompt) => onUpdateQueuedMessage(
                     session.id,
                     item.id,
@@ -3231,7 +3711,7 @@ function SessionPage({
           <section className="dialog-card mobile-context-card" role="dialog" aria-modal="true">
             <div className="dialog-head">
               <div>
-                <strong>{mobileContextPanel === "activity" ? t("session.activityTitle") : t("workspace.changes")}</strong>
+                <strong>{mobileContextPanel === "progress" ? t("progress.title") : mobileContextPanel === "activity" ? t("session.activityTitle") : t("workspace.changes")}</strong>
                 <p>{pageSessionTitle ?? t("session.untitled")}</p>
               </div>
               <button className="drawer-close" type="button" onClick={() => setMobileContextPanel(null)} title={t("action.close")}>
@@ -3241,6 +3721,11 @@ function SessionPage({
             <ContextPanel
               sessionToken={sessionToken}
               session={session}
+              taskDetail={taskDetail}
+              queuedMessages={queuedMessages}
+              onUpdateQueuedMessage={onUpdateQueuedMessage}
+              onReorderQueuedMessages={onReorderQueuedMessages}
+              onDeleteQueuedMessage={onDeleteQueuedMessage}
               t={t}
               initialPanel={mobileContextPanel}
               modal
@@ -3287,6 +3772,21 @@ function SessionPage({
                   <Switch checked={session.notificationsEnabled !== false} onCheckedChange={(checked) => void updateSessionNotifications(checked)} />
                 </label>
                 <span className="subtle">{t("session.notificationsHelp")}</span>
+              </div>
+            )}
+            {session && goalOwnerId && (
+              <div className="session-info-goal">
+                <GoalPanel
+                  sessionToken={sessionToken}
+                  goal={session.goal}
+                  ownerType={goalOwnerType}
+                  ownerId={goalOwnerId}
+                  t={t}
+                  notify={notify}
+                  onGoalChange={handleSessionGoalChange}
+                  agents={roomMentionAgents}
+                  expandSignal={goalInfoExpandSignal}
+                />
               </div>
             )}
             {session?.conversationType === "room" && (
@@ -3546,12 +4046,20 @@ function SessionPage({
 function QueuedMessageRow({
   item,
   index,
+  dragging,
+  onDragStart,
+  onDragEnd,
+  onDropOn,
   onSave,
   onDelete,
   t,
 }: {
   item: QueuedMessage;
   index: number;
+  dragging: boolean;
+  onDragStart: () => void;
+  onDragEnd: () => void;
+  onDropOn: () => void;
   onSave: (prompt: string) => Promise<void>;
   onDelete: () => Promise<void>;
   t: TFunction;
@@ -3564,8 +4072,26 @@ function QueuedMessageRow({
   }, [item.prompt]);
 
   return (
-    <div className="queue-item">
+    <div
+      className={`queue-item ${dragging ? "dragging" : ""}`}
+      draggable={!editing}
+      onDragStart={(event) => {
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", item.id);
+        onDragStart();
+      }}
+      onDragEnd={onDragEnd}
+      onDragOver={(event) => {
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+      }}
+      onDrop={(event) => {
+        event.preventDefault();
+        onDropOn();
+      }}
+    >
       <span className="queue-index">{index + 1}</span>
+      <span className="queue-drag-handle" title={t("action.more")} aria-hidden="true"><GripVertical size={15} /></span>
       {editing ? (
         <textarea name="draft" value={draft} rows={2} onChange={(event) => setDraft(event.target.value)} />
       ) : (
@@ -3612,6 +4138,7 @@ type RoomConsoleUpdate = { roomId: string; event: RoomEventSummary; tasks: RoomT
 
 function RoomConsole({ sessionToken, roomId, sessionWorkspacePath, projectWorkspacePath, reloadKey, recentUpdate, realtimeFallback, roomMessageMode, onRoomMessageModeChange, t, notify, onRoomName, onOpenSession }: { sessionToken: string; roomId: string; sessionWorkspacePath?: string | null; projectWorkspacePath?: string | null; reloadKey?: number; recentUpdate?: RoomConsoleUpdate | null; realtimeFallback?: boolean; roomMessageMode: "sse" | "polling"; onRoomMessageModeChange: (mode: "sse" | "polling") => void; t: TFunction; notify: (message: string, tone?: ToastTone) => void; onRoomName?: (name: string) => void; onOpenSession: (sessionId: string) => void }) {
   const [room, setRoom] = useState<RoomSummary | null>(null);
+  const [roomGoalDetail, setRoomGoalDetail] = useState<GoalDetailResponse | null>(null);
   const [agents, setAgents] = useState<RoomAgentSummary[]>([]);
   const [allAgents, setAllAgents] = useState<AgentSummary[]>([]);
   const [tasks, setTasks] = useState<RoomTaskSummary[]>([]);
@@ -3680,6 +4207,14 @@ function RoomConsole({ sessionToken, roomId, sessionWorkspacePath, projectWorksp
     .filter((item) => item.run?.workspacePath);
   const roomMessageEvents = events.filter((event) => event.type === "user.message" || event.type === "agent.mentioned");
   const roomBlackboardCount = artifacts.length + decisions.length + handoffs.length;
+  const roomGoalItems = roomGoalDetail?.items ?? [];
+  const roomGoalProposals = roomGoalDetail?.proposals.filter((proposal) => proposal.status === "pending") ?? [];
+  const roomGoalColumns = [
+    { id: "planned", label: t("goal.items"), items: roomGoalItems.filter((item) => item.status === "planned") },
+    { id: "active", label: t("goal.active"), items: roomGoalItems.filter((item) => item.status === "active") },
+    { id: "blocked", label: t("goal.blocked"), items: roomGoalItems.filter((item) => item.status === "blocked") },
+    { id: "completed", label: t("goal.completed"), items: roomGoalItems.filter((item) => item.status === "completed") },
+  ];
   const roomTimeline = [
     ...tasks.slice(0, 4).map((task) => ({ id: task.id, title: task.title, meta: `${t("room.tasks")} · ${task.status}` })),
     ...runs.slice(0, 4).map((run) => ({ id: run.id, title: agents.find((agent) => agent.id === run.agentId)?.name ?? run.agentId, meta: `${t("room.runs")} · ${run.status}` })),
@@ -3720,6 +4255,12 @@ function RoomConsole({ sessionToken, roomId, sessionWorkspacePath, projectWorksp
       fetchRoomPage<RoomHandoffSummary>("handoffs"),
     ]) as [RoomSummary | null, RoomAgentSummary[], PageResponse<AgentSummary>, PageResponse<RoomTaskSummary>, PageResponse<RoomScheduleSummary>, PageResponse<AgentRunSummary>, PageResponse<RoomEventSummary>, PageResponse<RoomArtifactSummary>, PageResponse<RoomDecisionSummary>, PageResponse<RoomHandoffSummary>];
     setRoom(roomDetail);
+    if (roomDetail?.goal?.id) {
+      const goalResponse = await fetch(`/api/goals/${roomDetail.goal.id}`, { headers });
+      setRoomGoalDetail(goalResponse.ok ? await goalResponse.json() as GoalDetailResponse : null);
+    } else {
+      setRoomGoalDetail(null);
+    }
     if (roomDetail?.name) onRoomName?.(roomDetail.name);
     setAgents(agentList);
     setAllAgents(allAgentPage.items ?? []);
@@ -4122,6 +4663,7 @@ function RoomConsole({ sessionToken, roomId, sessionWorkspacePath, projectWorksp
       <Tabs className="room-tabs" defaultValue="overview">
         <TabsList className="settings-tabs" aria-label={t("room.title")}>
           <TabsTrigger className="settings-tab" value="overview">{t("room.overview")}</TabsTrigger>
+          <TabsTrigger className="settings-tab" value="goal">{t("room.goalBoard")}</TabsTrigger>
           <TabsTrigger className="settings-tab" value="messages">{t("room.messages")} {roomMessageEvents.length}</TabsTrigger>
           <TabsTrigger className="settings-tab" value="members">{t("room.members")} {agents.length}</TabsTrigger>
           <TabsTrigger className="settings-tab" value="tasks">{t("room.tasks")} {tasks.length}</TabsTrigger>
@@ -4168,6 +4710,59 @@ function RoomConsole({ sessionToken, roomId, sessionWorkspacePath, projectWorksp
             ))}
             {!roomTimeline.length && <div className="empty-state">{t("room.noActivity")}</div>}
           </div>
+        </TabsContent>
+        <TabsContent className="room-goal-board" value="goal">
+          {room?.goal ? (
+            <>
+              <div className="room-goal-board-head">
+                <div>
+                  <strong>{room.goal.text}</strong>
+                  <span>{readableGoalMode(room.goal.mode, t)} · {readableGoalStatus(room.goal.status, t)}</span>
+                </div>
+                <div className="room-goal-board-stats">
+                  <span>{t("goal.items")}: {room.goal.progress.totalItems}</span>
+                  <span>{t("goal.active")}: {room.goal.progress.activeItems}</span>
+                  <span>{t("goal.completed")}: {room.goal.progress.completedItems}</span>
+                  <span>{t("goal.blocked")}: {room.goal.progress.blockedItems}</span>
+                </div>
+              </div>
+              {room.goal.currentFocus && (
+                <div className="room-goal-focus">
+                  <strong>{t("progress.currentFocus")}</strong>
+                  <span>{room.goal.currentFocus.text}</span>
+                </div>
+              )}
+              {roomGoalProposals.length > 0 && (
+                <div className="room-goal-proposals">
+                  <strong>{t("goal.proposals")}</strong>
+                  {roomGoalProposals.slice(0, 4).map((proposal) => (
+                    <span key={proposal.id}>{proposal.title} · {proposal.kind} · {formatShortDate(proposal.createdAt)}</span>
+                  ))}
+                </div>
+              )}
+              <div className="room-goal-columns">
+                {roomGoalColumns.map((column) => (
+                  <section className="room-goal-column" key={column.id}>
+                    <strong>{column.label}</strong>
+                    {column.items.map((item) => {
+                      const linkedTask = tasks.find((task) => task.goalItemId === item.id || task.id === item.roomTaskId);
+                      return (
+                        <article className="room-goal-card" key={item.id}>
+                          <strong>{item.title}</strong>
+                          <span>{item.assignedAgentId ? agents.find((agent) => agent.id === item.assignedAgentId)?.name ?? item.assignedAgentId : t("room.unassigned")}</span>
+                          {linkedTask && <span>{t("room.tasks")}: {linkedTask.status}</span>}
+                          {item.description && <code>{item.description}</code>}
+                        </article>
+                      );
+                    })}
+                    {!column.items.length && <div className="empty-state">{t("room.noTasks")}</div>}
+                  </section>
+                ))}
+              </div>
+            </>
+          ) : (
+            <div className="empty-state">{t("progress.noProgress")}</div>
+          )}
         </TabsContent>
         <TabsContent className="room-list" value="messages">
           {roomMessageEvents.map((event) => {
@@ -4605,29 +5200,86 @@ function MessageCards({ items, sessionToken, t, notify, onDelete }: { items: Mes
 function ContextPanel({
   sessionToken,
   session,
+  taskDetail,
+  queuedMessages = [],
+  onUpdateQueuedMessage,
+  onReorderQueuedMessages,
+  onDeleteQueuedMessage,
   t,
   onOpenFile,
-  initialPanel = "activity",
+  initialPanel = "progress",
   modal = false,
 }: {
   sessionToken: string;
   session?: SessionSummary;
+  taskDetail?: CodexTaskDetail;
+  queuedMessages?: QueuedMessage[];
+  onUpdateQueuedMessage?: (sessionId: string, queueId: string, prompt: string, providerId: string | null, model: string | null, replyToMessageId?: string | null) => Promise<void>;
+  onReorderQueuedMessages?: (sessionId: string, orderedIds: string[]) => Promise<void>;
+  onDeleteQueuedMessage?: (sessionId: string, queueId: string) => Promise<void>;
   t: TFunction;
   onOpenFile: (path: string) => void;
-  initialPanel?: "changes" | "activity";
+  initialPanel?: "progress" | "changes" | "activity";
   modal?: boolean;
 }) {
   const dialog = useAppDialog(t);
-  const [activePanel, setActivePanel] = useState<"changes" | "activity">(initialPanel);
+  const [activePanel, setActivePanel] = useState<"progress" | "changes" | "activity">(initialPanel);
   const [changes, setChanges] = useState<WorkspaceChanges | null>(null);
+  const [goalDetail, setGoalDetail] = useState<GoalDetailResponse | null>(null);
+  const [previews, setPreviews] = useState<PreviewSummary[]>([]);
+  const [browserCards, setBrowserCards] = useState<MessageCardSummary[]>([]);
   const [selectedPath, setSelectedPath] = useState("");
   const [message, setMessage] = useState("");
   const [activityItems, setActivityItems] = useState<ActivityItem[]>([]);
   const [activityCursor, setActivityCursor] = useState<string | null>(null);
   const [activityHasMore, setActivityHasMore] = useState(false);
+  const [contextDraggedQueueId, setContextDraggedQueueId] = useState<string | null>(null);
   const activityRefreshTimerRef = useRef<number | null>(null);
   const changesRefreshTimerRef = useRef<number | null>(null);
   const selectedFile = changes?.files.find((item) => item.path === selectedPath) ?? changes?.files[0] ?? null;
+  const goal = goalDetail?.goal ?? session?.goal ?? null;
+  const goalItems = goalDetail?.items ?? [];
+  const latestActivity = activityItems[0] ?? null;
+  const previewIds = new Set(previews.map((preview) => preview.id));
+  const browserRows = [
+    ...previews.map((preview) => ({
+      id: `preview:${preview.id}`,
+      label: preview.label,
+      detail: `${t("project.preview")} · ${preview.status}`,
+      href: preview.url,
+      cardId: null as string | null,
+    })),
+    ...browserCards.flatMap((card) => {
+      const payload = (card.payload && typeof card.payload === "object" ? card.payload : {}) as Record<string, unknown>;
+      const previewId = typeof payload.previewId === "string" ? payload.previewId : null;
+      if (previewId && previewIds.has(previewId)) return [];
+      const href = typeof payload.url === "string" ? payload.url : null;
+      if (!href) return [];
+      return [{
+        id: card.id,
+        label: card.title || href,
+        detail: card.type,
+        href,
+        cardId: card.id,
+      }];
+    }),
+  ].slice(0, 6);
+  const progressSteps = [
+    ...(goal ? [{ id: goal.id, label: goal.text, meta: `${readableGoalMode(goal.mode, t)} · ${readableGoalStatus(goal.status, t)}`, done: goal.status === "completed" }] : []),
+    ...(goal?.currentFocus ? [{ id: goal.currentFocus.id, label: goal.currentFocus.text, meta: t("progress.currentFocus"), done: goal.currentFocus.status === "completed" }] : []),
+    ...goalItems.slice(0, 5).map((item) => ({
+      id: item.id,
+      label: item.title,
+      meta: [item.status, item.assignedAgentId].filter(Boolean).join(" · "),
+      done: item.status === "completed",
+    })),
+    ...activityItems.slice(0, Math.max(0, goalItems.length ? 3 : 6)).map((item) => ({
+      id: item.id ?? `${item.kind}-${item.at}`,
+      label: item.label,
+      meta: readableActivityStatus(item.status, item.kind, t),
+      done: item.status === "completed",
+    })),
+  ].slice(0, 8);
 
   useEffect(() => {
     setActivePanel(initialPanel);
@@ -4654,6 +5306,43 @@ function ContextPanel({
       void loadChanges();
     }, 900);
   }, [loadChanges]);
+
+  const loadGoalDetail = useCallback(async () => {
+    if (!session?.goal?.id) {
+      setGoalDetail(null);
+      return;
+    }
+    const response = await fetch(`/api/goals/${session.goal.id}`, {
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    if (!response.ok) return;
+    setGoalDetail((await response.json()) as GoalDetailResponse);
+  }, [session?.goal?.id, sessionToken]);
+
+  const loadPreviews = useCallback(async () => {
+    if (!session?.id) {
+      setPreviews([]);
+      return;
+    }
+    const params = new URLSearchParams({ scopeType: "session", scopeId: session.id });
+    const response = await fetch(`/api/previews?${params}`, {
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    if (!response.ok) return;
+    setPreviews((await response.json()) as PreviewSummary[]);
+  }, [session?.id, sessionToken]);
+
+  const loadBrowserCards = useCallback(async () => {
+    if (!session?.id) {
+      setBrowserCards([]);
+      return;
+    }
+    const response = await fetch(`/api/sessions/${session.id}/cards`, {
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    if (!response.ok) return;
+    setBrowserCards((await response.json()) as MessageCardSummary[]);
+  }, [session?.id, sessionToken]);
 
   const loadActivity = useCallback(async (older = false) => {
     if (!session?.id) {
@@ -4688,11 +5377,24 @@ function ContextPanel({
   }, [loadChanges]);
 
   useEffect(() => {
+    void loadGoalDetail();
+  }, [loadGoalDetail]);
+
+  useEffect(() => {
+    void loadPreviews();
+  }, [loadPreviews]);
+
+  useEffect(() => {
+    void loadBrowserCards();
+  }, [loadBrowserCards]);
+
+  useEffect(() => {
     setActivityItems([]);
     setActivityCursor(null);
     setActivityHasMore(false);
-    if (activePanel === "activity") void loadActivity();
-  }, [activePanel, session?.id, sessionToken]);
+    if (activePanel === "activity" || activePanel === "progress") void loadActivity();
+    if (activePanel === "progress") void Promise.all([loadPreviews(), loadBrowserCards()]);
+  }, [activePanel, loadBrowserCards, loadPreviews, session?.id, sessionToken]);
 
   useEffect(() => {
     function handleWorkspaceChanged(event: Event) {
@@ -4714,8 +5416,9 @@ function ContextPanel({
     function handleTaskActivityChanged(event: Event) {
       const detail = (event as CustomEvent<{ sessionId?: string }>).detail;
       if (!session?.id || detail?.sessionId !== session.id) return;
-      if (activePanel !== "activity") return;
+      if (activePanel !== "activity" && activePanel !== "progress") return;
       scheduleLoadActivity();
+      if (activePanel === "progress") void loadBrowserCards();
     }
     window.addEventListener(taskActivityChangedEvent, handleTaskActivityChanged);
     return () => {
@@ -4725,7 +5428,7 @@ function ContextPanel({
         activityRefreshTimerRef.current = null;
       }
     };
-  }, [activePanel, scheduleLoadActivity, session?.id]);
+  }, [activePanel, loadBrowserCards, scheduleLoadActivity, session?.id]);
 
   async function copyPatch(file?: WorkspaceChangeFile | null) {
     const value = file ? file.patch || file.newContent || "" : changes?.raw.diff ?? "";
@@ -4780,11 +5483,40 @@ function ContextPanel({
     window.setTimeout(() => setMessage(""), 1200);
   }
 
+  function openSessionGoalSettings() {
+    if (!session?.id) return;
+    window.dispatchEvent(new CustomEvent(sessionInfoRequestedEvent, { detail: { sessionId: session.id, expandGoal: true } }));
+  }
+
+  function reorderContextQueue(dragId: string | null, dropId: string) {
+    if (!session?.id || !onReorderQueuedMessages || !dragId || dragId === dropId) return;
+    const dragIndex = queuedMessages.findIndex((item) => item.id === dragId);
+    const dropIndex = queuedMessages.findIndex((item) => item.id === dropId);
+    if (dragIndex < 0 || dropIndex < 0) return;
+    const nextQueue = [...queuedMessages];
+    const [moved] = nextQueue.splice(dragIndex, 1);
+    nextQueue.splice(dropIndex, 0, moved);
+    setContextDraggedQueueId(null);
+    void onReorderQueuedMessages(session.id, nextQueue.map((item) => item.id));
+  }
+
+  async function dismissBrowserCard(cardId: string | null) {
+    if (!session?.id || !cardId) return;
+    const response = await fetch(`/api/sessions/${session.id}/cards/${encodeURIComponent(cardId)}`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    if (response.ok) await loadBrowserCards();
+  }
+
   return (
     <aside className={`context-panel ${modal ? "mobile-context-panel" : ""}`}>
       {dialog.node}
       <header className="context-header">
         <div className="context-tabs" role="tablist" aria-label={t("session.infoTitle")}>
+          <button className="context-tab" type="button" role="tab" aria-selected={activePanel === "progress"} data-state={activePanel === "progress" ? "active" : "inactive"} onClick={() => setActivePanel("progress")} title={t("progress.title")}>
+            <IconText icon={Check}>{t("progress.title")}</IconText>
+          </button>
           <button className="context-tab" type="button" role="tab" aria-selected={activePanel === "changes"} data-state={activePanel === "changes" ? "active" : "inactive"} onClick={() => setActivePanel("changes")} title={t("workspace.changes")}>
             <IconText icon={FolderGit2}>{t("workspace.changes")}</IconText>
           </button>
@@ -4792,8 +5524,90 @@ function ContextPanel({
             <IconText icon={Activity}>{t("session.activityTitle")}</IconText>
           </button>
         </div>
-        <button className="ghost-button icon-only" type="button" title={t("action.refresh")} aria-label={t("action.refresh")} onClick={() => activePanel === "changes" ? void loadChanges() : void loadActivity()} disabled={!session}><IconText icon={RefreshCw}>{t("action.refresh")}</IconText></button>
+        <button className="ghost-button icon-only" type="button" title={t("action.refresh")} aria-label={t("action.refresh")} onClick={() => activePanel === "changes" ? void loadChanges() : activePanel === "progress" ? void Promise.all([loadActivity(), loadGoalDetail(), loadPreviews(), loadBrowserCards()]) : void loadActivity()} disabled={!session}><IconText icon={RefreshCw}>{t("action.refresh")}</IconText></button>
       </header>
+      <section className={`panel progress-panel ${activePanel === "progress" ? "active" : ""}`}>
+        <div className="progress-section">
+          <div className="progress-section-head">
+            <strong>{t("progress.title")}</strong>
+            <button className="ghost-button compact-action" type="button" disabled={!session} onClick={openSessionGoalSettings}>
+              {goal ? t("goal.update") : t("goal.create")}
+            </button>
+          </div>
+          <div className="progress-step-list">
+            {progressSteps.map((step) => (
+              <div className="progress-step" key={step.id}>
+                <span className={`progress-check ${step.done ? "done" : ""}`}><Check size={12} /></span>
+                <div>
+                  <strong>{step.label}</strong>
+                  {step.meta && <span>{step.meta}</span>}
+                </div>
+              </div>
+            ))}
+            {!progressSteps.length && <div className="empty-state">{session ? t("progress.noProgress") : t("workspace.noSession")}</div>}
+          </div>
+        </div>
+        <div className="progress-divider" />
+        <div className="progress-section">
+          <div className="progress-section-head">
+            <strong>{t("progress.execution")}</strong>
+            <Activity size={15} />
+          </div>
+          <div className="progress-meta-list">
+            <div className="progress-meta-row"><Clock3 size={15} /><span>{t("session.infoStatus")}</span><strong>{readableStatus(session?.status, t)}</strong></div>
+            <div className="progress-meta-row"><Activity size={15} /><span>{t("progress.latestActivity")}</span><strong>{latestActivity ? readableActivityStatus(latestActivity.status, latestActivity.kind, t) : "-"}</strong></div>
+            {latestActivity && <div className="progress-meta-row wide"><Info size={15} /><span>{latestActivity.label}</span><strong>{formatShortDate(latestActivity.at)}</strong></div>}
+            {taskDetail?.exitCode !== undefined && taskDetail.exitCode !== null && <div className="progress-meta-row"><TerminalIcon size={15} /><span>{t("project.exitCode")}</span><strong>{taskDetail.exitCode}</strong></div>}
+          </div>
+        </div>
+        <div className="progress-divider" />
+        <div className="progress-section">
+          <div className="progress-section-head">
+            <strong>{t("session.queueTitle")}</strong>
+            <span>{queuedMessages.length} {t("session.queueUnit")}</span>
+          </div>
+          <div className="context-queue-list">
+            {queuedMessages.slice(0, 6).map((item, index) => (
+              <QueuedMessageRow
+                key={item.id}
+                item={item}
+                index={index}
+                dragging={contextDraggedQueueId === item.id}
+                onDragStart={() => setContextDraggedQueueId(item.id)}
+                onDragEnd={() => setContextDraggedQueueId(null)}
+                onDropOn={() => reorderContextQueue(contextDraggedQueueId, item.id)}
+                onSave={(nextPrompt) => session && onUpdateQueuedMessage
+                  ? onUpdateQueuedMessage(session.id, item.id, nextPrompt, item.providerId ?? session.providerId ?? null, item.model ?? session.model ?? null, item.replyToMessageId ?? null)
+                  : Promise.resolve()}
+                onDelete={() => session && onDeleteQueuedMessage ? onDeleteQueuedMessage(session.id, item.id) : Promise.resolve()}
+                t={t}
+              />
+            ))}
+            {!queuedMessages.length && <div className="empty-state">{t("progress.noQueuedInput")}</div>}
+          </div>
+        </div>
+        <div className="progress-divider" />
+        <div className="progress-section">
+          <div className="progress-section-head">
+            <strong>{t("progress.browser")}</strong>
+            <Globe size={15} />
+          </div>
+          <div className="progress-meta-list">
+            {browserRows.map((row) => (
+              <div className="progress-browser-row" key={row.id}>
+                <a className="progress-meta-row progress-link-row" href={row.href} target="_blank" rel="noreferrer">
+                  <Globe size={15} />
+                  <span>{row.label}</span>
+                  <strong>{row.detail}</strong>
+                </a>
+                <button className="ghost-button icon-only" type="button" title={t("action.copy")} aria-label={t("action.copy")} onClick={() => void copyText(row.href)}><IconText icon={Copy}>{t("action.copy")}</IconText></button>
+                {row.cardId && <button className="ghost-button icon-only" type="button" title={t("action.delete")} aria-label={t("action.delete")} onClick={() => void dismissBrowserCard(row.cardId)}><IconText icon={Trash2}>{t("action.delete")}</IconText></button>}
+              </div>
+            ))}
+            {!browserRows.length && <div className="empty-state">{t("project.noPreviews")}</div>}
+          </div>
+        </div>
+      </section>
       <section className={`panel ${activePanel === "changes" ? "active" : ""}`}>
         <div className="diff-summary">
           <strong>{changes ? `${changes.summary.filesChanged} ${t("workspace.filesChanged")}` : t("workspace.noSession")}</strong>
