@@ -4,6 +4,7 @@ import type {
   CodexRuntimeSettings,
   CodexSandboxMode,
   PreviewAccessSettings,
+  SessionCompactionSettings,
 } from "@codex-web/protocol";
 
 type RuntimeSettingsDefaults = {
@@ -83,6 +84,51 @@ export function createRuntimeSettingsStore(db: Database.Database, defaultsInput:
     `).run(JSON.stringify(settings), settings.updatedAt);
   }
 
+  function defaultSessionCompactionSettings(): SessionCompactionSettings {
+    return {
+      enabled: true,
+      autoCompactMessages: 80,
+      autoCompactChars: 80_000,
+      minNewMessages: 20,
+      minNewChars: 12_000,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  function sanitizeSessionCompactionSettings(value?: Partial<SessionCompactionSettings>): SessionCompactionSettings {
+    const defaults = defaultSessionCompactionSettings();
+    const numberValue = (input: unknown, fallback: number, min: number, max: number) => {
+      const parsed = Number(input ?? fallback);
+      return Number.isFinite(parsed) ? Math.min(Math.max(Math.floor(parsed), min), max) : fallback;
+    };
+    return {
+      enabled: typeof value?.enabled === "boolean" ? value.enabled : defaults.enabled,
+      autoCompactMessages: numberValue(value?.autoCompactMessages, defaults.autoCompactMessages, 1, 100_000),
+      autoCompactChars: numberValue(value?.autoCompactChars, defaults.autoCompactChars, 1_000, 10_000_000),
+      minNewMessages: numberValue(value?.minNewMessages, defaults.minNewMessages, 1, 10_000),
+      minNewChars: numberValue(value?.minNewChars, defaults.minNewChars, 1_000, 2_000_000),
+      updatedAt: typeof value?.updatedAt === "string" ? value.updatedAt : defaults.updatedAt,
+    };
+  }
+
+  function loadSessionCompactionSettings(): SessionCompactionSettings {
+    const row = db.prepare("select value from app_settings where key = 'session_compaction'").get() as { value: string } | undefined;
+    if (!row) return defaultSessionCompactionSettings();
+    try {
+      return sanitizeSessionCompactionSettings(JSON.parse(row.value) as Partial<SessionCompactionSettings>);
+    } catch {
+      return defaultSessionCompactionSettings();
+    }
+  }
+
+  function saveSessionCompactionSettings(settings: SessionCompactionSettings) {
+    db.prepare(`
+      insert into app_settings (key, value, updated_at)
+      values ('session_compaction', ?, ?)
+      on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at
+    `).run(JSON.stringify(settings), settings.updatedAt);
+  }
+
   return {
     codexRuntime: {
       load: loadCodexRuntimeSettings,
@@ -93,6 +139,11 @@ export function createRuntimeSettingsStore(db: Database.Database, defaultsInput:
       load: loadPreviewAccessSettings,
       save: savePreviewAccessSettings,
       sanitize: sanitizePreviewAccessSettings,
+    },
+    sessionCompaction: {
+      load: loadSessionCompactionSettings,
+      save: saveSessionCompactionSettings,
+      sanitize: sanitizeSessionCompactionSettings,
     },
   };
 }

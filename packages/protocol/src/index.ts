@@ -13,6 +13,7 @@ export interface SessionSummary {
   providerId?: string | null;
   model?: string | null;
   codexSessionId?: string | null;
+  notificationsEnabled?: boolean;
   status: "running" | "paused" | "done" | "interrupted";
   createdAt?: string;
   updatedAt: string;
@@ -77,7 +78,7 @@ export interface ProjectStatsSummary {
   previewStatusCounts: Record<string, number>;
 }
 
-export type PreviewScopeType = "project" | "session";
+export type PreviewScopeType = "project" | "session" | "folder";
 export type PreviewAccess = "private" | "public";
 
 export interface PreviewSummary {
@@ -129,6 +130,9 @@ export interface ProviderSummary {
   capabilities?: ProviderCapabilities;
   models?: string[];
   modelsCachedAt?: string | null;
+  rpmLimit?: number | null;
+  rpmLimitEnabled?: boolean;
+  useProxy?: boolean;
 }
 
 export interface ProviderCapabilities {
@@ -209,6 +213,23 @@ export interface PreviewAccessSettings {
   updatedAt: string;
 }
 
+export interface SessionCompactionSettings {
+  enabled: boolean;
+  autoCompactMessages: number;
+  autoCompactChars: number;
+  minNewMessages: number;
+  minNewChars: number;
+  updatedAt: string;
+}
+
+export interface UpdateSessionCompactionSettingsRequest {
+  enabled?: boolean;
+  autoCompactMessages?: number;
+  autoCompactChars?: number;
+  minNewMessages?: number;
+  minNewChars?: number;
+}
+
 export interface RateLimitSettings {
   enabled: boolean;
   globalPerMinute: number;
@@ -276,6 +297,220 @@ export interface MaintenanceCleanupResponse {
   updated: {
     detachedSessions: number;
   };
+}
+
+export interface TaskHealthItem {
+  sessionId: string;
+  title: string;
+  sessionStatus: SessionSummary["status"];
+  runId?: string | null;
+  runStatus?: TaskRunSummary["status"] | null;
+  pid?: number | null;
+  pidAlive: boolean;
+  runnerRunning?: boolean | null;
+  runnerExitCode?: number | null;
+  childPid?: number | null;
+  childPidAlive?: boolean | null;
+  logBytes: number;
+  updatedAt: string;
+  issue?: string | null;
+}
+
+export interface TaskHealthResponse {
+  ok: boolean;
+  checkedAt: string;
+  items: TaskHealthItem[];
+}
+
+export interface TaskHealthRepairResponse {
+  ok: boolean;
+  repaired: Array<{ sessionId: string; issue: string; action: string }>;
+  health: TaskHealthResponse;
+}
+
+export type NotificationChannelKind = "webhook" | "bark" | "email" | "telegram";
+export type NotificationChannelAdapter = "webhook" | "authenticated_webhook" | "email" | "telegram";
+export type NotificationChannelAuthType = "none" | "bearer" | "query_token" | "token_request";
+export type NotificationSeverity = "info" | "success" | "warning" | "error";
+export type NotificationEventType = "task_completed" | "task_failed" | "task_interrupted" | "needs_approval" | "task_health_issue" | "provider_check_failed" | "backup_failed" | "restore_failed" | "auth_login";
+export type NotificationDeliveryStatus = "pending" | "sent" | "failed" | "skipped";
+
+export interface NotificationChannelDefinition {
+  id: string;
+  kind: NotificationChannelKind;
+  adapter?: NotificationChannelAdapter;
+  authType?: NotificationChannelAuthType;
+  name: string;
+  description: string;
+  builtin?: boolean;
+  method?: string;
+  urlTemplate?: string;
+  headersTemplate?: string;
+  bodyTemplate?: string;
+  accountFields?: string[];
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface NotificationAccountSummary {
+  id: string;
+  name: string;
+  channelId?: string | null;
+  channelKind: NotificationChannelKind;
+  enabled: boolean;
+  config: Record<string, unknown>;
+  permissions?: NotificationPermissionPolicy;
+  lastTestStatus?: NotificationDeliveryStatus | null;
+  lastError?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface NotificationRuleTarget {
+  accountId?: string;
+  recipientId?: string;
+  senderAccountId?: string | null;
+  chatId?: string;
+  emailTo?: string[];
+}
+
+export type NotificationRecipientKind = "email" | "webhook" | "bark" | "telegram";
+
+export interface NotificationPermissionPolicy {
+  allowedAgentIds?: string[];
+  allowedRoomIds?: string[];
+  allowedProjectIds?: string[];
+}
+
+export interface NotificationRecipientSummary {
+  id: string;
+  name: string;
+  kind: NotificationRecipientKind;
+  enabled: boolean;
+  senderAccountId?: string | null;
+  channelId?: string | null;
+  config: Record<string, unknown>;
+  permissions?: NotificationPermissionPolicy;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface NotificationRuleSummary {
+  id: string;
+  name: string;
+  enabled: boolean;
+  eventTypes: NotificationEventType[];
+  minSeverity: NotificationSeverity;
+  targets: NotificationRuleTarget[];
+  dedupeMinutes: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface NotificationDeliverySummary {
+  id: string;
+  ruleId?: string | null;
+  accountId?: string | null;
+  eventType: NotificationEventType;
+  severity: NotificationSeverity;
+  title: string;
+  message: string;
+  status: NotificationDeliveryStatus;
+  attempts: number;
+  responseStatus?: number | null;
+  lastError?: string | null;
+  metadata?: Record<string, unknown>;
+  createdAt: string;
+  sentAt?: string | null;
+}
+
+export interface NotificationEphemeralRuleSummary {
+  id: string;
+  scopeType: "task" | "session" | "room_task";
+  scopeId: string;
+  eventTypes: NotificationEventType[];
+  targets: NotificationRuleTarget[];
+  enabled: boolean;
+  expireMode: "after_trigger" | "session_end" | "manual";
+  createdAt: string;
+  expiresAt?: string | null;
+  triggeredAt?: string | null;
+}
+
+export interface NotificationSettingsResponse {
+  channels: NotificationChannelDefinition[];
+  accounts: NotificationAccountSummary[];
+  recipients: NotificationRecipientSummary[];
+  rules: NotificationRuleSummary[];
+  ephemeralRules: NotificationEphemeralRuleSummary[];
+  recentDeliveries: NotificationDeliverySummary[];
+}
+
+export interface AppNotificationSummary {
+  id: string;
+  eventType: NotificationEventType;
+  severity: NotificationSeverity;
+  title: string;
+  message: string;
+  sourceType?: string | null;
+  sourceId?: string | null;
+  metadata?: Record<string, unknown>;
+  readAt?: string | null;
+  createdAt: string;
+}
+
+export interface AppNotificationsResponse {
+  items: AppNotificationSummary[];
+  unreadCount: number;
+}
+
+export type AppNotificationStreamEvent =
+  | ({ type: "snapshot" } & AppNotificationsResponse)
+  | { type: "notification"; notification: AppNotificationSummary; unreadCount: number };
+
+export interface UpsertNotificationAccountRequest {
+  name?: string;
+  channelId?: string;
+  channelKind?: NotificationChannelKind;
+  enabled?: boolean;
+  config?: Record<string, unknown>;
+  permissions?: NotificationPermissionPolicy;
+}
+
+export interface UpsertNotificationChannelRequest {
+  name?: string;
+  description?: string;
+  adapter?: NotificationChannelAdapter;
+  authType?: NotificationChannelAuthType;
+  method?: string;
+  urlTemplate?: string;
+  headersTemplate?: string;
+  bodyTemplate?: string;
+  accountFields?: string[];
+}
+
+export interface UpsertNotificationRecipientRequest {
+  name?: string;
+  kind?: NotificationRecipientKind;
+  enabled?: boolean;
+  senderAccountId?: string | null;
+  channelId?: string | null;
+  config?: Record<string, unknown>;
+  permissions?: NotificationPermissionPolicy;
+}
+
+export interface UpsertNotificationRuleRequest {
+  name?: string;
+  enabled?: boolean;
+  eventTypes?: NotificationEventType[];
+  minSeverity?: NotificationSeverity;
+  targets?: NotificationRuleTarget[];
+  dedupeMinutes?: number;
+}
+
+export interface TestNotificationAccountRequest {
+  emailTo?: string[];
+  chatId?: string;
 }
 
 export interface SystemBackupProjectReference {
@@ -360,6 +595,7 @@ export interface CreateSessionRequest {
 
 export interface UpdateSessionRequest {
   title?: string;
+  notificationsEnabled?: boolean;
 }
 
 export interface CreateCodexTaskRequest {
@@ -368,6 +604,12 @@ export interface CreateCodexTaskRequest {
   providerId?: string | null;
   model?: string | null;
   cwd?: string;
+  attachments?: UploadAttachmentInput[];
+  ephemeralNotifications?: Array<{
+    eventTypes?: NotificationEventType[];
+    targets?: NotificationRuleTarget[];
+    expireMode?: "after_trigger" | "session_end" | "manual";
+  }>;
 }
 
 export interface ContinueCodexTaskRequest {
@@ -375,6 +617,14 @@ export interface ContinueCodexTaskRequest {
   providerId?: string | null;
   model?: string | null;
   replyToMessageId?: string | null;
+  attachments?: UploadAttachmentInput[];
+}
+
+export interface UploadAttachmentInput {
+  name: string;
+  type?: string | null;
+  size?: number | null;
+  dataBase64: string;
 }
 
 export interface RecoverCodexTaskRequest {
@@ -505,6 +755,40 @@ export interface TaskContextFileResponse {
   updatedAt: string;
 }
 
+export interface SessionCompactionSummary {
+  id: string;
+  sessionId: string;
+  providerId?: string | null;
+  model?: string | null;
+  sourceMessageStartId?: string | null;
+  sourceMessageEndId?: string | null;
+  sourceMessageCount: number;
+  sourceChars: number;
+  promptHash: string;
+  filePath: string;
+  supersedesId?: string | null;
+  createdAt: string;
+}
+
+export interface CreateSessionCompactionRequest {
+  providerId?: string | null;
+  model?: string | null;
+}
+
+export interface UpdateSessionCompactionRequest {
+  summary: string;
+}
+
+export interface SessionCompactionResponse {
+  compaction: SessionCompactionSummary;
+  summary: string;
+}
+
+export interface SessionCompactionListResponse {
+  sessionId: string;
+  items: SessionCompactionSummary[];
+}
+
 export interface CodexTaskDiff {
   ok: boolean;
   cwd: string;
@@ -574,6 +858,9 @@ export interface CreateProviderRequest {
   baseUrl?: string;
   apiKey?: string;
   capabilities?: Partial<ProviderCapabilities>;
+  rpmLimit?: number | null;
+  rpmLimitEnabled?: boolean;
+  useProxy?: boolean;
 }
 
 export interface UpdateProviderRequest {
@@ -583,6 +870,9 @@ export interface UpdateProviderRequest {
   baseUrl?: string;
   apiKey?: string;
   capabilities?: Partial<ProviderCapabilities>;
+  rpmLimit?: number | null;
+  rpmLimitEnabled?: boolean;
+  useProxy?: boolean;
 }
 
 export interface ExtensionSummary {
@@ -1017,8 +1307,11 @@ export interface RoomSummary {
 export interface RoomOrchestrationSettings {
   autoStartTasks: boolean;
   autoCreateReviewTasks: boolean;
+  autoListenAfterAgentEvents: boolean;
   notifyUserOnFailure: boolean;
   maxAutoRetries: number;
+  maxAutoListenChainDepth: number;
+  maxAutoListenTasksPerEvent: number;
 }
 
 export interface CreateRoomRequest {
@@ -1116,6 +1409,7 @@ export interface CreateRoomMessageRequest {
   content: string;
   sessionId?: string | null;
   replyToMessageId?: string | null;
+  attachments?: UploadAttachmentInput[];
 }
 
 export interface CreateRoomMessageResponse {

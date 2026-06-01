@@ -2,13 +2,14 @@ import Database from "better-sqlite3";
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { spawn as spawnProcess, spawnSync, type ChildProcess } from "node:child_process";
+import { fork, spawn as spawnProcess, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn as spawnPty } from "node-pty";
 import { generateSecret, generateURI } from "otplib";
+import nodemailer from "nodemailer";
 import { WebSocketServer, WebSocket } from "ws";
 import type {
   ApprovalActionType,
@@ -28,6 +29,9 @@ import type {
   AgentRunSummary,
   AgentSummary,
   AgentWorkspaceMode,
+  AppNotificationSummary,
+  AppNotificationStreamEvent,
+  AppNotificationsResponse,
   ArchiveIgnoreTemplate,
   AuthState,
   AutomationRunSummary,
@@ -60,6 +64,7 @@ import type {
   CreateRoomRequest,
   CreateRoomMessageRequest,
   CreateSessionRequest,
+  CreateSessionCompactionRequest,
   UpdateSessionRequest,
   CreateTerminalSessionRequest,
   ExecutionContextSummary,
@@ -74,6 +79,21 @@ import type {
   LoginResponse,
   MaintenanceCleanupResponse,
   MessageCardSummary,
+  NotificationAccountSummary,
+  NotificationChannelAdapter,
+  NotificationChannelAuthType,
+  NotificationChannelDefinition,
+  NotificationChannelKind,
+  NotificationDeliveryStatus,
+  NotificationDeliverySummary,
+  NotificationEphemeralRuleSummary,
+  NotificationEventType,
+  NotificationPermissionPolicy,
+  NotificationRecipientSummary,
+  NotificationRuleSummary,
+  NotificationRuleTarget,
+  NotificationSeverity,
+  TestNotificationAccountRequest,
   PageResponse,
   PermissionProfileId,
   CreatePreviewRequest,
@@ -111,6 +131,10 @@ import type {
   RoomSummary,
   SaveFileRequest,
   SessionMessage,
+  SessionCompactionListResponse,
+  SessionCompactionResponse,
+  SessionCompactionSettings,
+  SessionCompactionSummary,
   SessionMessagesPage,
   SessionSummary,
   SetupCompleteRequest,
@@ -124,6 +148,11 @@ import type {
   SystemRestoreResponse,
   UpdateAccessTokenRequest,
   UpdateCodexRuntimeSettingsRequest,
+  UpsertNotificationAccountRequest,
+  UpsertNotificationChannelRequest,
+  UpsertNotificationRecipientRequest,
+  UpsertNotificationRuleRequest,
+  UpdateSessionCompactionSettingsRequest,
   UpdateSystemBackupSettingsRequest,
   UpdateRoomDecisionRequest,
   UpdateRoomHandoffRequest,
@@ -133,10 +162,13 @@ import type {
   TaskActivitySummary,
   TaskContextFileResponse,
   TaskContextResponse,
+  TaskHealthResponse,
+  TaskHealthRepairResponse,
   TerminalDefaultsResponse,
   TaskLogResponse,
   TaskRunSummary,
   TerminalSessionSummary,
+  UploadAttachmentInput,
   UpdateQueuedMessageRequest,
   UpdateAgentGroupRequest,
   UpdateAgentCircleRequest,
@@ -146,6 +178,7 @@ import type {
   UpdateProviderRequest,
   UpdateRoomRequest,
   UpdateRoomTaskRequest,
+  UpdateSessionCompactionRequest,
   UpdateTerminalSessionRequest,
   UpdateAutomationRequest,
   WorkspaceChangeFile,
@@ -209,6 +242,7 @@ type RoomStreamEvent =
 const app = new Hono();
 const sessionTtlMs = 7 * 24 * 60 * 60 * 1000;
 const dataDir = join(dirname(fileURLToPath(import.meta.url)), "../data");
+const codexRunnerPath = join(dirname(fileURLToPath(import.meta.url)), "codex-runner.mjs");
 const sqlitePath = join(dataDir, "codex-web.sqlite");
 const taskLogDir = join(dataDir, "task-logs");
 const archiveIgnoreTemplateDir = resolve(process.env.CODEX_WEB_IGNORE_TEMPLATE_DIR ?? join(dirname(fileURLToPath(import.meta.url)), "../templates/gitignore"));
@@ -254,6 +288,7 @@ let pendingOtpSecret = generateSecret();
 let pendingResetOtpSecret: string | null = null;
 let codexRuntimeSettings = runtimeSettingsStore.codexRuntime.load();
 let previewAccessSettings = runtimeSettingsStore.previewAccess.load();
+let sessionCompactionSettings = runtimeSettingsStore.sessionCompaction.load();
 let rateLimitSettings = rateLimitStore.load();
 let systemBackupSettings = loadSystemBackupSettings();
 const appData = loadAppData();
@@ -283,7 +318,6 @@ type PreviewAccessRequest = {
 };
 const previewAccessRequests = new Map<string, PreviewAccessRequest>();
 loadPreviewAccessRequests();
-pauseStaleRunningSessions();
 
 const terminalSessions = new Map<string, TerminalRuntime>();
 const deletedTerminalSessionIds = new Set<string>();
@@ -291,8 +325,21 @@ const codexTaskOutputs = new Map<string, { output: string; exitCode: number | nu
 const codexTaskProcesses = new Map<string, ChildProcess>();
 const codexTaskStopRequested = new Set<string>();
 const codexTaskStdoutBuffers = new Map<string, string>();
+const codexTaskLogOffsets = new Map<string, number>();
+const codexTaskTailers = new Map<string, NodeJS.Timeout>();
+const finalizedRecoveredTasks = new Set<string>();
 const codexTaskSubscribers = new Map<string, Set<(event: TaskEvent) => void>>();
 const roomEventSubscribers = new Map<string, Set<(event: RoomStreamEvent) => void>>();
+const appNotificationSubscribers = new Set<(event: AppNotificationStreamEvent) => void>();
+const telegramPollingOffsets = new Map<string, number>();
+const telegramPollingBusy = new Set<string>();
+const telegramPendingSends = new Map<string, { message: string; sessionIds: string[]; createdAt: number }>();
+const telegramPendingSelections = new Map<string, { ids: string[]; createdAt: number }>();
+const telegramPendingFileRoots = new Map<string, { roots: Array<{ label: string; root: string }>; createdAt: number }>();
+const telegramPendingFiles = new Map<string, { root: string; relPath: string; dirNames: string[]; createdAt: number }>();
+const telegramPendingTerminal = new Map<string, { command: string; roots: Array<{ label: string; root: string }>; createdAt: number }>();
+const telegramPendingInputs = new Map<string, { kind: "send" | "terminal"; createdAt: number }>();
+pauseStaleRunningSessions();
 recoverInterruptedRoomAgentRunsFromLogs();
 closePersistedRunningTerminals();
 
@@ -319,7 +366,10 @@ function openDatabase() {
       default_model text not null,
       base_url text,
       api_key text,
-      capabilities text
+      capabilities text,
+      rpm_limit integer,
+      rpm_limit_enabled integer not null default 0,
+      use_proxy integer not null default 0
     );
     create table if not exists projects (
       id text primary key,
@@ -340,6 +390,7 @@ function openDatabase() {
       provider_id text,
       model text,
       codex_session_id text,
+      notifications_enabled integer not null default 1,
       status text not null,
       created_at text,
       updated_at text not null
@@ -445,6 +496,114 @@ function openDatabase() {
       checked_at text not null
     );
     create index if not exists provider_health_provider_checked_idx on provider_health_checks(provider_id, checked_at desc, id desc);
+    create table if not exists notification_accounts (
+      id text primary key,
+      name text not null,
+      channel_id text,
+      channel_kind text not null,
+      enabled integer not null,
+      config text not null,
+      permissions text not null default '{}',
+      last_test_status text,
+      last_error text,
+      created_at text not null,
+      updated_at text not null
+    );
+    create index if not exists notification_accounts_kind_enabled_idx on notification_accounts(channel_kind, enabled, updated_at desc);
+    create table if not exists notification_channels (
+      id text primary key,
+      name text not null,
+      kind text not null,
+      adapter text not null default 'webhook',
+      auth_type text not null default 'none',
+      description text not null,
+      method text not null,
+      url_template text not null,
+      headers_template text not null,
+      body_template text not null,
+      account_fields text not null,
+      builtin integer not null default 0,
+      created_at text not null,
+      updated_at text not null
+    );
+    create index if not exists notification_channels_updated_idx on notification_channels(updated_at desc, id desc);
+    create table if not exists notification_recipients (
+      id text primary key,
+      name text not null,
+      kind text not null,
+      enabled integer not null,
+      sender_account_id text,
+      channel_id text,
+      config text not null,
+      permissions text not null default '{}',
+      created_at text not null,
+      updated_at text not null
+    );
+    create index if not exists notification_recipients_kind_enabled_idx on notification_recipients(kind, enabled, updated_at desc);
+    create table if not exists notification_rules (
+      id text primary key,
+      name text not null,
+      enabled integer not null,
+      event_types text not null,
+      min_severity text not null,
+      targets text not null,
+      dedupe_minutes integer not null,
+      created_at text not null,
+      updated_at text not null
+    );
+    create index if not exists notification_rules_enabled_updated_idx on notification_rules(enabled, updated_at desc);
+    create table if not exists notification_deliveries (
+      id text primary key,
+      rule_id text,
+      account_id text,
+      event_type text not null,
+      severity text not null,
+      title text not null,
+      message text not null,
+      status text not null,
+      attempts integer not null,
+      response_status integer,
+      last_error text,
+      metadata text,
+      created_at text not null,
+      sent_at text
+    );
+    create index if not exists notification_deliveries_created_idx on notification_deliveries(created_at desc, id desc);
+    create index if not exists notification_deliveries_dedupe_idx on notification_deliveries(rule_id, account_id, event_type, created_at desc);
+    create table if not exists notification_ephemeral_rules (
+      id text primary key,
+      scope_type text not null,
+      scope_id text not null,
+      event_types text not null,
+      targets text not null,
+      enabled integer not null,
+      expire_mode text not null,
+      created_at text not null,
+      expires_at text,
+      triggered_at text
+    );
+    create index if not exists notification_ephemeral_scope_idx on notification_ephemeral_rules(scope_type, scope_id, enabled, created_at desc);
+    create table if not exists telegram_chat_routes (
+      account_id text not null,
+      chat_id text not null,
+      session_id text not null,
+      updated_at text not null,
+      primary key (account_id, chat_id)
+    );
+    create table if not exists app_notifications (
+      id text primary key,
+      event_type text not null,
+      severity text not null,
+      title text not null,
+      message text not null,
+      source_type text,
+      source_id text,
+      metadata text,
+      read_at text,
+      created_at text not null
+    );
+    create index if not exists app_notifications_created_idx on app_notifications(created_at desc, id desc);
+    create index if not exists app_notifications_read_idx on app_notifications(read_at, created_at desc);
     create table if not exists provider_model_cache (
       provider_id text primary key,
       cache_key text not null,
@@ -467,6 +626,21 @@ function openDatabase() {
     );
     create index if not exists task_runs_session_started_idx on task_runs(session_id, started_at desc, id desc);
     create index if not exists task_runs_status_started_idx on task_runs(status, started_at desc, id desc);
+    create table if not exists session_compactions (
+      id text primary key,
+      session_id text not null,
+      provider_id text,
+      model text,
+      source_message_start_id text,
+      source_message_end_id text,
+      source_message_count integer not null,
+      source_chars integer not null,
+      prompt_hash text not null,
+      file_path text not null,
+      supersedes_id text,
+      created_at text not null
+    );
+    create index if not exists session_compactions_session_created_idx on session_compactions(session_id, created_at desc, id desc);
     create table if not exists task_activities (
       id text primary key,
       session_id text not null,
@@ -758,6 +932,17 @@ function openDatabase() {
   `);
   const providerColumns = database.prepare("pragma table_info(providers)").all() as Array<{ name: string }>;
   if (!providerColumns.some((column) => column.name === "capabilities")) database.prepare("alter table providers add column capabilities text").run();
+  if (!providerColumns.some((column) => column.name === "rpm_limit")) database.prepare("alter table providers add column rpm_limit integer").run();
+  if (!providerColumns.some((column) => column.name === "rpm_limit_enabled")) database.prepare("alter table providers add column rpm_limit_enabled integer not null default 0").run();
+  if (!providerColumns.some((column) => column.name === "use_proxy")) database.prepare("alter table providers add column use_proxy integer not null default 0").run();
+  const notificationAccountColumns = database.prepare("pragma table_info(notification_accounts)").all() as Array<{ name: string }>;
+  if (!notificationAccountColumns.some((column) => column.name === "channel_id")) database.prepare("alter table notification_accounts add column channel_id text").run();
+  if (!notificationAccountColumns.some((column) => column.name === "permissions")) database.prepare("alter table notification_accounts add column permissions text not null default '{}'").run();
+  const notificationRecipientColumns = database.prepare("pragma table_info(notification_recipients)").all() as Array<{ name: string }>;
+  if (!notificationRecipientColumns.some((column) => column.name === "permissions")) database.prepare("alter table notification_recipients add column permissions text not null default '{}'").run();
+  const notificationChannelColumns = database.prepare("pragma table_info(notification_channels)").all() as Array<{ name: string }>;
+  if (!notificationChannelColumns.some((column) => column.name === "adapter")) database.prepare("alter table notification_channels add column adapter text not null default 'webhook'").run();
+  if (!notificationChannelColumns.some((column) => column.name === "auth_type")) database.prepare("alter table notification_channels add column auth_type text not null default 'none'").run();
   const taskRunColumns = database.prepare("pragma table_info(task_runs)").all() as Array<{ name: string }>;
   if (!taskRunColumns.some((column) => column.name === "prompt_chars")) database.prepare("alter table task_runs add column prompt_chars integer").run();
   if (!taskRunColumns.some((column) => column.name === "prompt_hash")) database.prepare("alter table task_runs add column prompt_hash text").run();
@@ -775,6 +960,9 @@ function openDatabase() {
   }
   if (!sessionColumns.some((column) => column.name === "room_id")) {
     database.prepare("alter table sessions add column room_id text").run();
+  }
+  if (!sessionColumns.some((column) => column.name === "notifications_enabled")) {
+    database.prepare("alter table sessions add column notifications_enabled integer not null default 1").run();
   }
   const roomColumns = database.prepare("pragma table_info(rooms)").all() as Array<{ name: string }>;
   if (!roomColumns.some((column) => column.name === "session_id")) {
@@ -1177,6 +1365,15 @@ function createApproval(input: Omit<ApprovalRecord, "id" | "status" | "createdAt
     approval.createdAt,
     approval.resolvedAt,
   );
+  emitExternalNotification({
+    eventType: "needs_approval",
+    severity: approval.risk === "critical" || approval.risk === "high" ? "error" : "warning",
+    title: approval.title,
+    message: approval.description || approval.details,
+    sourceType: "approval",
+    sourceId: approval.id,
+    metadata: { actionType: approval.actionType, risk: approval.risk },
+  });
   return approval;
 }
 
@@ -1376,6 +1573,7 @@ function sessionFromRow(row: Record<string, unknown>, projects: ProjectSummary[]
     providerId: row.provider_id ? String(row.provider_id) : null,
     model: row.model ? String(row.model) : null,
     codexSessionId: row.codex_session_id ? String(row.codex_session_id) : null,
+    notificationsEnabled: row.notifications_enabled === undefined ? true : Boolean(row.notifications_enabled),
     status: row.status as SessionSummary["status"],
     createdAt: row.created_at ? String(row.created_at) : undefined,
     updatedAt: String(row.updated_at),
@@ -1466,6 +1664,12 @@ function mergeProviderCapabilities(kind: ProviderSummary["kind"], value?: Partia
   return { ...defaultProviderCapabilities(kind), ...(value ?? {}) };
 }
 
+function sanitizeProviderRpmLimit(value: unknown) {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.min(Math.floor(parsed), 100_000) : null;
+}
+
 function providerFromRow(row: Record<string, unknown>): ProviderRecord {
   const kind = row.kind as ProviderRecord["kind"];
   return {
@@ -1476,6 +1680,9 @@ function providerFromRow(row: Record<string, unknown>): ProviderRecord {
     baseUrl: row.base_url ? String(row.base_url) : undefined,
     apiKey: row.api_key ? String(row.api_key) : undefined,
     capabilities: parseProviderCapabilities(row.capabilities, kind),
+    rpmLimit: sanitizeProviderRpmLimit(row.rpm_limit),
+    rpmLimitEnabled: Boolean(row.rpm_limit_enabled),
+    useProxy: Boolean(row.use_proxy),
   };
 }
 
@@ -1685,8 +1892,8 @@ function readExtensionDetail(type: ExtensionSummary["type"], name: string, path?
 
 function upsertSession(session: SessionSummary) {
   db.prepare(`
-    insert into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, status, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    insert into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, status, created_at, updated_at)
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     on conflict(id) do update set
       kind = excluded.kind,
       conversation_type = excluded.conversation_type,
@@ -1697,6 +1904,7 @@ function upsertSession(session: SessionSummary) {
       provider_id = excluded.provider_id,
       model = excluded.model,
       codex_session_id = excluded.codex_session_id,
+      notifications_enabled = excluded.notifications_enabled,
       status = excluded.status,
       created_at = excluded.created_at,
       updated_at = excluded.updated_at
@@ -1711,6 +1919,7 @@ function upsertSession(session: SessionSummary) {
     session.providerId ?? null,
     session.model ?? null,
     session.codexSessionId ?? null,
+    session.notificationsEnabled === false ? 0 : 1,
     session.status,
     session.createdAt ?? null,
     session.updatedAt,
@@ -1733,16 +1942,19 @@ function upsertProject(project: ProjectSummary) {
 
 function upsertProvider(provider: ProviderRecord) {
   db.prepare(`
-    insert into providers (id, name, kind, default_model, base_url, api_key, capabilities)
-    values (?, ?, ?, ?, ?, ?, ?)
+    insert into providers (id, name, kind, default_model, base_url, api_key, capabilities, rpm_limit, rpm_limit_enabled, use_proxy)
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     on conflict(id) do update set
       name = excluded.name,
       kind = excluded.kind,
       default_model = excluded.default_model,
       base_url = excluded.base_url,
       api_key = excluded.api_key,
-      capabilities = excluded.capabilities
-  `).run(provider.id, provider.name, provider.kind, provider.defaultModel, provider.baseUrl ?? null, provider.apiKey ?? null, JSON.stringify(provider.capabilities ?? defaultProviderCapabilities(provider.kind)));
+      capabilities = excluded.capabilities,
+      rpm_limit = excluded.rpm_limit,
+      rpm_limit_enabled = excluded.rpm_limit_enabled,
+      use_proxy = excluded.use_proxy
+  `).run(provider.id, provider.name, provider.kind, provider.defaultModel, provider.baseUrl ?? null, provider.apiKey ?? null, JSON.stringify(provider.capabilities ?? defaultProviderCapabilities(provider.kind)), sanitizeProviderRpmLimit(provider.rpmLimit), provider.rpmLimitEnabled ? 1 : 0, provider.useProxy ? 1 : 0);
 }
 
 function upsertAutomation(automation: AutomationSummary) {
@@ -1808,6 +2020,25 @@ function setRoomParentSessionStatus(roomId: string, status: SessionSummary["stat
   publishTaskEvent(parentSession.id, status === "running" ? { type: "started", session: parentSession } : { type: "done", session: parentSession, exitCode: null });
 }
 
+function mentionsRoomUser(value: string) {
+  return /(^|\s)@user\b/i.test(value);
+}
+
+function roomTaskShouldNotifyUser(roomId?: string | null, taskId?: string | null, assistantContent = "") {
+  if (!roomId || !taskId) return false;
+  if (mentionsRoomUser(assistantContent)) return true;
+  const task = db.prepare("select prompt, payload from room_tasks where room_id = ? and id = ?").get(roomId, taskId) as { prompt?: string; payload?: string | null } | undefined;
+  const payload = jsonPayload(task?.payload) as { mentionsUser?: boolean };
+  if (payload.mentionsUser === true || mentionsRoomUser(task?.prompt ?? "")) return true;
+  const rows = db.prepare("select payload from room_events where room_id = ? order by created_at desc, id desc limit 80").all(roomId) as Array<{ payload?: string | null }>;
+  return rows.some((row) => {
+    const eventPayload = jsonPayload(row.payload) as { mentionsUser?: boolean; taskIds?: unknown[]; taskId?: unknown };
+    if (eventPayload.mentionsUser !== true) return false;
+    if (String(eventPayload.taskId ?? "") === taskId) return true;
+    return Array.isArray(eventPayload.taskIds) && eventPayload.taskIds.map(String).includes(taskId);
+  });
+}
+
 function finishAgentRun(sessionId: string, exitCode: number | null, stopped: boolean) {
   const status = stopped ? "stopped" : exitCode === 0 ? "done" : "failed";
   const now = new Date().toISOString();
@@ -1845,6 +2076,7 @@ function finishAgentRun(sessionId: string, exitCode: number | null, stopped: boo
           parentSession.updatedAt = message.createdAt;
           upsertSession(parentSession);
           publishTaskEvent(parentSession.id, { type: "message", message, session: parentSession });
+          scheduleSessionAutoCompaction(parentSession, "room-agent-message");
         }
       }
     }
@@ -2120,6 +2352,789 @@ function recordProviderHealthCheck(providerId: string, kind: ProviderHealthCheck
     result.error ?? null,
     new Date().toISOString(),
   );
+}
+
+const notificationChannels: NotificationChannelDefinition[] = [
+  { id: "webhook", kind: "webhook", adapter: "webhook", authType: "none", name: "Webhook", description: "Send a JSON or templated HTTP request.", builtin: true, method: "POST", accountFields: ["url"] },
+  {
+    id: "bark",
+    kind: "webhook",
+    adapter: "webhook",
+    authType: "none",
+    name: "Bark",
+    description: "Send iOS push notifications through a Bark-compatible webhook endpoint.",
+    builtin: true,
+    method: "POST",
+    urlTemplate: "{{serverUrl}}/push",
+    bodyTemplate: JSON.stringify({
+      device_key: "{{deviceKey}}",
+      title: "{{title}}",
+      body: "{{message}}",
+      group: "{{group}}",
+      sound: "{{sound}}",
+      icon: "{{icon}}",
+      url: "{{url}}",
+    }),
+    accountFields: ["serverUrl", "deviceKey", "group", "sound", "icon", "url"],
+  },
+  { id: "email", kind: "email", adapter: "email", authType: "none", name: "Email SMTP", description: "Send email through an SMTP sender account.", builtin: true, accountFields: ["host", "port", "username", "password", "fromEmail"] },
+  { id: "telegram", kind: "telegram", adapter: "telegram", authType: "none", name: "Telegram Bot", description: "Send Telegram messages through a bot token.", builtin: true, accountFields: ["botToken", "proxyUrl"] },
+];
+const notificationSeverityRank: Record<NotificationSeverity, number> = { info: 0, success: 1, warning: 2, error: 3 };
+const notificationEventTypes: NotificationEventType[] = ["task_completed", "task_failed", "task_interrupted", "needs_approval", "task_health_issue", "provider_check_failed", "backup_failed", "restore_failed", "auth_login"];
+
+type NotificationAccountRecord = NotificationAccountSummary;
+type NotificationEventInput = {
+  eventType: NotificationEventType;
+  severity: NotificationSeverity;
+  title: string;
+  message: string;
+  sourceType?: string;
+  sourceId?: string;
+  metadata?: Record<string, unknown>;
+};
+
+function notificationChannelFromRow(row: Record<string, unknown>): NotificationChannelDefinition {
+  return {
+    id: String(row.id),
+    kind: String(row.kind) as NotificationChannelKind,
+    adapter: String(row.adapter ?? "webhook") as NotificationChannelAdapter,
+    authType: String(row.auth_type ?? "none") as NotificationChannelAuthType,
+    name: String(row.name),
+    description: String(row.description ?? ""),
+    builtin: Boolean(row.builtin),
+    method: String(row.method ?? "POST"),
+    urlTemplate: String(row.url_template ?? ""),
+    headersTemplate: String(row.headers_template ?? ""),
+    bodyTemplate: String(row.body_template ?? ""),
+    accountFields: parseJsonValue<string[]>(row.account_fields, []),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function listNotificationChannels() {
+  const custom = (db.prepare("select * from notification_channels order by updated_at desc, id desc").all() as Array<Record<string, unknown>>).map(notificationChannelFromRow);
+  return [...notificationChannels, ...custom];
+}
+
+function getNotificationChannel(id?: string | null) {
+  if (!id) return null;
+  return notificationChannels.find((channel) => channel.id === id)
+    ?? ((db.prepare("select * from notification_channels where id = ?").get(id) as Record<string, unknown> | undefined) ? notificationChannelFromRow(db.prepare("select * from notification_channels where id = ?").get(id) as Record<string, unknown>) : null);
+}
+
+function parseJsonValue<T>(value: unknown, fallback: T): T {
+  if (typeof value !== "string" || !value.trim()) return fallback;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function publicNotificationConfig(kind: NotificationAccountSummary["channelKind"], config: Record<string, unknown>) {
+  const copy: Record<string, unknown> = { ...config };
+  for (const key of ["password", "deviceKey", "token", "secret", "botToken", "corpSecret", "accessToken", "bearerToken"]) {
+    if (copy[key]) copy[key] = "********";
+  }
+  if (kind === "webhook" && copy.headers && typeof copy.headers === "object") {
+    copy.headers = Object.fromEntries(Object.entries(copy.headers as Record<string, unknown>).map(([key, value]) => [
+      key,
+      /authorization|token|secret|key/i.test(key) && value ? "********" : value,
+    ]));
+  }
+  return copy;
+}
+
+function sanitizeNotificationPermissions(input?: NotificationPermissionPolicy | Record<string, unknown> | null): NotificationPermissionPolicy {
+  const list = (value: unknown) => Array.isArray(value) ? value.map((item) => String(item).trim()).filter(Boolean) : [];
+  return {
+    allowedAgentIds: list(input?.allowedAgentIds),
+    allowedRoomIds: list(input?.allowedRoomIds),
+    allowedProjectIds: list(input?.allowedProjectIds),
+  };
+}
+
+function notificationAccountFromRow(row: Record<string, unknown>, exposeSecrets = false): NotificationAccountRecord {
+  const channelKind = notificationChannels.some((channel) => channel.kind === row.channel_kind) ? row.channel_kind as NotificationAccountSummary["channelKind"] : "webhook";
+  const config = parseJsonValue<Record<string, unknown>>(row.config, {});
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    channelId: row.channel_id ? String(row.channel_id) : null,
+    channelKind,
+    enabled: Boolean(row.enabled),
+    config: exposeSecrets ? config : publicNotificationConfig(channelKind, config),
+    permissions: sanitizeNotificationPermissions(parseJsonValue<NotificationPermissionPolicy>(row.permissions, {})),
+    lastTestStatus: row.last_test_status ? String(row.last_test_status) as NotificationDeliveryStatus : null,
+    lastError: row.last_error ? String(row.last_error) : null,
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function notificationRecipientFromRow(row: Record<string, unknown>, exposeSecrets = false): NotificationRecipientSummary {
+  const kind = ["email", "webhook", "bark", "telegram"].includes(String(row.kind)) ? String(row.kind) as NotificationRecipientSummary["kind"] : "webhook";
+  const config = parseJsonValue<Record<string, unknown>>(row.config, {});
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    kind,
+    enabled: Boolean(row.enabled),
+    senderAccountId: row.sender_account_id ? String(row.sender_account_id) : null,
+    channelId: row.channel_id ? String(row.channel_id) : null,
+    config: exposeSecrets ? config : publicNotificationConfig(kind === "email" ? "email" : kind === "bark" ? "bark" : kind === "telegram" ? "telegram" : "webhook", config),
+    permissions: sanitizeNotificationPermissions(parseJsonValue<NotificationPermissionPolicy>(row.permissions, {})),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function notificationRuleFromRow(row: Record<string, unknown>): NotificationRuleSummary {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    enabled: Boolean(row.enabled),
+    eventTypes: parseJsonValue<NotificationEventType[]>(row.event_types, []).filter((type) => notificationEventTypes.includes(type)),
+    minSeverity: notificationSeverityRank[String(row.min_severity) as NotificationSeverity] !== undefined ? String(row.min_severity) as NotificationSeverity : "info",
+    targets: sanitizeNotificationTargets(parseJsonValue<NotificationRuleTarget[]>(row.targets, [])),
+    dedupeMinutes: Math.max(0, Number(row.dedupe_minutes) || 0),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function notificationDeliveryFromRow(row: Record<string, unknown>): NotificationDeliverySummary {
+  return {
+    id: String(row.id),
+    ruleId: row.rule_id ? String(row.rule_id) : null,
+    accountId: row.account_id ? String(row.account_id) : null,
+    eventType: String(row.event_type) as NotificationEventType,
+    severity: String(row.severity) as NotificationSeverity,
+    title: String(row.title),
+    message: String(row.message),
+    status: String(row.status) as NotificationDeliveryStatus,
+    attempts: Number(row.attempts) || 0,
+    responseStatus: row.response_status === null || row.response_status === undefined ? null : Number(row.response_status),
+    lastError: row.last_error ? String(row.last_error) : null,
+    metadata: parseJsonValue<Record<string, unknown>>(row.metadata, {}),
+    createdAt: String(row.created_at),
+    sentAt: row.sent_at ? String(row.sent_at) : null,
+  };
+}
+
+function notificationEphemeralRuleFromRow(row: Record<string, unknown>): NotificationEphemeralRuleSummary {
+  return {
+    id: String(row.id),
+    scopeType: String(row.scope_type) as NotificationEphemeralRuleSummary["scopeType"],
+    scopeId: String(row.scope_id),
+    eventTypes: parseJsonValue<NotificationEventType[]>(row.event_types, []).filter((type) => notificationEventTypes.includes(type)),
+    targets: sanitizeNotificationTargets(parseJsonValue<NotificationRuleTarget[]>(row.targets, [])),
+    enabled: Boolean(row.enabled),
+    expireMode: String(row.expire_mode) as NotificationEphemeralRuleSummary["expireMode"],
+    createdAt: String(row.created_at),
+    expiresAt: row.expires_at ? String(row.expires_at) : null,
+    triggeredAt: row.triggered_at ? String(row.triggered_at) : null,
+  };
+}
+
+function appNotificationFromRow(row: Record<string, unknown>): AppNotificationSummary {
+  return {
+    id: String(row.id),
+    eventType: String(row.event_type) as NotificationEventType,
+    severity: String(row.severity) as NotificationSeverity,
+    title: String(row.title),
+    message: String(row.message),
+    sourceType: row.source_type ? String(row.source_type) : null,
+    sourceId: row.source_id ? String(row.source_id) : null,
+    metadata: parseJsonValue<Record<string, unknown>>(row.metadata, {}),
+    readAt: row.read_at ? String(row.read_at) : null,
+    createdAt: String(row.created_at),
+  };
+}
+
+function createAppNotification(event: NotificationEventInput) {
+  const id = `app-notification-${randomUUID()}`;
+  const createdAt = new Date().toISOString();
+  db.prepare(`
+    insert into app_notifications (id, event_type, severity, title, message, source_type, source_id, metadata, created_at)
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    event.eventType,
+    event.severity,
+    event.title,
+    event.message,
+    event.sourceType ?? null,
+    event.sourceId ?? null,
+    JSON.stringify(event.metadata ?? {}),
+    createdAt,
+  );
+  const notification = appNotificationFromRow(db.prepare("select * from app_notifications where id = ?").get(id) as Record<string, unknown>);
+  publishAppNotificationEvent({ type: "notification", notification, unreadCount: appNotificationUnreadCount() });
+  return notification;
+}
+
+function listAppNotifications(limit = 30): AppNotificationsResponse {
+  const rows = db.prepare(`
+    select * from app_notifications
+    order by created_at desc, id desc
+    limit ?
+  `).all(Math.max(1, Math.min(100, limit))) as Array<Record<string, unknown>>;
+  const unread = db.prepare("select count(*) as count from app_notifications where read_at is null").get() as { count?: number } | undefined;
+  return {
+    items: rows.map(appNotificationFromRow),
+    unreadCount: unread?.count ?? 0,
+  };
+}
+
+function appNotificationUnreadCount() {
+  const row = db.prepare("select count(*) as count from app_notifications where read_at is null").get() as { count?: number } | undefined;
+  return row?.count ?? 0;
+}
+
+function publishAppNotificationEvent(event: AppNotificationStreamEvent) {
+  for (const subscriber of [...appNotificationSubscribers]) {
+    try {
+      subscriber(event);
+    } catch {
+      appNotificationSubscribers.delete(subscriber);
+    }
+  }
+}
+
+function publishAppNotificationsSnapshot() {
+  publishAppNotificationEvent({ type: "snapshot", ...listAppNotifications(30) });
+}
+
+function subscribeAppNotifications(subscriber: (event: AppNotificationStreamEvent) => void) {
+  appNotificationSubscribers.add(subscriber);
+  return () => appNotificationSubscribers.delete(subscriber);
+}
+
+function listNotificationAccounts(exposeSecrets = false) {
+  return (db.prepare("select * from notification_accounts order by updated_at desc, id desc").all() as Array<Record<string, unknown>>).map((row) => notificationAccountFromRow(row, exposeSecrets));
+}
+
+function listNotificationRecipients(exposeSecrets = false) {
+  return (db.prepare("select * from notification_recipients order by updated_at desc, id desc").all() as Array<Record<string, unknown>>).map((row) => notificationRecipientFromRow(row, exposeSecrets));
+}
+
+function listAllNotificationRules() {
+  return (db.prepare("select * from notification_rules order by updated_at desc, id desc").all() as Array<Record<string, unknown>>).map(notificationRuleFromRow);
+}
+
+function listNotificationRules(limit = 50, cursorValue?: string | null, filters: { enabled?: boolean } = {}) {
+  const cursor = decodePageCursor(cursorValue);
+  const where = [
+    ...(filters.enabled === undefined ? [] : ["enabled = @enabled"]),
+    ...(cursor ? ["(updated_at < @cursorSort or (updated_at = @cursorSort and id < @cursorId))"] : []),
+  ];
+  const rows = db.prepare(`
+    select * from notification_rules
+    ${where.length ? `where ${where.join(" and ")}` : ""}
+    order by updated_at desc, id desc
+    limit @limit
+  `).all({ enabled: filters.enabled === undefined ? undefined : filters.enabled ? 1 : 0, cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
+  return pageFromRows(rows.map(notificationRuleFromRow), limit, (item) => item.updatedAt);
+}
+
+function listNotificationEphemeralRules(limit = 50, cursorValue?: string | null) {
+  const cursor = decodePageCursor(cursorValue);
+  const rows = db.prepare(`
+    select * from notification_ephemeral_rules
+    ${cursor ? "where (created_at < @cursorSort or (created_at = @cursorSort and id < @cursorId))" : ""}
+    order by created_at desc, id desc
+    limit @limit
+  `).all({ cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
+  return pageFromRows(rows.map(notificationEphemeralRuleFromRow), limit, (item) => item.createdAt);
+}
+
+function createNotificationEphemeralRule(input: {
+  scopeType?: "session" | "task" | "room_task";
+  scopeId?: string;
+  eventTypes?: NotificationEventType[];
+  targets?: NotificationRuleTarget[];
+  expireMode?: "after_trigger" | "session_end" | "manual";
+}) {
+  const scopeType = input.scopeType === "task" || input.scopeType === "room_task" ? input.scopeType : "session";
+  const scopeId = input.scopeId?.trim();
+  const eventTypes = (input.eventTypes ?? []).filter((type) => notificationEventTypes.includes(type));
+  const targets = sanitizeNotificationTargets(input.targets ?? []);
+  const expireMode = input.expireMode === "session_end" || input.expireMode === "manual" ? input.expireMode : "after_trigger";
+  if (!scopeId || !eventTypes.length || !targets.length) return null;
+  const id = `notification-ephemeral-${randomUUID()}`;
+  const now = new Date().toISOString();
+  db.prepare(`
+    insert into notification_ephemeral_rules (id, scope_type, scope_id, event_types, targets, enabled, expire_mode, created_at)
+    values (?, ?, ?, ?, ?, 1, ?, ?)
+  `).run(id, scopeType, scopeId, JSON.stringify(eventTypes), JSON.stringify(targets), expireMode, now);
+  return {
+    id,
+    scopeType,
+    scopeId,
+    eventTypes,
+    targets,
+    enabled: true,
+    expireMode,
+    createdAt: now,
+  } satisfies NotificationEphemeralRuleSummary;
+}
+
+function listNotificationDeliveries(limit = 50, cursorValue?: string | null, filters: { eventType?: NotificationEventType; status?: NotificationDeliveryStatus; severity?: NotificationSeverity } = {}) {
+  const cursor = decodePageCursor(cursorValue);
+  const where = [
+    ...(filters.eventType ? ["event_type = @eventType"] : []),
+    ...(filters.status ? ["status = @status"] : []),
+    ...(filters.severity ? ["severity = @severity"] : []),
+    ...(cursor ? ["(created_at < @cursorSort or (created_at = @cursorSort and id < @cursorId))"] : []),
+  ];
+  const rows = db.prepare(`
+    select * from notification_deliveries
+    ${where.length ? `where ${where.join(" and ")}` : ""}
+    order by created_at desc, id desc
+    limit @limit
+  `).all({ eventType: filters.eventType, status: filters.status, severity: filters.severity, cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
+  return pageFromRows(rows.map(notificationDeliveryFromRow), limit, (item) => item.createdAt);
+}
+
+function sanitizeNotificationConfig(kind: NotificationAccountSummary["channelKind"], input?: Record<string, unknown>, previous?: Record<string, unknown>) {
+  const config = input ?? {};
+  const list = (value: unknown) => Array.isArray(value)
+    ? value.map((item) => String(item).trim()).filter(Boolean)
+    : String(value ?? "").split(",").map((item) => item.trim()).filter(Boolean);
+  if (kind === "email") {
+    const password = String(config.password ?? "").trim();
+    return {
+      host: String(config.host ?? previous?.host ?? "").trim(),
+      port: Number(config.port ?? previous?.port ?? 587) || 587,
+      secure: config.secure === true,
+      username: String(config.username ?? previous?.username ?? "").trim(),
+      password: password && password !== "********" ? password : String(previous?.password ?? ""),
+      fromName: String(config.fromName ?? previous?.fromName ?? "Codex Web").trim(),
+      fromEmail: String(config.fromEmail ?? previous?.fromEmail ?? "").trim(),
+      testEmailTo: list(config.testEmailTo ?? previous?.testEmailTo),
+    };
+  }
+  if (kind === "telegram") {
+    const botToken = String(config.botToken ?? "").trim();
+    return {
+      botToken: botToken && botToken !== "********" ? botToken : String(previous?.botToken ?? ""),
+      proxyUrl: String(config.proxyUrl ?? previous?.proxyUrl ?? "").trim(),
+      inboundEnabled: config.inboundEnabled === true,
+      allowedChatIds: list(config.allowedChatIds ?? previous?.allowedChatIds),
+      allowedUserIds: list(config.allowedUserIds ?? previous?.allowedUserIds),
+      defaultSessionId: String(config.defaultSessionId ?? previous?.defaultSessionId ?? "").trim(),
+      testChatId: String(config.testChatId ?? previous?.testChatId ?? "").trim(),
+    };
+  }
+  if (kind === "bark") {
+    const deviceKey = String(config.deviceKey ?? "").trim();
+    return {
+      serverUrl: String(config.serverUrl ?? previous?.serverUrl ?? "https://api.day.app").trim(),
+      deviceKey: deviceKey && deviceKey !== "********" ? deviceKey : String(previous?.deviceKey ?? ""),
+      sound: String(config.sound ?? previous?.sound ?? "").trim(),
+      group: String(config.group ?? previous?.group ?? "Codex Web").trim(),
+      icon: String(config.icon ?? previous?.icon ?? "").trim(),
+      url: String(config.url ?? previous?.url ?? "").trim(),
+    };
+  }
+  return {
+    url: String(config.url ?? previous?.url ?? "").trim(),
+    method: String(config.method ?? previous?.method ?? "POST").trim().toUpperCase() || "POST",
+    headers: typeof config.headers === "object" && config.headers && !Array.isArray(config.headers) ? config.headers : previous?.headers ?? {},
+    bodyTemplate: String(config.bodyTemplate ?? previous?.bodyTemplate ?? "").trim(),
+  };
+}
+
+function sanitizeNotificationTargets(targets?: NotificationRuleTarget[]) {
+  return (targets ?? [])
+    .map((target) => ({
+      accountId: target.accountId ? String(target.accountId).trim() : undefined,
+      recipientId: target.recipientId ? String(target.recipientId).trim() : undefined,
+      senderAccountId: target.senderAccountId ? String(target.senderAccountId).trim() : undefined,
+      chatId: target.chatId ? String(target.chatId).trim() : undefined,
+      emailTo: Array.isArray(target.emailTo) ? target.emailTo.map((item) => String(item).trim()).filter(Boolean) : undefined,
+    }))
+    .filter((target) => target.accountId || target.recipientId);
+}
+
+function renderNotificationTemplate(template: string, event: NotificationEventInput, extra: Record<string, unknown> = {}) {
+  const values: Record<string, unknown> = {
+    ...extra,
+    title: event.title,
+    message: event.message,
+    severity: event.severity,
+    eventType: event.eventType,
+    sourceType: event.sourceType ?? "",
+    sourceId: event.sourceId ?? "",
+    createdAt: new Date().toISOString(),
+    metadata: event.metadata ?? {},
+  };
+  return template.replace(/\{\{\s*([\w.]+)\s*\}\}/g, (_, path: string) => {
+    const value = path.split(".").reduce<unknown>((current, key) => current && typeof current === "object" ? (current as Record<string, unknown>)[key] : undefined, values);
+    return value === undefined || value === null ? "" : String(value);
+  });
+}
+
+function parseNotificationHeaders(template: string, event: NotificationEventInput, extra: Record<string, unknown>) {
+  return Object.fromEntries(String(template ?? "").split("\n").map((line) => {
+    const rendered = renderNotificationTemplate(line, event, extra);
+    const index = rendered.indexOf(":");
+    return index > 0 ? [rendered.slice(0, index).trim(), rendered.slice(index + 1).trim()] : ["", ""];
+  }).filter(([key]) => key));
+}
+
+function normalizeWebhookConfig(config: Record<string, unknown>) {
+  const copy = { ...config };
+  if (copy.serverUrl) copy.serverUrl = String(copy.serverUrl).replace(/\/+$/, "");
+  if (!copy.serverUrl && copy.deviceKey) copy.serverUrl = "https://api.day.app";
+  if (!copy.group) copy.group = "Codex Web";
+  return copy;
+}
+
+async function sendWebhookNotification(channel: NotificationChannelDefinition | null, config: Record<string, unknown>, event: NotificationEventInput) {
+  const webhookConfig = normalizeWebhookConfig(config);
+  const method = String(channel?.method ?? webhookConfig.method ?? "POST").toUpperCase();
+  const headers = {
+    "content-type": "application/json",
+    ...(typeof webhookConfig.headers === "object" && webhookConfig.headers ? webhookConfig.headers as Record<string, string> : {}),
+    ...parseNotificationHeaders(channel?.headersTemplate ?? "", event, webhookConfig),
+  };
+  const urlTemplate = channel?.urlTemplate || String(webhookConfig.url ?? "");
+  if (!urlTemplate.trim()) throw new Error("webhook_url_required");
+  const renderedUrl = new URL(renderNotificationTemplate(urlTemplate, event, webhookConfig));
+  if (channel?.authType === "bearer") {
+    const token = String(webhookConfig.token ?? webhookConfig.accessToken ?? webhookConfig.bearerToken ?? "").trim();
+    if (!token) throw new Error("webhook_bearer_token_required");
+    headers.authorization = `Bearer ${token}`;
+  }
+  if (channel?.authType === "query_token") {
+    const token = String(webhookConfig.token ?? webhookConfig.accessToken ?? "").trim();
+    if (!token) throw new Error("webhook_query_token_required");
+    renderedUrl.searchParams.set(String(webhookConfig.tokenParam ?? "access_token"), token);
+  }
+  if (channel?.authType === "token_request") {
+    throw new Error("webhook_token_request_auth_not_configured");
+  }
+  const bodyTemplate = channel?.bodyTemplate || String(webhookConfig.bodyTemplate ?? "") || JSON.stringify(event);
+  const init: RequestInit = {
+    method,
+    headers,
+  };
+  if (method !== "GET" && method !== "HEAD") init.body = renderNotificationTemplate(bodyTemplate, event, webhookConfig);
+  const response = await fetch(renderedUrl.toString(), init);
+  const text = await response.text().catch(() => "");
+  if (!response.ok) throw new Error(text.slice(0, 500) || `webhook_http_${response.status}`);
+  if (channel?.id === "bark" && text && /"code"\s*:\s*(?!200\b)\d+/i.test(text)) throw new Error(text.slice(0, 500) || `bark_http_${response.status}`);
+  return { responseStatus: response.status };
+}
+
+async function sendNotificationToAccount(account: NotificationAccountRecord, event: NotificationEventInput, target?: NotificationRuleTarget) {
+  const config = account.config;
+  const customChannel = account.channelId ? getNotificationChannel(account.channelId) : null;
+  if (account.channelKind === "webhook" && customChannel?.id && customChannel.id !== "webhook") return sendWebhookNotification(customChannel, config, event);
+  if (account.channelKind === "email") {
+    const to = target?.emailTo?.length ? target.emailTo : [];
+    if (!to.length) throw new Error("email_recipients_required");
+    if (!config.host || !config.fromEmail) throw new Error("email_smtp_config_required");
+    const transporter = nodemailer.createTransport({
+      host: String(config.host),
+      port: Number(config.port) || 587,
+      secure: config.secure === true,
+      auth: config.username || config.password ? { user: String(config.username ?? ""), pass: String(config.password ?? "") } : undefined,
+    });
+    await transporter.sendMail({
+      from: config.fromName ? `"${String(config.fromName).replace(/"/g, "'")}" <${String(config.fromEmail)}>` : String(config.fromEmail),
+      to,
+      subject: event.title,
+      text: `${event.message}\n\n事件：${event.eventType}\n等级：${event.severity}`,
+    });
+    return { responseStatus: null };
+  }
+  if (account.channelKind === "telegram") {
+    if (!config.botToken) throw new Error("telegram_bot_token_required");
+    if (!target?.chatId) throw new Error("telegram_chat_id_required");
+    const response = await telegramBotApi(account, "sendMessage", {
+      chat_id: target.chatId,
+      text: `${event.title}\n\n${event.message}`,
+      disable_web_page_preview: true,
+    });
+    const text = await response.text().catch(() => "");
+    if (!response.ok) throw new Error(text.slice(0, 500) || `telegram_http_${response.status}`);
+    return { responseStatus: response.status };
+  }
+  if (account.channelKind === "bark") return sendWebhookNotification(getNotificationChannel("bark"), config, event);
+  return sendWebhookNotification(customChannel, config, event);
+}
+
+function telegramApiBase(account: NotificationAccountRecord) {
+  const config = account.config as Record<string, unknown>;
+  const proxyUrl = String(config.proxyUrl ?? "").trim();
+  return (proxyUrl || "https://api.telegram.org").replace(/\/+$/, "");
+}
+
+async function telegramBotApi(account: NotificationAccountRecord, method: string, payload: Record<string, unknown>) {
+  const config = account.config as Record<string, unknown>;
+  if (!config.botToken) throw new Error("telegram_bot_token_required");
+  return fetch(`${telegramApiBase(account)}/bot${String(config.botToken)}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+  });
+}
+
+async function syncTelegramBotCommands(account: NotificationAccountRecord) {
+  if (account.channelKind !== "telegram") return;
+  const config = account.config as Record<string, unknown>;
+  if (!config.botToken || config.botToken === "********") return;
+  if (account.enabled && config.inboundEnabled === true) {
+    await telegramBotApi(account, "setMyCommands", {
+      commands: [
+        { command: "start", description: "Show bot help" },
+        { command: "sessions", description: "List recent sessions" },
+        { command: "agents", description: "List agents" },
+        { command: "rooms", description: "List rooms" },
+        { command: "files", description: "Browse files" },
+        { command: "terminal", description: "Run a terminal command" },
+        { command: "bind", description: "Bind this chat to a session" },
+        { command: "unbind", description: "Clear the bound session" },
+        { command: "send", description: "Send a message to a session" },
+        { command: "help", description: "Show help" },
+      ],
+    });
+    await telegramBotApi(account, "setChatMenuButton", {
+      menu_button: { type: "commands" },
+    });
+    return;
+  }
+  await telegramBotApi(account, "deleteMyCommands", {});
+  await telegramBotApi(account, "setChatMenuButton", {
+    menu_button: { type: "default" },
+  });
+}
+
+function notificationDeliveryMetadata(account: NotificationAccountRecord, event: NotificationEventInput, target?: NotificationRuleTarget, recipient?: NotificationRecipientSummary) {
+  return {
+    eventMetadata: event.metadata ?? {},
+    sourceType: event.sourceType ?? null,
+    sourceId: event.sourceId ?? null,
+    target: target ? {
+      accountId: target.accountId ?? null,
+      recipientId: target.recipientId ?? null,
+      senderAccountId: target.senderAccountId ?? null,
+      chatId: target.chatId ?? null,
+      emailToCount: target.emailTo?.length ?? 0,
+      emailTo: target.emailTo ?? [],
+    } : null,
+    account: {
+      id: account.id,
+      name: account.name,
+      kind: account.channelKind,
+      channelId: account.channelId ?? null,
+    },
+    recipient: recipient ? {
+      id: recipient.id,
+      name: recipient.name,
+      kind: recipient.kind,
+      senderAccountId: recipient.senderAccountId ?? null,
+      channelId: recipient.channelId ?? null,
+    } : null,
+  };
+}
+
+async function deliverNotification(account: NotificationAccountRecord, event: NotificationEventInput, ruleId: string | null, target?: NotificationRuleTarget, recipient?: NotificationRecipientSummary) {
+  const id = `notification-delivery-${randomUUID()}`;
+  const createdAt = new Date().toISOString();
+  db.prepare(`
+    insert into notification_deliveries (id, rule_id, account_id, event_type, severity, title, message, status, attempts, metadata, created_at)
+    values (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+  `).run(id, ruleId, account.id, event.eventType, event.severity, event.title, event.message, JSON.stringify(notificationDeliveryMetadata(account, event, target, recipient)), createdAt);
+  try {
+    const result = await sendNotificationToAccount(account, event, target);
+    db.prepare("update notification_deliveries set status = 'sent', attempts = 1, response_status = ?, sent_at = ? where id = ?").run(result.responseStatus ?? null, new Date().toISOString(), id);
+    return true;
+  } catch (error) {
+    db.prepare("update notification_deliveries set status = 'failed', attempts = 1, last_error = ? where id = ?").run(error instanceof Error ? error.message : String(error), id);
+    return false;
+  }
+}
+
+function chooseEmailNotificationSender(recipient: NotificationRecipientSummary, target?: NotificationRuleTarget) {
+  const emailSenders = listNotificationAccounts(true).filter((account) => account.enabled && account.channelKind === "email");
+  return (target?.senderAccountId ? emailSenders.find((account) => account.id === target.senderAccountId) : null)
+    ?? (recipient.senderAccountId ? emailSenders.find((account) => account.id === recipient.senderAccountId) : null)
+    ?? (emailSenders.length === 1 ? emailSenders[0] : null);
+}
+
+function chooseTelegramNotificationSender(recipient: NotificationRecipientSummary, target?: NotificationRuleTarget) {
+  const telegramSenders = listNotificationAccounts(true).filter((account) => account.enabled && account.channelKind === "telegram");
+  return (target?.senderAccountId ? telegramSenders.find((account) => account.id === target.senderAccountId) : null)
+    ?? (recipient.senderAccountId ? telegramSenders.find((account) => account.id === recipient.senderAccountId) : null)
+    ?? (telegramSenders.length === 1 ? telegramSenders[0] : null);
+}
+
+async function deliverNotificationToRecipient(recipient: NotificationRecipientSummary, event: NotificationEventInput, ruleId: string | null, target?: NotificationRuleTarget) {
+  if (recipient.kind === "email") {
+    const sender = chooseEmailNotificationSender(recipient, target);
+    if (!sender) throw new Error("email_sender_required");
+    return deliverNotification(sender, event, ruleId, { recipientId: recipient.id, accountId: sender.id, emailTo: [String(recipient.config.email ?? "")].filter(Boolean) }, recipient);
+  }
+  if (recipient.kind === "telegram") {
+    const sender = chooseTelegramNotificationSender(recipient, target);
+    if (!sender) throw new Error("telegram_sender_required");
+    return deliverNotification(sender, event, ruleId, { recipientId: recipient.id, accountId: sender.id, chatId: String(recipient.config.chatId ?? "") }, recipient);
+  }
+  const account: NotificationAccountRecord = {
+    id: recipient.id,
+    name: recipient.name,
+    channelId: recipient.channelId ?? null,
+    channelKind: "webhook",
+    enabled: recipient.enabled,
+    config: recipient.config,
+    createdAt: recipient.createdAt,
+    updatedAt: recipient.updatedAt,
+  };
+  return deliverNotification(account, event, ruleId, { recipientId: recipient.id, accountId: account.id }, recipient);
+}
+
+function notificationRecentlyDelivered(ruleId: string, accountId: string, eventType: NotificationEventType, dedupeMinutes: number) {
+  if (dedupeMinutes <= 0) return false;
+  const since = new Date(Date.now() - dedupeMinutes * 60_000).toISOString();
+  return Boolean(db.prepare(`
+    select id from notification_deliveries
+    where rule_id = ? and account_id = ? and event_type = ? and created_at >= ? and status in ('sent', 'pending')
+    limit 1
+  `).get(ruleId, accountId, eventType, since));
+}
+
+function notificationEventTypesFromPrompt(prompt: string): NotificationEventType[] {
+  const text = prompt.toLowerCase();
+  if (/审批|批准|确认|approval/.test(text)) return ["needs_approval"];
+  if (/失败|报错|错误|fail|error/.test(text)) return ["task_failed"];
+  return ["task_completed"];
+}
+
+function registerEphemeralNotificationsFromPrompt(session: SessionSummary, prompt: string) {
+  const text = prompt.trim();
+  if (!/通知|提醒|notify/i.test(text)) return;
+  const recipients = listNotificationRecipients(true).filter((recipient) => recipient.enabled);
+  const normalized = text.toLowerCase().replace(/\s+/g, "");
+  const matched = recipients.filter((recipient) => {
+    const name = recipient.name.toLowerCase().replace(/\s+/g, "");
+    return name && normalized.includes(name);
+  });
+  const targets = (matched.length ? matched : recipients.length === 1 ? recipients : [])
+    .map((recipient) => ({ recipientId: recipient.id }));
+  if (!targets.length) return;
+  const now = new Date().toISOString();
+  db.prepare(`
+    insert into notification_ephemeral_rules (id, scope_type, scope_id, event_types, targets, enabled, expire_mode, created_at)
+    values (?, 'session', ?, ?, ?, 1, 'after_trigger', ?)
+  `).run(
+    `notification-ephemeral-${randomUUID()}`,
+    session.id,
+    JSON.stringify(notificationEventTypesFromPrompt(text)),
+    JSON.stringify(targets),
+    now,
+  );
+}
+
+function notificationScopesForEvent(event: NotificationEventInput) {
+  const scopes: Array<{ scopeType: "session" | "task" | "room_task"; scopeId: string }> = [];
+  if (event.sourceType === "session" && event.sourceId) scopes.push({ scopeType: "session", scopeId: event.sourceId });
+  const metadataScopes = Array.isArray(event.metadata?.notificationScopes) ? event.metadata.notificationScopes : [];
+  for (const item of metadataScopes) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    const scopeType = record.scopeType === "session" || record.scopeType === "task" || record.scopeType === "room_task" ? record.scopeType : null;
+    const scopeId = typeof record.scopeId === "string" && record.scopeId.trim() ? record.scopeId.trim() : "";
+    if (scopeType && scopeId) scopes.push({ scopeType, scopeId });
+  }
+  return Array.from(new Map(scopes.map((scope) => [`${scope.scopeType}:${scope.scopeId}`, scope])).values());
+}
+
+function listEphemeralNotificationRulesForEvent(event: NotificationEventInput) {
+  const scopes = notificationScopesForEvent(event);
+  if (!scopes.length) return [];
+  const rows = scopes.flatMap((scope) => db.prepare(`
+    select * from notification_ephemeral_rules
+    where enabled = 1 and scope_type = ? and scope_id = ?
+    order by created_at asc
+  `).all(scope.scopeType, scope.scopeId) as Array<Record<string, unknown>>);
+  return rows
+    .map((row) => ({
+      id: String(row.id),
+      scopeType: String(row.scope_type),
+      scopeId: String(row.scope_id),
+      eventTypes: parseJsonValue<NotificationEventType[]>(row.event_types, []).filter((type) => notificationEventTypes.includes(type)),
+      targets: sanitizeNotificationTargets(parseJsonValue<NotificationRuleTarget[]>(row.targets, [])),
+      expireMode: String(row.expire_mode),
+    }))
+    .filter((rule) => rule.eventTypes.includes(event.eventType) && rule.targets.length);
+}
+
+async function createExternalNotification(event: NotificationEventInput) {
+  const accounts = new Map(listNotificationAccounts(true).filter((account) => account.enabled).map((account) => [account.id, account]));
+  const recipients = new Map(listNotificationRecipients(true).filter((recipient) => recipient.enabled).map((recipient) => [recipient.id, recipient]));
+  const rules = listAllNotificationRules().filter((rule) =>
+    rule.enabled
+    && rule.eventTypes.includes(event.eventType)
+    && notificationSeverityRank[event.severity] >= notificationSeverityRank[rule.minSeverity]
+  );
+  for (const rule of rules) {
+    for (const target of rule.targets) {
+      if (target.recipientId) {
+        const recipient = recipients.get(target.recipientId);
+        if (!recipient || notificationRecentlyDelivered(rule.id, recipient.id, event.eventType, rule.dedupeMinutes)) continue;
+        void deliverNotificationToRecipient(recipient, event, rule.id, target).catch((error) => console.error("recipient notification failed", error));
+        continue;
+      }
+      if (!target.accountId) continue;
+      const account = accounts.get(target.accountId);
+      if (!account || notificationRecentlyDelivered(rule.id, account.id, event.eventType, rule.dedupeMinutes)) continue;
+      void deliverNotification(account, event, rule.id, target);
+    }
+  }
+  for (const rule of listEphemeralNotificationRulesForEvent(event)) {
+    for (const target of rule.targets) {
+      if (!target.recipientId) continue;
+      const recipient = recipients.get(target.recipientId);
+      if (!recipient) continue;
+      void deliverNotificationToRecipient(recipient, event, rule.id, target).catch((error) => console.error("ephemeral recipient notification failed", error));
+    }
+    if (rule.expireMode === "after_trigger") {
+      db.prepare("update notification_ephemeral_rules set enabled = 0, triggered_at = ? where id = ?").run(new Date().toISOString(), rule.id);
+    }
+  }
+}
+
+function sessionNotificationsEnabled(session?: SessionSummary | null) {
+  return session?.notificationsEnabled !== false;
+}
+
+function roomSessionForRoomId(roomId?: string | null) {
+  if (!roomId) return null;
+  const room = db.prepare("select session_id from rooms where id = ?").get(roomId) as { session_id?: string | null } | undefined;
+  return room?.session_id ? appData.sessions.find((session) => session.id === room.session_id) ?? null : null;
+}
+
+function notificationsEnabledForEvent(event: NotificationEventInput) {
+  const sourceSession = event.sourceType === "session" && event.sourceId
+    ? appData.sessions.find((session) => session.id === event.sourceId)
+    : null;
+  if (sourceSession && !sessionNotificationsEnabled(sourceSession)) return false;
+  const metadataRoomId = typeof event.metadata?.roomId === "string" ? event.metadata.roomId : null;
+  const roomSession = roomSessionForRoomId(metadataRoomId ?? sourceSession?.roomId ?? null);
+  if (roomSession && !sessionNotificationsEnabled(roomSession)) return false;
+  return true;
+}
+
+function emitExternalNotification(event: NotificationEventInput) {
+  if (!notificationsEnabledForEvent(event)) return;
+  createAppNotification(event);
+  void createExternalNotification(event).catch((error) => console.error("notification dispatch failed", error));
 }
 
 function automationRanInMinute(automationId: string, minuteKey: string) {
@@ -2510,6 +3525,121 @@ function roomAgentOutputContract() {
   ].join("\n");
 }
 
+function notificationPermissionContext(session: SessionSummary) {
+  const run = db.prepare("select * from agent_runs where session_id = ? order by started_at desc, id desc limit 1").get(session.id) as Record<string, unknown> | undefined;
+  const directAgent = directAgentForSession(session.id)?.agent ?? null;
+  return {
+    agentId: run?.agent_id ? String(run.agent_id) : directAgent?.id ?? null,
+    roomId: run?.room_id ? String(run.room_id) : session.roomId ?? null,
+    projectId: session.projectId ?? null,
+    run,
+  };
+}
+
+function notificationPermissionAllows(policy: NotificationPermissionPolicy | undefined, context: ReturnType<typeof notificationPermissionContext>) {
+  const allowedAgentIds = policy?.allowedAgentIds ?? [];
+  const allowedRoomIds = policy?.allowedRoomIds ?? [];
+  const allowedProjectIds = policy?.allowedProjectIds ?? [];
+  if (allowedAgentIds.length && (!context.agentId || !allowedAgentIds.includes(context.agentId))) return false;
+  if (allowedRoomIds.length && (!context.roomId || !allowedRoomIds.includes(context.roomId))) return false;
+  if (allowedProjectIds.length && (!context.projectId || !allowedProjectIds.includes(context.projectId))) return false;
+  return true;
+}
+
+function notificationSkillContext(session: SessionSummary) {
+  const permissionContext = notificationPermissionContext(session);
+  const recipients = listNotificationRecipients()
+    .filter((recipient) => recipient.enabled)
+    .filter((recipient) => notificationPermissionAllows(recipient.permissions, permissionContext))
+    .map((recipient) => ({
+      id: recipient.id,
+      name: recipient.name,
+      kind: recipient.kind,
+      senderAccountId: recipient.senderAccountId ?? null,
+    }));
+  const senders = listNotificationAccounts()
+    .filter((account) => account.enabled)
+    .filter((account) => notificationPermissionAllows(account.permissions, permissionContext))
+    .map((account) => ({
+      id: account.id,
+      name: account.name,
+      kind: account.channelKind,
+    }));
+  const run = permissionContext.run;
+  const scopes = [
+    `- session: current session (${session.id})`,
+    "- current_task: the currently running Codex task for this session",
+    run?.task_id ? `- current_room_task: current Room task (${String(run.task_id)})` : "",
+  ].filter(Boolean);
+  if (!recipients.length) return "";
+  return [
+    "## Notification Skill",
+    "You may request a scoped one-time notification.",
+    "Use this only when the user explicitly asks to be notified or when an existing notification instruction is part of the task.",
+    "Do not create persistent/global notification rules.",
+    "Allowed scopes:",
+    ...scopes,
+    "Allowed recipients:",
+    ...recipients.map((recipient) => `- ${recipient.name} (${recipient.id}) kind=${recipient.kind}`),
+    senders.length ? "Available senders:" : "",
+    ...senders.map((sender) => `- ${sender.name} (${sender.id}) kind=${sender.kind}`),
+    "",
+    "To create a one-time notification rule, include a fenced JSON block named `codex-web-notification` in your answer.",
+    "Supported eventTypes: task_completed, task_failed, task_interrupted, needs_approval.",
+    "Use recipientIds from the allowed list. You may also include senderAccountId for an override.",
+    "Use scopeType=session, current_task, or current_room_task. Prefer current_room_task inside Room Agent task runs, otherwise use current_task for this run or session for the whole session.",
+    "Example:",
+    "```codex-web-notification",
+    JSON.stringify({
+      action: "createOneTimeRule",
+      scopeType: run?.task_id ? "current_room_task" : "current_task",
+      eventTypes: ["task_completed"],
+      recipientIds: recipients.slice(0, 1).map((recipient) => recipient.id),
+      senderAccountId: null,
+      expireMode: "after_trigger",
+      reason: "Notify the user when this task completes.",
+    }, null, 2),
+    "```",
+  ].filter((line) => line !== "").join("\n");
+}
+
+function compactSessionLine(session: SessionSummary) {
+  const project = session.projectId ? appData.projects.find((item) => item.id === session.projectId) : null;
+  return `- ${session.title} (${session.id}) status=${session.status} type=${session.conversationType ?? "codex"} project=${project?.name ?? session.projectId ?? "scratch"} updated=${session.updatedAt}`;
+}
+
+function crossSessionSkillContext(session: SessionSummary) {
+  const recentSessions = appData.sessions
+    .filter((item) => item.id !== session.id)
+    .slice()
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .slice(0, 20);
+  if (!recentSessions.length) return "";
+  return [
+    "## Cross-Session Skill",
+    "You may request controlled access to other Codex Web sessions when the user explicitly asks you to check another session, compare progress, or send a message to another session.",
+    "Prefer exact session ids. If the user names a session, use targetTitle and the backend will choose the best recent title match.",
+    "Do not use this for unrelated browsing of history.",
+    "",
+    "Recent accessible sessions:",
+    ...recentSessions.map(compactSessionLine),
+    "",
+    "To use this capability, include a fenced JSON block named `codex-web-cross-session` in your answer.",
+    "Supported actions:",
+    "- listSessions: records the recent accessible session list.",
+    "- readSession: reads target status, latest run, memory summary, and recent messages.",
+    "- sendMessage: sends a structured message to the target session; if the target is running it is queued, otherwise it starts a new turn.",
+    "",
+    "Examples:",
+    "```codex-web-cross-session",
+    JSON.stringify([
+      { action: "readSession", targetSessionId: recentSessions[0]?.id ?? "task-..." },
+      { action: "sendMessage", targetSessionId: recentSessions[0]?.id ?? "task-...", message: "Please report your current progress." },
+    ], null, 2),
+    "```",
+  ].join("\n");
+}
+
 type CodexTaskContextInput = Partial<Pick<ExecutionContextSummary, "sourceType" | "agentId" | "roomId" | "createdBy" | "permissionProfileId" | "resolvedPermissions">> & {
   currentMessageId?: string | null;
   replyToMessageId?: string | null;
@@ -2527,6 +3657,9 @@ function writeExecutionContextPack(
   const transcript = sessionTranscriptMarkdown(session.id, contextInput?.currentMessageId);
   const replyTo = getSessionMessage(session.id, contextInput?.replyToMessageId);
   const roomContext = roomId ? roomBlackboardContext(roomId, agentId) : "";
+  const notificationContext = notificationSkillContext(session);
+  const crossSessionContext = crossSessionSkillContext(session);
+  const persistentMemory = latestSessionMemoryMarkdown(session.id);
   const workspaceState = workspaceStateMarkdown(cwd);
   const currentRequest = ["# Current Request", prompt.trim()].join("\n\n");
   const replyContext = replyTo ? [
@@ -2574,16 +3707,25 @@ function writeExecutionContextPack(
     "- summary.md",
     "- recent-messages.md",
     "- conversation-transcript.md",
+    persistentMemory ? "- persistent-memory.md" : "",
     "- workspace-state.md",
     "- current-request.md",
     replyContext ? "- reply-target.md" : "",
     roomContext ? "- room-blackboard.md" : "",
     roomId ? "- decisions.md" : "",
+    notificationContext ? "- notification-skill.md" : "",
+    crossSessionContext ? "- cross-session-skill.md" : "",
     "",
+    persistentMemory,
+    persistentMemory ? "" : "",
     "## Recent Session Messages",
     sessionContext,
     "",
     workspaceState,
+    "",
+    notificationContext,
+    "",
+    crossSessionContext,
     "",
     roomContext,
     "",
@@ -2598,9 +3740,12 @@ function writeExecutionContextPack(
   writeSessionContextFile(session.id, "summary.md", summary);
   writeSessionContextFile(session.id, "recent-messages.md", sessionContext);
   writeSessionContextFile(session.id, "conversation-transcript.md", transcript);
+  if (persistentMemory) writeSessionContextFile(session.id, "persistent-memory.md", persistentMemory);
   writeSessionContextFile(session.id, "current-request.md", currentRequest);
   if (replyContext) writeSessionContextFile(session.id, "reply-target.md", replyContext);
   writeSessionContextFile(session.id, "workspace-state.md", workspaceState);
+  if (notificationContext) writeSessionContextFile(session.id, "notification-skill.md", notificationContext);
+  if (crossSessionContext) writeSessionContextFile(session.id, "cross-session-skill.md", crossSessionContext);
   if (roomContext) writeSessionContextFile(session.id, "room-blackboard.md", roomContext);
   if (roomId) writeSessionContextFile(session.id, "decisions.md", roomDecisionsMarkdown(roomId));
   return { contextPackPath, pack };
@@ -2737,6 +3882,328 @@ function allSessionMessages(sessionId: string) {
   `).all({ sessionId }) as Array<Record<string, unknown>>).map(messageFromRow);
 }
 
+function sessionCompactionFromRow(row: Record<string, unknown>): SessionCompactionSummary {
+  return {
+    id: String(row.id),
+    sessionId: String(row.session_id),
+    providerId: row.provider_id ? String(row.provider_id) : null,
+    model: row.model ? String(row.model) : null,
+    sourceMessageStartId: row.source_message_start_id ? String(row.source_message_start_id) : null,
+    sourceMessageEndId: row.source_message_end_id ? String(row.source_message_end_id) : null,
+    sourceMessageCount: Number(row.source_message_count ?? 0),
+    sourceChars: Number(row.source_chars ?? 0),
+    promptHash: String(row.prompt_hash),
+    filePath: String(row.file_path),
+    supersedesId: row.supersedes_id ? String(row.supersedes_id) : null,
+    createdAt: String(row.created_at),
+  };
+}
+
+function latestSessionCompaction(sessionId: string) {
+  const row = db.prepare(`
+    select *
+    from session_compactions
+    where session_id = ?
+    order by created_at desc, id desc
+    limit 1
+  `).get(sessionId) as Record<string, unknown> | undefined;
+  return row ? sessionCompactionFromRow(row) : null;
+}
+
+function listSessionCompactions(sessionId: string, limit = 20): SessionCompactionListResponse {
+  const rows = db.prepare(`
+    select *
+    from session_compactions
+    where session_id = ?
+    order by created_at desc, id desc
+    limit ?
+  `).all(sessionId, Math.max(1, Math.min(limit, 100))) as Array<Record<string, unknown>>;
+  return { sessionId, items: rows.map(sessionCompactionFromRow) };
+}
+
+function latestSessionMemoryMarkdown(sessionId: string) {
+  const latest = latestSessionCompaction(sessionId);
+  if (!latest) return "";
+  const fileContent = existsSync(latest.filePath) ? readFileSync(latest.filePath, "utf8") : "";
+  const summary = fileContent.trim();
+  if (!summary) return "";
+  return [
+    "# Persistent Session Memory",
+    `- compaction id: ${latest.id}`,
+    `- created: ${latest.createdAt}`,
+    `- source messages: ${latest.sourceMessageCount}`,
+    latest.providerId ? `- provider: ${latest.providerId}` : "",
+    latest.model ? `- model: ${latest.model}` : "",
+    "",
+    summary,
+  ].filter((line) => line !== "").join("\n");
+}
+
+function messagesAfterCompaction(messages: SessionMessage[], compaction: SessionCompactionSummary | null) {
+  if (!compaction?.sourceMessageEndId) return messages;
+  const index = messages.findIndex((message) => message.id === compaction.sourceMessageEndId);
+  return index >= 0 ? messages.slice(index + 1) : messages;
+}
+
+function sessionCompactionPrompt(session: SessionSummary, messages: SessionMessage[], previousSummary = "") {
+  const transcript = messages.map((message) => [
+    `## ${message.role} ${message.createdAt}`,
+    `- id: ${message.id}`,
+    message.replyToMessageId ? `- replyTo: ${message.replyToMessageId}` : "",
+    "",
+    truncateContextText(message.content, 4000),
+  ].filter((line) => line !== "").join("\n")).join("\n\n");
+  return [
+    "Create a durable session memory summary for Codex Web.",
+    "Return Markdown only. Be concise but preserve information needed for future turns.",
+    "",
+    "Required sections:",
+    "## Stable User Preferences",
+    "## Decisions",
+    "## Current Task State",
+    "## Open Questions",
+    "## Important Files And References",
+    "## Risks Or Constraints",
+    "",
+    "Rules:",
+    "- Preserve concrete decisions, user preferences, task state, blockers, and key file paths.",
+    "- Do not include generic greetings or low-value chatter.",
+    "- Do not invent facts not present in the transcript.",
+    "- Keep the summary bounded; prefer bullets.",
+    previousSummary ? "- Update the previous summary with the new transcript. Return a complete replacement summary, not a delta." : "",
+    "",
+    `Session: ${session.title} (${session.id})`,
+    `Type: ${session.conversationType ?? "codex"}`,
+    "",
+    previousSummary ? "# Previous Persistent Summary" : "",
+    previousSummary ? truncateContextText(previousSummary, 20_000) : "",
+    previousSummary ? "" : "",
+    "# Transcript",
+    truncateContextText(transcript, 80_000),
+  ].join("\n");
+}
+
+function responseOutputText(payload: Record<string, unknown>) {
+  if (typeof payload.output_text === "string") return payload.output_text;
+  const output = Array.isArray(payload.output) ? payload.output : [];
+  return output.map((item) => {
+    if (!item || typeof item !== "object") return "";
+    const record = item as Record<string, unknown>;
+    return textFromResponseContent(record.content);
+  }).filter(Boolean).join("\n").trim();
+}
+
+async function generateSessionCompactionSummary(session: SessionSummary, provider: ProviderRecord, model: string, prompt: string) {
+  if (provider.kind === "local") throw new Error("provider_compaction_unsupported");
+  if (!provider.apiKey) throw new Error("api_key_missing");
+  if (provider.kind === "openai-compatible-chat") {
+    if (!provider.baseUrl) throw new Error("base_url_required");
+    const response = await fetch(joinUrl(provider.baseUrl, "/chat/completions"), {
+      method: "POST",
+      headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: "You summarize software-development conversations into durable session memory." },
+          { role: "user", content: prompt },
+        ],
+        max_tokens: 1200,
+      }),
+    });
+    if (!response.ok) throw new Error(await response.text() || `http_${response.status}`);
+    const payload = await response.json() as Record<string, unknown>;
+    const choice = Array.isArray(payload.choices) ? payload.choices[0] as Record<string, unknown> | undefined : undefined;
+    const message = choice?.message && typeof choice.message === "object" ? choice.message as Record<string, unknown> : {};
+    const content = typeof message.content === "string" ? message.content.trim() : "";
+    if (!content) throw new Error("empty_compaction_summary");
+    return content;
+  }
+  const response = await fetch(joinUrl(provider.baseUrl || "https://api.openai.com/v1", "/responses"), {
+    method: "POST",
+    headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" },
+    body: JSON.stringify({
+      model,
+      input: prompt,
+      max_output_tokens: 1600,
+    }),
+  });
+  if (!response.ok) throw new Error(await response.text() || `http_${response.status}`);
+  const payload = await response.json() as Record<string, unknown>;
+  const content = responseOutputText(payload);
+  if (!content) throw new Error("empty_compaction_summary");
+  return content;
+}
+
+async function createSessionCompaction(session: SessionSummary, body?: CreateSessionCompactionRequest | null, options: { incremental?: boolean } = {}): Promise<SessionCompactionResponse> {
+  const allMessages = allSessionMessages(session.id).filter((message) => message.role !== "system");
+  const previous = latestSessionCompaction(session.id);
+  const previousSummary = options.incremental && previous ? latestSessionMemoryMarkdown(session.id) : "";
+  const messages = options.incremental ? messagesAfterCompaction(allMessages, previous) : allMessages;
+  if (!messages.length) throw new Error("no_messages_to_compact");
+  const provider = appData.providers.find((item) => item.id === body?.providerId)
+    ?? (session.providerId ? appData.providers.find((item) => item.id === session.providerId) : undefined)
+    ?? appData.providers.find((item) => item.kind !== "local" && item.apiKey);
+  if (!provider) throw new Error("provider_required");
+  const model = body?.model?.trim() || session.model || provider.defaultModel;
+  if (!model) throw new Error("model_required");
+  const prompt = sessionCompactionPrompt(session, messages, previousSummary);
+  const promptHash = createHash("sha256").update(prompt).digest("hex").slice(0, 16);
+  const summary = await generateSessionCompactionSummary(session, provider, model, prompt);
+  const id = `compaction-${randomUUID()}`;
+  const now = new Date().toISOString();
+  const memoryRoot = sessionMemoryPath(session.id);
+  mkdirSync(memoryRoot, { recursive: true });
+  const filePath = join(memoryRoot, `${id}.md`);
+  const latestPath = join(memoryRoot, "latest-summary.md");
+  writeFileSync(filePath, summary, "utf8");
+  writeFileSync(latestPath, summary, "utf8");
+  const sourceChars = messages.reduce((sum, message) => sum + message.content.length, 0);
+  db.prepare(`
+    insert into session_compactions (
+      id, session_id, provider_id, model, source_message_start_id, source_message_end_id,
+      source_message_count, source_chars, prompt_hash, file_path, supersedes_id, created_at
+    )
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    session.id,
+    provider.id,
+    model,
+    messages[0]?.id ?? null,
+    messages.at(-1)?.id ?? null,
+    messages.length,
+    sourceChars,
+    promptHash,
+    filePath,
+    previous?.id ?? null,
+    now,
+  );
+  return { compaction: latestSessionCompaction(session.id)!, summary };
+}
+
+function updateLatestSessionCompaction(session: SessionSummary, summary: string): SessionCompactionResponse {
+  const previous = latestSessionCompaction(session.id);
+  if (!previous) throw new Error("session_compaction_not_found");
+  const trimmed = summary.trim();
+  if (!trimmed) throw new Error("summary_required");
+  const id = `compaction-${randomUUID()}`;
+  const now = new Date().toISOString();
+  const memoryRoot = sessionMemoryPath(session.id);
+  mkdirSync(memoryRoot, { recursive: true });
+  const filePath = join(memoryRoot, `${id}.md`);
+  writeFileSync(filePath, trimmed, "utf8");
+  writeFileSync(join(memoryRoot, "latest-summary.md"), trimmed, "utf8");
+  const promptHash = createHash("sha256").update(`manual-edit:${trimmed}`).digest("hex").slice(0, 16);
+  db.prepare(`
+    insert into session_compactions (
+      id, session_id, provider_id, model, source_message_start_id, source_message_end_id,
+      source_message_count, source_chars, prompt_hash, file_path, supersedes_id, created_at
+    )
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    session.id,
+    null,
+    "manual-edit",
+    previous.sourceMessageStartId ?? null,
+    previous.sourceMessageEndId ?? null,
+    previous.sourceMessageCount,
+    previous.sourceChars,
+    promptHash,
+    filePath,
+    previous.id,
+    now,
+  );
+  return { compaction: latestSessionCompaction(session.id)!, summary: trimmed };
+}
+
+function restoreSessionCompaction(session: SessionSummary, compactionId: string): SessionCompactionResponse {
+  const target = db.prepare("select * from session_compactions where session_id = ? and id = ?").get(session.id, compactionId) as Record<string, unknown> | undefined;
+  if (!target) throw new Error("session_compaction_not_found");
+  const targetCompaction = sessionCompactionFromRow(target);
+  const summary = existsSync(targetCompaction.filePath) ? readFileSync(targetCompaction.filePath, "utf8").trim() : "";
+  if (!summary) throw new Error("summary_missing");
+  const previous = latestSessionCompaction(session.id);
+  const id = `compaction-${randomUUID()}`;
+  const now = new Date().toISOString();
+  const memoryRoot = sessionMemoryPath(session.id);
+  mkdirSync(memoryRoot, { recursive: true });
+  const filePath = join(memoryRoot, `${id}.md`);
+  writeFileSync(filePath, summary, "utf8");
+  writeFileSync(join(memoryRoot, "latest-summary.md"), summary, "utf8");
+  const promptHash = createHash("sha256").update(`manual-restore:${targetCompaction.id}:${summary}`).digest("hex").slice(0, 16);
+  db.prepare(`
+    insert into session_compactions (
+      id, session_id, provider_id, model, source_message_start_id, source_message_end_id,
+      source_message_count, source_chars, prompt_hash, file_path, supersedes_id, created_at
+    )
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    session.id,
+    null,
+    "manual-restore",
+    targetCompaction.sourceMessageStartId ?? null,
+    targetCompaction.sourceMessageEndId ?? null,
+    targetCompaction.sourceMessageCount,
+    targetCompaction.sourceChars,
+    promptHash,
+    filePath,
+    previous?.id ?? null,
+    now,
+  );
+  return { compaction: latestSessionCompaction(session.id)!, summary };
+}
+
+const runningAutoCompactions = new Set<string>();
+
+function shouldAutoCompactSession(session: SessionSummary) {
+  if (!sessionCompactionSettings.enabled) return false;
+  if (runningAutoCompactions.has(session.id)) return false;
+  const messages = allSessionMessages(session.id).filter((message) => message.role !== "system");
+  if (!messages.length) return false;
+  const totalChars = messages.reduce((sum, message) => sum + message.content.length, 0);
+  if (messages.length < sessionCompactionSettings.autoCompactMessages && totalChars < sessionCompactionSettings.autoCompactChars) return false;
+  const latest = latestSessionCompaction(session.id);
+  const newMessages = messagesAfterCompaction(messages, latest);
+  if (!newMessages.length) return false;
+  const newChars = newMessages.reduce((sum, message) => sum + message.content.length, 0);
+  if (!latest) return true;
+  return newMessages.length >= sessionCompactionSettings.minNewMessages || newChars >= sessionCompactionSettings.minNewChars;
+}
+
+function scheduleSessionAutoCompaction(session: SessionSummary, reason: string) {
+  if (!shouldAutoCompactSession(session)) return;
+  runningAutoCompactions.add(session.id);
+  void createSessionCompaction(session, null, { incremental: true })
+    .then((result) => {
+      const activity: Extract<TaskEvent, { type: "activity" }> = {
+        type: "activity",
+        kind: "tool",
+        label: "会话记忆已自动压缩",
+        detail: `${reason}; ${result.compaction.sourceMessageCount} new messages`,
+        status: "completed",
+        at: result.compaction.createdAt,
+      };
+      recordTaskActivity(session.id, activity);
+      publishTaskEvent(session.id, activity);
+    })
+    .catch((error) => {
+      appendCodexErrorOutput(session, `\n[session compaction failed] ${error instanceof Error ? error.message : String(error)}\n`);
+      recordTaskActivity(session.id, {
+        type: "activity",
+        kind: "tool",
+        label: "会话记忆自动压缩失败",
+        detail: error instanceof Error ? error.message : String(error),
+        status: "failed",
+        at: new Date().toISOString(),
+      });
+    })
+    .finally(() => {
+      runningAutoCompactions.delete(session.id);
+    });
+}
+
 function deleteSessionMessages(sessionId: string) {
   db.prepare("delete from messages where session_id = ?").run(sessionId);
   db.prepare("delete from message_cards where session_id = ?").run(sessionId);
@@ -2748,6 +4215,7 @@ function deleteSessionDatabaseRows(sessionId: string) {
   db.prepare("delete from message_queue where session_id = ?").run(sessionId);
   db.prepare("delete from task_activities where session_id = ?").run(sessionId);
   db.prepare("delete from execution_contexts where session_id = ?").run(sessionId);
+  db.prepare("delete from session_compactions where session_id = ?").run(sessionId);
   db.prepare("delete from agent_sessions where session_id = ?").run(sessionId);
   db.prepare("delete from agent_runs where session_id = ?").run(sessionId);
   db.prepare("delete from sessions where id = ?").run(sessionId);
@@ -3103,7 +4571,7 @@ function closePersistedRunningTerminals() {
 function previewFromRow(row: Record<string, unknown>): PreviewRecord {
   return {
     id: String(row.id),
-    scopeType: row.scope_type === "session" ? "session" : "project",
+    scopeType: row.scope_type === "session" || row.scope_type === "folder" ? row.scope_type : "project",
     scopeId: String(row.scope_id),
     label: String(row.label),
     targetHost: String(row.target_host),
@@ -3348,7 +4816,11 @@ function cleanupDatabaseRedundancy(options: { deleteArchivedApprovals?: boolean;
   }
 
   for (const preview of Array.from(previews.values())) {
-    const hasScope = preview.scopeType === "project" ? projectIds.has(preview.scopeId) : sessionIds.has(preview.scopeId);
+    const hasScope = preview.scopeType === "project"
+      ? projectIds.has(preview.scopeId)
+      : preview.scopeType === "folder"
+        ? existsSync(preview.scopeId) && statSync(preview.scopeId).isDirectory()
+        : sessionIds.has(preview.scopeId);
     if (!hasScope) {
       deletePreview(preview.id);
       deletedPreviews += 1;
@@ -3402,12 +4874,7 @@ function cleanupDatabaseRedundancy(options: { deleteArchivedApprovals?: boolean;
   let orphanAgentSessions = 0;
   for (const row of orphanAgentRows) {
     const session = sessionFromRow(row, appData.projects);
-    const child = codexTaskProcesses.get(session.id);
-    if (child) child.kill("SIGTERM");
-    codexTaskProcesses.delete(session.id);
-    codexTaskOutputs.delete(session.id);
-    codexTaskStopRequested.delete(session.id);
-    codexTaskStdoutBuffers.delete(session.id);
+    clearCodexTaskRuntime(session.id, true);
     appData.sessions = appData.sessions.filter((item) => item.id !== session.id);
     deleteSessionDatabaseRows(session.id);
     orphanAgentSessions += 1;
@@ -3421,12 +4888,7 @@ function cleanupDatabaseRedundancy(options: { deleteArchivedApprovals?: boolean;
   for (const row of orphanRoomRows) {
     const childSessions = appData.sessions.filter((session) => session.conversationType === "agent" && session.roomId === row.id);
     for (const childSession of childSessions) {
-      const child = codexTaskProcesses.get(childSession.id);
-      if (child) child.kill("SIGTERM");
-      codexTaskProcesses.delete(childSession.id);
-      codexTaskOutputs.delete(childSession.id);
-      codexTaskStopRequested.delete(childSession.id);
-      codexTaskStdoutBuffers.delete(childSession.id);
+      clearCodexTaskRuntime(childSession.id, true);
       deleteSessionDatabaseRows(childSession.id);
       deleteSessionData(childSession, false, true);
     }
@@ -3479,13 +4941,17 @@ function cleanupDatabaseRedundancy(options: { deleteArchivedApprovals?: boolean;
   };
 }
 
-function pathStats(targetPath: string) {
+function pathStats(targetPath: string, options: { excludeNames?: Set<string> } = {}) {
   try {
-    const stat = statSync(targetPath);
+    const stat = lstatSync(targetPath);
+    if (stat.isSymbolicLink()) {
+      return { bytes: stat.size, updatedAt: stat.mtime.toISOString() };
+    }
     if (stat.isDirectory()) {
       let bytes = 0;
       for (const child of readdirSync(targetPath)) {
-        bytes += pathStats(join(targetPath, child)).bytes;
+        if (options.excludeNames?.has(child)) continue;
+        bytes += pathStats(join(targetPath, child), options).bytes;
       }
       return { bytes, updatedAt: stat.mtime.toISOString() };
     }
@@ -3503,8 +4969,9 @@ function storageItem(
   relatedId?: string | null,
   relatedName?: string | null,
   relatedType?: StorageItemSummary["relatedType"],
+  statsOptions?: { excludeNames?: Set<string> },
 ): StorageItemSummary {
-  const stats = pathStats(itemPath);
+  const stats = pathStats(itemPath, statsOptions);
   return {
     id: createHash("sha1").update(`${type}:${itemPath}`).digest("hex"),
     type,
@@ -3551,21 +5018,6 @@ function listStorageItems(): StorageScanResponse {
     }
   }
 
-  for (const session of appData.sessions) {
-    const logsRoot = sessionLogsPath(session.id);
-    if (!existsSync(logsRoot)) continue;
-    const active = sessionIds.has(session.id);
-    const sessionLabel = session.title;
-    const logPath = join(logsRoot, "codex.log");
-    const metaPath = join(logsRoot, "codex.json");
-    if (existsSync(logPath)) {
-      items.push(storageItem("task-log", active ? "active" : "orphan", `${session.id}.log`, logPath, session.id, sessionLabel, "session"));
-    }
-    if (existsSync(metaPath)) {
-      items.push(storageItem("task-log", active ? "active" : "orphan", `${session.id}.json`, metaPath, session.id, sessionLabel, "session"));
-    }
-  }
-
   if (existsSync(sessionWorkspaceRoot)) {
     for (const name of readdirSync(sessionWorkspaceRoot)) {
       const itemPath = join(sessionWorkspaceRoot, name);
@@ -3595,17 +5047,6 @@ function listStorageItems(): StorageScanResponse {
         const isActive = activeRoomIds.has(name) && Boolean(run && (run.run_status === "running" || mergeStatus === "pending" || mergeStatus === "conflict"));
         items.push(storageItem("room-worktree", isActive ? "active" : "orphan", `${name}/${worktreeName}`, worktreePath, run?.id ?? name, room?.name, run ? "run" : "room"));
       }
-    }
-  }
-
-  if (existsSync(taskLogDir)) {
-    for (const name of readdirSync(taskLogDir)) {
-      if (!name.endsWith(".log") && !name.endsWith(".json")) continue;
-      const relatedId = name.replace(/\.(log|json)$/, "");
-      const migratedPath = join(sessionLogsPath(relatedId), name.endsWith(".log") ? "codex.log" : "codex.json");
-      if (existsSync(migratedPath)) continue;
-      const session = sessionById.get(relatedId);
-      items.push(storageItem("task-log", session && activeSessionIds.has(relatedId) ? "active" : "orphan", name, join(taskLogDir, name), relatedId, session?.title, "session"));
     }
   }
 
@@ -3901,6 +5342,11 @@ async function readBackupUpload(c: { req: { formData: () => Promise<FormData> } 
 }
 
 function deleteSessionData(session: SessionSummary, deleteWorkspace: boolean, deleteLogs: boolean) {
+  const managedWorkspaceRoots = [sessionWorkspaceRoot, join(dataDir, "rooms")];
+  const resolvedWorkspace = session.workspacePath ? resolve(session.workspacePath) : "";
+  if (resolvedWorkspace && managedWorkspaceRoots.some((root) => pathWithinRoot(resolvedWorkspace, root))) {
+    deleteFileMountsForRoot(resolvedWorkspace);
+  }
   rmSync(sessionContextPath(session.id), { recursive: true, force: true });
   if (deleteLogs) {
     rmSync(taskLogPath(session.id), { force: true });
@@ -3909,7 +5355,7 @@ function deleteSessionData(session: SessionSummary, deleteWorkspace: boolean, de
     rmSync(legacyTaskMetaPath(session.id), { force: true });
   }
   if (!deleteWorkspace) return;
-  const allowedRoots = [sessionWorkspaceRoot, join(dataDir, "rooms")];
+  const allowedRoots = managedWorkspaceRoots;
   const candidates = new Set<string>([sessionDataPath(session.id)]);
   if (session.workspacePath) candidates.add(resolve(session.workspacePath));
   if (session.roomId) candidates.add(roomWorkspaceDataPath(session.roomId));
@@ -3985,6 +5431,10 @@ function previewUpstreamPathFromUrl(sourceUrl: URL, preview: PreviewRecord) {
 
 function previewScopeWorkspace(scopeType: PreviewRecord["scopeType"], scopeId: string) {
   if (scopeType === "project") return appData.projects.find((project) => project.id === scopeId)?.workspacePath ?? null;
+  if (scopeType === "folder") {
+    const folderPath = resolve(scopeId);
+    return existsSync(folderPath) && statSync(folderPath).isDirectory() ? folderPath : null;
+  }
   return appData.sessions.find((session) => session.id === scopeId)?.workspacePath ?? null;
 }
 
@@ -4137,14 +5587,24 @@ function pauseStaleRunningSessions() {
     if (session.status === "running") {
       const runningTaskRun = latestRunningTaskRun(session.id);
       const pid = typeof runningTaskRun?.pid === "number" ? runningTaskRun.pid : null;
+      const meta = readTaskMeta(session.id);
+      if (meta && meta.running === false && (typeof meta.exitCode === "number" || meta.exitCode === null || meta.error)) {
+        backfillSessionFromTaskLog(session);
+        codexTaskOutputs.set(session.id, readCodexOutput(session.id));
+        finalizeCodexRunnerTask(session, typeof meta.exitCode === "number" ? meta.exitCode : null, meta.error ?? "api_recovered_finished_runner");
+        changed = true;
+        continue;
+      }
       if (isProcessAlive(pid)) {
+        backfillSessionFromTaskLog(session);
+        codexTaskOutputs.set(session.id, readCodexOutput(session.id));
+        startCodexTaskTailer(session, { finalizeOnExit: true });
         session.updatedAt = new Date().toISOString();
-        appendSessionMessage(session.id, "system", `API restarted at ${session.updatedAt}; Codex process ${pid} still appears to be running in the background.`);
         recordTaskActivity(session.id, {
           type: "activity",
           kind: "tool",
-          label: "任务仍在后台运行",
-          detail: `pid ${pid}`,
+          label: "任务流已恢复",
+          detail: `runner pid ${pid}`,
           status: "in_progress",
           at: session.updatedAt,
         });
@@ -4333,8 +5793,11 @@ function roomStatus(value: unknown, fallback: RoomStatus = "draft"): RoomStatus 
 const defaultRoomOrchestration: RoomOrchestrationSettings = {
   autoStartTasks: true,
   autoCreateReviewTasks: true,
+  autoListenAfterAgentEvents: true,
   notifyUserOnFailure: true,
   maxAutoRetries: 0,
+  maxAutoListenChainDepth: 1,
+  maxAutoListenTasksPerEvent: 1,
 };
 
 function roomOrchestrationSettings(value: unknown, override?: Partial<RoomOrchestrationSettings>): RoomOrchestrationSettings {
@@ -4343,8 +5806,11 @@ function roomOrchestrationSettings(value: unknown, override?: Partial<RoomOrches
   return {
     autoStartTasks: override?.autoStartTasks ?? item.autoStartTasks ?? defaultRoomOrchestration.autoStartTasks,
     autoCreateReviewTasks: override?.autoCreateReviewTasks ?? item.autoCreateReviewTasks ?? defaultRoomOrchestration.autoCreateReviewTasks,
+    autoListenAfterAgentEvents: override?.autoListenAfterAgentEvents ?? item.autoListenAfterAgentEvents ?? defaultRoomOrchestration.autoListenAfterAgentEvents,
     notifyUserOnFailure: override?.notifyUserOnFailure ?? item.notifyUserOnFailure ?? defaultRoomOrchestration.notifyUserOnFailure,
     maxAutoRetries: Math.max(0, Math.min(10, Number(override?.maxAutoRetries ?? item.maxAutoRetries ?? defaultRoomOrchestration.maxAutoRetries) || 0)),
+    maxAutoListenChainDepth: Math.max(0, Math.min(10, Number(override?.maxAutoListenChainDepth ?? item.maxAutoListenChainDepth ?? defaultRoomOrchestration.maxAutoListenChainDepth) || 0)),
+    maxAutoListenTasksPerEvent: Math.max(1, Math.min(20, Number(override?.maxAutoListenTasksPerEvent ?? item.maxAutoListenTasksPerEvent ?? defaultRoomOrchestration.maxAutoListenTasksPerEvent) || 1)),
   };
 }
 
@@ -4508,7 +5974,13 @@ function privatePreviewAccessResponse(preview: PreviewRecord, sourceUrl: URL) {
   });
 }
 
-app.use("*", createRateLimitMiddleware(() => rateLimitSettings));
+app.use("*", createRateLimitMiddleware(
+  () => rateLimitSettings,
+  (providerId) => {
+    const provider = appData.providers.find((item) => item.id === providerId);
+    return provider ? { enabled: provider.rpmLimitEnabled, rpmLimit: provider.rpmLimit } : null;
+  },
+));
 
 function slugify(value: string) {
   return value.trim().toLowerCase().replaceAll(/[^a-z0-9]+/g, "-").replaceAll(/^-|-$/g, "") || randomUUID();
@@ -4565,6 +6037,16 @@ function deleteFileMount(id: string) {
   if (id === "default" && fileMounts.size <= 1) throw new Error("cannot_delete_last_mount");
   db.prepare("delete from file_mounts where id = ?").run(id);
   fileMounts.delete(id);
+}
+
+function deleteFileMountsForRoot(rootPath: string) {
+  const normalizedRoot = normalizeMountPath(rootPath);
+  for (const mount of Array.from(fileMounts.values())) {
+    if (normalizeMountPath(mount.rootPath) !== normalizedRoot) continue;
+    if (mount.id === "default" && fileMounts.size <= 1) continue;
+    db.prepare("delete from file_mounts where id = ?").run(mount.id);
+    fileMounts.delete(mount.id);
+  }
 }
 
 function resolveInsideMount(mount: FileMountRecord, inputPath?: string) {
@@ -4678,6 +6160,9 @@ function publicProvider(provider: ProviderRecord): ProviderSummary {
     capabilities: provider.capabilities ?? defaultProviderCapabilities(provider.kind),
     models: cachedModels?.models,
     modelsCachedAt: cachedModels?.cachedAt ?? null,
+    rpmLimit: provider.rpmLimit ?? null,
+    rpmLimitEnabled: provider.rpmLimitEnabled ?? false,
+    useProxy: provider.useProxy ?? false,
   };
 }
 
@@ -5047,6 +6532,23 @@ async function proxyResponsesToChatCompletions(provider: ProviderRecord, body: R
   return new Response(JSON.stringify(chatCompletionToResponse(payload, String(chatRequest.model ?? provider.defaultModel))), { headers: { "content-type": "application/json" } });
 }
 
+async function proxyResponsesToResponses(provider: ProviderRecord, body: Record<string, unknown>) {
+  if (!provider.baseUrl) return new Response(JSON.stringify({ error: "base_url_required" }), { status: 400, headers: { "content-type": "application/json" } });
+  const upstream = await fetch(joinUrl(provider.baseUrl, "/responses"), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(provider.apiKey ? { authorization: `Bearer ${provider.apiKey}` } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  const headers = new Headers();
+  headers.set("content-type", upstream.headers.get("content-type") ?? (body.stream === true ? "text/event-stream; charset=utf-8" : "application/json"));
+  const cacheControl = upstream.headers.get("cache-control");
+  if (cacheControl) headers.set("cache-control", cacheControl);
+  return new Response(upstream.body, { status: upstream.status, headers });
+}
+
 async function probeProviderInterface(provider: ProviderRecord, kind: "responses" | "chatCompletions") {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), providerTimeoutMs);
@@ -5153,7 +6655,7 @@ async function testProvider(provider: ProviderRecord): Promise<ProviderTestRespo
       providerId: provider.id,
       status: response.status,
       durationMs: Date.now() - startedAt,
-      error: response.ok ? undefined : `http_${response.status}`,
+      error: response.ok ? undefined : await response.text() || `http_${response.status}`,
     };
   } catch (error) {
     return {
@@ -5301,6 +6803,103 @@ function sessionMetadataPath(sessionId: string) {
 
 function sessionContextPath(sessionId: string) {
   return resolve(sessionDataPath(sessionId), "context");
+}
+
+function sessionMemoryPath(sessionId: string) {
+  return resolve(sessionDataPath(sessionId), "memory");
+}
+
+function sessionAttachmentsPath(sessionId: string) {
+  return resolve(sessionDataPath(sessionId), "attachments");
+}
+
+type SavedSessionAttachment = {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  path: string;
+  relativePath: string;
+  textPreview?: string;
+};
+
+const maxAttachmentFiles = 8;
+const maxAttachmentBytes = 5 * 1024 * 1024;
+const maxAttachmentTextPreviewChars = 16_000;
+
+function safeAttachmentName(name: string) {
+  const base = basename(name || "attachment").replace(/[^\w.\- ()[\]\u4e00-\u9fff]/g, "_").slice(0, 120);
+  return base && base !== "." && base !== ".." ? base : "attachment";
+}
+
+function readableAttachmentBytes(size: number) {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function attachmentTextPreview(buffer: Buffer, type: string, name: string) {
+  const lowerName = name.toLowerCase();
+  const looksText = type.startsWith("text/")
+    || /(?:\.txt|\.md|\.json|\.csv|\.tsv|\.log|\.xml|\.html|\.css|\.js|\.jsx|\.ts|\.tsx|\.py|\.go|\.rs|\.java|\.c|\.cpp|\.h|\.hpp|\.sh|\.yml|\.yaml|\.toml|\.ini|\.env)$/i.test(lowerName);
+  if (!looksText) return "";
+  const text = buffer.toString("utf8").replace(/\u0000/g, "");
+  return text.length > maxAttachmentTextPreviewChars ? `${text.slice(0, maxAttachmentTextPreviewChars)}\n... [truncated]` : text;
+}
+
+function saveSessionAttachments(sessionId: string, inputs?: UploadAttachmentInput[] | null) {
+  const items = (inputs ?? []).filter((item) => item?.dataBase64 && item.name).slice(0, maxAttachmentFiles);
+  if (!items.length) return [] as SavedSessionAttachment[];
+  const root = sessionAttachmentsPath(sessionId);
+  mkdirSync(root, { recursive: true });
+  return items.map((item) => {
+    const name = safeAttachmentName(item.name);
+    const type = item.type?.trim() || "application/octet-stream";
+    const buffer = Buffer.from(item.dataBase64, "base64");
+    if (buffer.length > maxAttachmentBytes) throw new Error("attachment_too_large");
+    const id = `attachment-${randomUUID()}`;
+    const filename = `${id}-${name}`;
+    const target = resolve(root, filename);
+    if (!target.startsWith(`${root}/`)) throw new Error("invalid_attachment_path");
+    writeFileSync(target, buffer);
+    const relativePath = `attachments/${filename}`;
+    const textPreview = attachmentTextPreview(buffer, type, name);
+    return {
+      id,
+      name,
+      type,
+      size: buffer.length,
+      path: target,
+      relativePath,
+      textPreview: textPreview || undefined,
+    };
+  });
+}
+
+function attachmentMarkdown(attachments: SavedSessionAttachment[], options: { includePreview: boolean }) {
+  if (!attachments.length) return "";
+  return [
+    "## Attachments",
+    ...attachments.flatMap((attachment, index) => [
+      `${index + 1}. ${attachment.name}`,
+      `   - path: ${attachment.path}`,
+      `   - session path: ${attachment.relativePath}`,
+      `   - type: ${attachment.type}`,
+      `   - size: ${readableAttachmentBytes(attachment.size)}`,
+      options.includePreview && attachment.textPreview ? "   - text preview:" : "",
+      options.includePreview && attachment.textPreview ? attachment.textPreview.split("\n").map((line) => `     ${line}`).join("\n") : "",
+    ]),
+  ].filter((line) => line !== "").join("\n");
+}
+
+function promptWithAttachments(prompt: string, attachments: SavedSessionAttachment[]) {
+  const attachmentBlock = attachmentMarkdown(attachments, { includePreview: true });
+  return attachmentBlock ? `${prompt.trim()}\n\n${attachmentBlock}` : prompt.trim();
+}
+
+function messageWithAttachments(prompt: string, attachments: SavedSessionAttachment[]) {
+  const attachmentBlock = attachmentMarkdown(attachments, { includePreview: false });
+  return attachmentBlock ? `${prompt.trim()}\n\n${attachmentBlock}` : prompt.trim();
 }
 
 function writeSessionContextFile(sessionId: string, name: string, content: string) {
@@ -6065,16 +7664,16 @@ function roomAgentsWithListenModes(roomId: string) {
   return rows.map((row) => ({ agent: agentFromRow(row), listenMode: listenMode(row.member_listen_mode) }));
 }
 
-function autoListenAgentsForRoomMessage(roomId: string) {
+function autoListenAgentsForRoomMessage(roomId: string, limit = 20) {
   const members = roomAgentsWithListenModes(roomId).filter((member) => member.agent.enabled && member.listenMode !== "none" && member.listenMode !== "passive");
   const orchestrators = members.filter((member) => member.listenMode === "orchestrator");
-  return (orchestrators.length ? orchestrators : members.filter((member) => member.listenMode === "active")).map((member) => member.agent);
+  return (orchestrators.length ? orchestrators : members.filter((member) => member.listenMode === "active")).slice(0, limit).map((member) => member.agent);
 }
 
-function createListenTasksForRoomEvent(roomId: string, reason: string, content: string, options: { excludeAgentId?: string | null; sourceTaskId?: string | null } = {}) {
+function createListenTasksForRoomEvent(roomId: string, reason: string, content: string, options: { excludeAgentId?: string | null; sourceTaskId?: string | null; limit?: number } = {}) {
   const members = roomAgentsWithListenModes(roomId).filter((member) => member.agent.enabled && member.listenMode !== "none" && member.listenMode !== "passive" && member.agent.id !== options.excludeAgentId);
   const orchestrators = members.filter((member) => member.listenMode === "orchestrator");
-  const targets = orchestrators.length ? orchestrators : members.filter((member) => member.listenMode === "active");
+  const targets = (orchestrators.length ? orchestrators : members.filter((member) => member.listenMode === "active")).slice(0, Math.max(1, options.limit ?? 20));
   return targets.map((member) => insertRoomTask(
     roomId,
     member.listenMode === "orchestrator" ? `Orchestrate: ${reason}` : `Listen: ${reason}`,
@@ -6115,6 +7714,23 @@ function insertRoomTask(roomId: string, title: string, prompt: string, assignedA
     now,
   );
   return roomTaskFromRow(db.prepare("select * from room_tasks where id = ?").get(id) as Record<string, unknown>);
+}
+
+function roomTaskAutoListenDepth(roomId: string, taskId?: string | null) {
+  if (!taskId) return 0;
+  let depth = 0;
+  let currentId: string | null = taskId;
+  const seen = new Set<string>();
+  while (currentId && !seen.has(currentId)) {
+    seen.add(currentId);
+    const row = db.prepare("select payload from room_tasks where room_id = ? and id = ?").get(roomId, currentId) as { payload?: string | null } | undefined;
+    if (!row) break;
+    const payload = jsonPayload(row.payload) as { kind?: string; sourceTaskId?: string | null };
+    if (payload.kind !== "listen") break;
+    depth += 1;
+    currentId = payload.sourceTaskId ?? null;
+  }
+  return depth;
 }
 
 function roomEvent(roomId: string, type: string, payload: unknown, targetAgentId?: string | null, sourceAgentId?: string | null) {
@@ -6244,15 +7860,18 @@ function orchestrateRoom(roomId: string, reason: string) {
     const task = createAutoReviewTask(roomId, latestCompleted, latestCompleted.agent_id ? String(latestCompleted.agent_id) : null);
     if (task) createdTasks.push(task);
   }
-  if ((reason === "agent.completed" || reason === "agent.failed") && latestCompleted) {
+  if (settings.autoListenAfterAgentEvents && (reason === "agent.completed" || reason === "agent.failed") && latestCompleted) {
     const payload = jsonPayload(latestCompleted.payload) as { kind?: string };
-    if (payload.kind !== "listen") {
+    const depth = roomTaskAutoListenDepth(roomId, String(latestCompleted.id));
+    if (payload.kind !== "listen" || depth < settings.maxAutoListenChainDepth) {
       createdTasks.push(...createListenTasksForRoomEvent(
         roomId,
         reason,
         `Agent task "${latestCompleted.title}" finished with status ${latestCompleted.status}.`,
-        { excludeAgentId: latestCompleted.agent_id ? String(latestCompleted.agent_id) : null, sourceTaskId: String(latestCompleted.id) },
+        { excludeAgentId: latestCompleted.agent_id ? String(latestCompleted.agent_id) : null, sourceTaskId: String(latestCompleted.id), limit: settings.maxAutoListenTasksPerEvent },
       ));
+    } else {
+      roomEvent(roomId, "orchestrator.decision", { action: "skip-auto-listen", reason, taskId: latestCompleted.id, depth, maxDepth: settings.maxAutoListenChainDepth });
     }
   }
   if (reason === "task.created") {
@@ -6264,7 +7883,7 @@ function orchestrateRoom(roomId: string, reason: string) {
     `).get(roomId) as Record<string, unknown> | undefined;
     const payload = latestTask ? jsonPayload(latestTask.payload) as { kind?: string } : {};
     if (latestTask && !latestTask.assigned_agent_id && payload.kind !== "listen") {
-      createdTasks.push(...createListenTasksForRoomEvent(roomId, reason, `A new unassigned room task was created: ${latestTask.title}.`, { sourceTaskId: String(latestTask.id) }));
+      createdTasks.push(...createListenTasksForRoomEvent(roomId, reason, `A new unassigned room task was created: ${latestTask.title}.`, { sourceTaskId: String(latestTask.id), limit: settings.maxAutoListenTasksPerEvent }));
     }
   }
   if (settings.notifyUserOnFailure && reason === "agent.failed") {
@@ -6565,11 +8184,16 @@ function appendCodexOutput(sessionId: string, value: string) {
   appendFileSync(taskLogPath(sessionId), value, "utf8");
 }
 
-function appendCodexErrorOutput(session: SessionSummary, value: string) {
-  appendCodexOutput(session.id, value);
+function processCodexLogChunk(session: SessionSummary, value: string) {
+  const item = codexTaskOutputs.get(session.id);
+  if (item) item.output = (item.output + value).slice(-256 * 1024);
   discoverPreviewUrls(session, value);
   publishTaskEvent(session.id, { type: "output", bytes: Buffer.byteLength(value), at: new Date().toISOString() });
-  for (const line of value.split(/\r?\n/)) {
+  const nextBuffer = (codexTaskStdoutBuffers.get(session.id) ?? "") + value;
+  const lines = nextBuffer.split(/\r?\n/);
+  codexTaskStdoutBuffers.set(session.id, lines.pop() ?? "");
+  for (const line of lines) {
+    rememberCodexSessionId(session, line);
     const activity = line.trim() ? readActivityEvent(line) : null;
     if (activity && activity.type === "activity") {
       publishTaskEvent(session.id, activity);
@@ -6577,7 +8201,18 @@ function appendCodexErrorOutput(session: SessionSummary, value: string) {
         publishTaskEvent(session.id, { type: "workspace", session, reason: "activity", at: new Date().toISOString() });
       }
     }
+    const assistantText = readAssistantText(line);
+    if (assistantText) {
+      const message = appendSessionMessage(session.id, "assistant", assistantText);
+      ingestAssistantArtifacts(session, message, assistantText);
+      publishTaskEvent(session.id, { type: "message", message, session });
+    }
   }
+}
+
+function appendCodexErrorOutput(session: SessionSummary, value: string) {
+  appendCodexOutput(session.id, value);
+  processCodexLogChunk(session, value);
 }
 
 function readTaskExitCode(sessionId: string) {
@@ -6592,9 +8227,21 @@ function readTaskExitCode(sessionId: string) {
   }
 }
 
+function readTaskMeta(sessionId: string) {
+  const path = taskMetaPath(sessionId);
+  const metaPath = existsSync(path) ? path : legacyTaskMetaPath(sessionId);
+  if (!existsSync(metaPath)) return null;
+  try {
+    return JSON.parse(readFileSync(metaPath, "utf8")) as { exitCode?: number | null; running?: boolean; error?: string | null; runnerPid?: number | null; childPid?: number | null };
+  } catch {
+    return null;
+  }
+}
+
 function writeTaskExitCode(sessionId: string, exitCode: number | null) {
   mkdirSync(sessionLogsPath(sessionId), { recursive: true });
-  writeFileSync(taskMetaPath(sessionId), JSON.stringify({ exitCode, updatedAt: new Date().toISOString() }, null, 2), "utf8");
+  const previous = readTaskMeta(sessionId) ?? {};
+  writeFileSync(taskMetaPath(sessionId), JSON.stringify({ ...previous, running: false, exitCode, updatedAt: new Date().toISOString() }, null, 2), "utf8");
 }
 
 function taskRunFromRow(row: Record<string, unknown>): TaskRunSummary {
@@ -6708,6 +8355,23 @@ function backfillTaskActivitiesFromLog(sessionId: string) {
   }
 }
 
+function backfillSessionFromTaskLog(session: SessionSummary) {
+  const content = readTaskLogContent(session.id);
+  if (!content) return;
+  for (const line of content.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    rememberCodexSessionId(session, line);
+    const activity = readActivityEvent(line);
+    if (activity?.type === "activity") recordTaskActivity(session.id, activity);
+    const assistantText = readAssistantText(line);
+    if (!assistantText) continue;
+    const existing = db.prepare("select id from messages where session_id = ? and role = 'assistant' and content = ? limit 1").get(session.id, assistantText);
+    if (existing) continue;
+    const message = appendSessionMessage(session.id, "assistant", assistantText);
+    ingestAssistantArtifacts(session, message, assistantText);
+  }
+}
+
 function backfillRoomActivitiesFromAgentLogs(session: SessionSummary) {
   if (session.conversationType !== "room" || !session.roomId) return;
   const rows = db.prepare(`
@@ -6807,6 +8471,93 @@ function listTaskRunsForSession(sessionId: string, limit = 30, cursorValue?: str
     limit @limit
   `).all({ sessionId, cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
   return pageFromRows(rows.map(taskRunFromRow), limit, (item) => item.startedAt);
+}
+
+function taskLogBytes(sessionId: string) {
+  const path = taskLogPath(sessionId);
+  if (existsSync(path)) return statSync(path).size;
+  const legacyPath = legacyTaskLogPath(sessionId);
+  return existsSync(legacyPath) ? statSync(legacyPath).size : 0;
+}
+
+function listTaskHealth(): TaskHealthResponse {
+  const rows = db.prepare(`
+    select *
+    from task_runs
+    where status = 'running'
+    order by started_at desc, id desc
+    limit 100
+  `).all() as Array<Record<string, unknown>>;
+  const items = rows.map((row) => {
+    const run = taskRunFromRow(row);
+    const session = appData.sessions.find((item) => item.id === run.sessionId);
+    const meta = readTaskMeta(run.sessionId);
+    const pidAlive = isProcessAlive(run.pid);
+    const childPid = typeof meta?.childPid === "number" ? meta.childPid : null;
+    const childPidAlive = childPid ? isProcessAlive(childPid) : null;
+    let issue: string | null = null;
+    if (!session) issue = "session_missing";
+    else if (session.status !== "running") issue = "session_not_running";
+    else if (meta?.running === false) issue = "runner_finished";
+    else if (!pidAlive) issue = "runner_pid_missing";
+    return {
+      sessionId: run.sessionId,
+      title: session?.title ?? run.sessionId,
+      sessionStatus: session?.status ?? "interrupted",
+      runId: run.id,
+      runStatus: run.status,
+      pid: run.pid,
+      pidAlive,
+      runnerRunning: typeof meta?.running === "boolean" ? meta.running : null,
+      runnerExitCode: typeof meta?.exitCode === "number" ? meta.exitCode : null,
+      childPid,
+      childPidAlive,
+      logBytes: taskLogBytes(run.sessionId),
+      updatedAt: session?.updatedAt ?? run.startedAt,
+      issue,
+    };
+  });
+  return { ok: items.every((item) => !item.issue), checkedAt: new Date().toISOString(), items };
+}
+
+function repairTaskHealth(): TaskHealthRepairResponse {
+  const repaired: TaskHealthRepairResponse["repaired"] = [];
+  const before = listTaskHealth();
+  for (const item of before.items) {
+    if (!item.issue) continue;
+    const session = appData.sessions.find((entry) => entry.id === item.sessionId);
+    if (item.issue === "runner_finished" && session) {
+      const meta = readTaskMeta(item.sessionId);
+      backfillSessionFromTaskLog(session);
+      finalizeCodexRunnerTask(session, typeof meta?.exitCode === "number" ? meta.exitCode : null, meta?.error ?? "task_health_repair_runner_finished");
+      repaired.push({ sessionId: item.sessionId, issue: item.issue, action: "finalized_from_runner_meta" });
+      continue;
+    }
+    if (item.issue === "runner_pid_missing" && session) {
+      session.status = "interrupted";
+      session.updatedAt = new Date().toISOString();
+      finishTaskRun(session.id, "interrupted", null, "task_health_repair_runner_pid_missing");
+      writeTaskExitCode(session.id, null);
+      recordTaskActivity(session.id, {
+        type: "activity",
+        kind: "tool",
+        label: "任务状态已修复",
+        detail: "runner_pid_missing",
+        status: "failed",
+        at: session.updatedAt,
+      });
+      appendSessionMessage(session.id, "system", `Task health repair at ${session.updatedAt}; runner process was missing and the task was marked interrupted.`);
+      upsertSession(session);
+      repaired.push({ sessionId: item.sessionId, issue: item.issue, action: "marked_interrupted" });
+      continue;
+    }
+    if (item.issue === "session_not_running") {
+      finishTaskRun(item.sessionId, "interrupted", null, "task_health_repair_session_not_running");
+      repaired.push({ sessionId: item.sessionId, issue: item.issue, action: "closed_running_task_run" });
+    }
+  }
+  if (repaired.length) saveAppData();
+  return { ok: true, repaired, health: listTaskHealth() };
 }
 
 function readCodexSessionId(line: string) {
@@ -7029,12 +8780,1026 @@ function parseRoomUpdateBlocks(text: string) {
   });
 }
 
+function parseNotificationSkillBlocks(text: string) {
+  const blocks = Array.from(text.matchAll(/```codex-web-notification\s*([\s\S]*?)```/gi)).map((match) => match[1]?.trim()).filter(Boolean);
+  return blocks.flatMap((block) => {
+    try {
+      const parsed = JSON.parse(block) as unknown;
+      const items = Array.isArray(parsed) ? parsed : [parsed];
+      return items.flatMap((item) => item && typeof item === "object" ? [item as Record<string, unknown>] : []);
+    } catch {
+      return [];
+    }
+  });
+}
+
+function parseCrossSessionSkillBlocks(text: string) {
+  const blocks = Array.from(text.matchAll(/```codex-web-cross-session\s*([\s\S]*?)```/gi)).map((match) => match[1]?.trim()).filter(Boolean);
+  return blocks.flatMap((block) => {
+    try {
+      const parsed = JSON.parse(block) as unknown;
+      const items = Array.isArray(parsed) ? parsed : [parsed];
+      return items.flatMap((item) => item && typeof item === "object" ? [item as Record<string, unknown>] : []);
+    } catch {
+      return [];
+    }
+  });
+}
+
 function stringArray(value: unknown) {
   return Array.isArray(value) ? value.map((item) => typeof item === "string" ? item.trim() : "").filter(Boolean) : [];
 }
 
 function roomDecisionStatus(value: unknown): RoomDecisionSummary["status"] {
   return value === "approved" || value === "rejected" || value === "resolved" ? value : "open";
+}
+
+function resolveNotificationRecipientIds(input: Record<string, unknown>, context: ReturnType<typeof notificationPermissionContext>) {
+  const recipients = listNotificationRecipients()
+    .filter((recipient) => recipient.enabled)
+    .filter((recipient) => notificationPermissionAllows(recipient.permissions, context));
+  const byId = new Map(recipients.map((recipient) => [recipient.id, recipient]));
+  const byName = new Map(recipients.map((recipient) => [recipient.name.toLowerCase(), recipient]));
+  const raw = [
+    ...stringArray(input.recipientIds),
+    ...stringArray(input.recipients),
+    ...stringArray(input.recipientNames),
+  ];
+  return Array.from(new Set(raw.flatMap((value) => {
+    const item = byId.get(value) ?? byName.get(value.toLowerCase());
+    return item ? [item.id] : [];
+  })));
+}
+
+function notificationEventTypesFromSkill(value: unknown): NotificationEventType[] {
+  const allowed: NotificationEventType[] = ["task_completed", "task_failed", "task_interrupted", "needs_approval"];
+  const selected = stringArray(value).filter((type): type is NotificationEventType => allowed.includes(type as NotificationEventType));
+  return selected.length ? selected : ["task_completed"];
+}
+
+function notificationExpireModeFromSkill(value: unknown) {
+  return value === "session_end" || value === "manual" ? value : "after_trigger";
+}
+
+function resolveCrossSessionTarget(sourceSession: SessionSummary, input: Record<string, unknown>) {
+  const targetSessionId = typeof input.targetSessionId === "string" ? input.targetSessionId.trim() : typeof input.sessionId === "string" ? input.sessionId.trim() : "";
+  if (targetSessionId) {
+    const exact = appData.sessions.find((item) => item.id === targetSessionId);
+    if (exact) return exact;
+  }
+  const targetTitle = typeof input.targetTitle === "string" ? input.targetTitle.trim().toLowerCase() : typeof input.title === "string" ? input.title.trim().toLowerCase() : "";
+  if (!targetTitle) return null;
+  const candidates = appData.sessions
+    .filter((item) => item.id !== sourceSession.id)
+    .filter((item) => item.title.toLowerCase() === targetTitle || item.title.toLowerCase().includes(targetTitle))
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return candidates[0] ?? null;
+}
+
+function crossSessionProgressMarkdown(target: SessionSummary) {
+  const latestRun = listTaskRunsForSession(target.id, 1).items[0] ?? null;
+  const messages = allSessionMessages(target.id).filter((message) => message.role !== "system").slice(-8);
+  const memory = latestSessionMemoryMarkdown(target.id);
+  return [
+    "# Cross-Session Progress",
+    `- session: ${target.id}`,
+    `- title: ${target.title}`,
+    `- type: ${target.conversationType ?? "codex"}`,
+    `- status: ${target.status}`,
+    `- project: ${target.projectId ?? "scratch"}`,
+    `- updated: ${target.updatedAt}`,
+    latestRun ? `- latest run: ${latestRun.status} started=${latestRun.startedAt} ended=${latestRun.endedAt ?? "running"} exit=${latestRun.exitCode ?? "null"}` : "- latest run: none",
+    "",
+    memory ? "## Persistent Summary" : "",
+    memory ? truncateContextText(memory, 6000) : "",
+    "",
+    "## Recent Messages",
+    messages.length ? messages.map((message) => [
+      `### ${message.role} ${message.createdAt}`,
+      truncateContextText(message.content, 1600),
+    ].join("\n")).join("\n\n") : "No recent messages.",
+  ].filter((line) => line !== "").join("\n");
+}
+
+function dispatchMessageToSession(target: SessionSummary, content: string) {
+  restoreCodexSessionIdFromLog(target);
+  if (codexTaskProcesses.has(target.id) || target.status === "running") {
+    const queued = enqueueMessage(target, {
+      prompt: content,
+      providerId: target.providerId ?? null,
+      model: target.model ?? null,
+    });
+    return { mode: "queued", queuedId: queued.id };
+  }
+  const providerId = target.providerId ?? null;
+  const provider = providerId ? appData.providers.find((item) => item.id === providerId) : appData.providers[0];
+  const selectedModel = target.model ?? provider?.defaultModel ?? null;
+  const cwd = resolveSessionCwd(target);
+  target.providerId = provider?.id ?? null;
+  target.model = selectedModel;
+  target.status = "running";
+  target.updatedAt = new Date().toISOString();
+  const userMessage = appendSessionMessage(target.id, "user", content);
+  saveAppData();
+  startCodexTask(target, promptForDirectAgentSession(target, content), cwd, provider, selectedModel, !target.codexSessionId, [], {
+    currentMessageId: userMessage.id,
+  });
+  return { mode: "started", messageId: userMessage.id };
+}
+
+function sendCrossSessionMessage(sourceSession: SessionSummary, target: SessionSummary, message: string) {
+  const trimmed = message.trim();
+  if (!trimmed) throw new Error("cross_session_message_required");
+  const content = [
+    `Cross-session message from "${sourceSession.title}" (${sourceSession.id}):`,
+    "",
+    trimmed,
+  ].join("\n");
+  return dispatchMessageToSession(target, content);
+}
+
+function enqueueCrossSessionFollowup(session: SessionSummary, result: string) {
+  if (!codexTaskProcesses.has(session.id) && session.status !== "running") return;
+  enqueueMessage(session, {
+    prompt: [
+      "A controlled cross-session capability returned the following result.",
+      "Use it to answer the user's original request directly.",
+      "Do not emit another codex-web-cross-session block unless the user asks for another target or the result is insufficient.",
+      "",
+      result,
+    ].join("\n"),
+    providerId: session.providerId ?? null,
+    model: session.model ?? null,
+  });
+}
+
+type TelegramUpdate = {
+  update_id: number;
+  message?: {
+    message_id?: number;
+    text?: string;
+    chat?: { id?: number | string; title?: string; username?: string; type?: string };
+    from?: { id?: number | string; username?: string; first_name?: string };
+  };
+  callback_query?: {
+    id: string;
+    data?: string;
+    message?: {
+      message_id?: number;
+      chat?: { id?: number | string; title?: string; username?: string; type?: string };
+    };
+    from?: { id?: number | string; username?: string; first_name?: string };
+  };
+};
+
+function telegramConfigList(value: unknown) {
+  if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
+  return String(value ?? "").split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function telegramUpdateChatId(update: TelegramUpdate) {
+  const id = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id;
+  return id === undefined ? "" : String(id);
+}
+
+function telegramUpdateUserId(update: TelegramUpdate) {
+  const id = update.message?.from?.id ?? update.callback_query?.from?.id;
+  return id === undefined ? "" : String(id);
+}
+
+function telegramInboundAllowed(account: NotificationAccountRecord, update: TelegramUpdate) {
+  const config = account.config as Record<string, unknown>;
+  const chatId = telegramUpdateChatId(update);
+  const userId = telegramUpdateUserId(update);
+  const allowedChatIds = telegramConfigList(config.allowedChatIds);
+  const allowedUserIds = telegramConfigList(config.allowedUserIds);
+  if (allowedChatIds.length && !allowedChatIds.includes(chatId)) return false;
+  if (allowedUserIds.length && !allowedUserIds.includes(userId)) return false;
+  return Boolean(chatId);
+}
+
+function telegramRouteSession(account: NotificationAccountRecord, chatId: string) {
+  const accountId = account.id;
+  const row = db.prepare("select session_id from telegram_chat_routes where account_id = ? and chat_id = ?").get(accountId, chatId) as { session_id?: string } | undefined;
+  const sessionId = row?.session_id ?? String((account.config as Record<string, unknown>).defaultSessionId ?? "");
+  return sessionId ? appData.sessions.find((session) => session.id === sessionId) ?? null : null;
+}
+
+function telegramSessionChoices(limit = 8) {
+  return appData.sessions
+    .slice()
+    .filter((session) => !(session.conversationType === "agent" && session.roomId))
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .slice(0, limit);
+}
+
+function telegramSessionLabel(session: SessionSummary, index?: number) {
+  const prefix = index === undefined ? "" : `${index + 1}. `;
+  const shortId = session.id.length > 12 ? `${session.id.slice(0, 12)}...` : session.id;
+  return `${prefix}${session.title} (${shortId})`;
+}
+
+function telegramAgentChoices(limit = 8) {
+  const rows = db.prepare("select * from agents where enabled = 1 order by updated_at desc, id desc limit ?").all(limit) as Array<Record<string, unknown>>;
+  return rows.map(agentFromRow);
+}
+
+function telegramAgentLabel(agent: AgentSummary, index?: number) {
+  const prefix = index === undefined ? "" : `${index + 1}. `;
+  const shortId = agent.id.length > 12 ? `${agent.id.slice(0, 12)}...` : agent.id;
+  return `${prefix}${agent.name} (${shortId})`;
+}
+
+function telegramRoomChoices(limit = 8) {
+  const rows = db.prepare("select * from rooms order by updated_at desc, id desc limit ?").all(limit) as Array<Record<string, unknown>>;
+  return rows.map(roomFromRow);
+}
+
+function telegramRoomLabel(room: RoomSummary, index?: number) {
+  const prefix = index === undefined ? "" : `${index + 1}. `;
+  const shortId = room.id.length > 12 ? `${room.id.slice(0, 12)}...` : room.id;
+  return `${prefix}${room.name} (${shortId})`;
+}
+
+function telegramPendingKey(accountId: string, chatId: string) {
+  return `${accountId}:${chatId}`;
+}
+
+function telegramSelectionKey(accountId: string, chatId: string, kind: "agent" | "room") {
+  return `${accountId}:${chatId}:${kind}`;
+}
+
+function createTelegramAgentSession(agent: AgentSummary) {
+  if (!agent.enabled) throw new Error("agent_disabled");
+  const project = resolveAgentProject(agent);
+  const provider = agent.providerId ? appData.providers.find((item) => item.id === agent.providerId) : appData.providers[0];
+  const now = new Date().toISOString();
+  const id = `task-${randomUUID()}`;
+  const session: SessionSummary = {
+    id,
+    kind: project ? "project" : "scratch",
+    conversationType: "agent",
+    roomId: null,
+    directAgentId: agent.id,
+    title: agent.name,
+    projectId: project?.id ?? null,
+    workspacePath: project?.workspacePath ? resolveTerminalCwd(project.workspacePath) : ensureScratchSessionWorkspace(id),
+    providerId: provider?.id ?? null,
+    model: agent.model ?? provider?.defaultModel ?? null,
+    status: "paused",
+    createdAt: now,
+    updatedAt: now,
+  };
+  appData.sessions.unshift(session);
+  upsertSession(session);
+  db.prepare("insert into agent_sessions (session_id, agent_id, created_at) values (?, ?, ?)").run(session.id, agent.id, now);
+  return session;
+}
+
+function telegramRootChoices(chatSession?: SessionSummary | null) {
+  const roots: Array<{ label: string; root: string }> = [];
+  if (chatSession?.workspacePath) roots.push({ label: telegramSessionLabel(chatSession), root: chatSession.workspacePath });
+  if (!chatSession) roots.push({ label: "System workspace", root: workspaceRoot });
+  for (const session of telegramSessionChoices(8)) {
+    if (chatSession?.id === session.id || !session.workspacePath) continue;
+    roots.push({ label: telegramSessionLabel(session), root: session.workspacePath });
+  }
+  const seen = new Set<string>();
+  return roots.filter((item) => {
+    const root = resolve(item.root);
+    if (seen.has(root) || !existsSync(root) || !statSync(root).isDirectory()) return false;
+    seen.add(root);
+    item.root = root;
+    return true;
+  }).slice(0, 9);
+}
+
+function telegramSafeRelativePath(input = "") {
+  return input.split("/").map((part) => part.trim()).filter((part) => part && part !== "." && part !== "..").join("/");
+}
+
+function telegramDangerousCommand(command: string) {
+  return /\b(rm\s+-[^\n]*r|shutdown|reboot|halt|mkfs|dd\s+if=|:\(\)\s*\{)\b/i.test(command);
+}
+
+function setTelegramRouteSession(accountId: string, chatId: string, sessionId: string) {
+  db.prepare(`
+    insert into telegram_chat_routes (account_id, chat_id, session_id, updated_at)
+    values (?, ?, ?, ?)
+    on conflict(account_id, chat_id) do update set session_id = excluded.session_id, updated_at = excluded.updated_at
+  `).run(accountId, chatId, sessionId, new Date().toISOString());
+}
+
+function clearTelegramRouteSession(accountId: string, chatId: string) {
+  db.prepare("delete from telegram_chat_routes where account_id = ? and chat_id = ?").run(accountId, chatId);
+}
+
+async function sendTelegramText(account: NotificationAccountRecord, chatId: string, text: string) {
+  const response = await telegramBotApi(account, "sendMessage", {
+    chat_id: chatId,
+    text: text.slice(0, 3900),
+    disable_web_page_preview: true,
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
+  }
+}
+
+async function sendTelegramSessionPicker(account: NotificationAccountRecord, chatId: string, message: string) {
+  const choices = telegramSessionChoices();
+  if (!choices.length) {
+    await sendTelegramText(account, chatId, "No sessions are available. Create a session first.");
+    return;
+  }
+  telegramPendingSends.set(telegramPendingKey(account.id, chatId), {
+    message,
+    sessionIds: choices.map((session) => session.id),
+    createdAt: Date.now(),
+  });
+  const response = await telegramBotApi(account, "sendMessage", {
+    chat_id: chatId,
+    text: "Select a session to send this message:",
+    reply_markup: {
+      inline_keyboard: [
+        ...choices.map((session, index) => ([{
+        text: telegramSessionLabel(session, index).slice(0, 64),
+        callback_data: `send:${index}`,
+        }])),
+        [{ text: "Cancel", callback_data: "cancel" }],
+      ],
+    },
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
+  }
+}
+
+async function sendTelegramAgents(account: NotificationAccountRecord, chatId: string) {
+  const choices = telegramAgentChoices();
+  if (!choices.length) {
+    await sendTelegramText(account, chatId, "No enabled agents are available.");
+    return;
+  }
+  telegramPendingSelections.set(telegramSelectionKey(account.id, chatId, "agent"), {
+    ids: choices.map((agent) => agent.id),
+    createdAt: Date.now(),
+  });
+  const text = [
+    "Agents:",
+    "",
+    ...choices.map((agent, index) => `${telegramAgentLabel(agent, index)}\n${agent.description ?? "No description"}`),
+    "",
+    "Tap an agent to create and bind a new session.",
+  ].join("\n\n");
+  const response = await telegramBotApi(account, "sendMessage", {
+    chat_id: chatId,
+    text: text.slice(0, 3900),
+    reply_markup: {
+      inline_keyboard: [
+        ...choices.map((agent, index) => ([{
+        text: telegramAgentLabel(agent, index).slice(0, 64),
+        callback_data: `agent:${index}`,
+        }])),
+        [{ text: "Cancel", callback_data: "cancel" }],
+      ],
+    },
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
+  }
+}
+
+async function sendTelegramRooms(account: NotificationAccountRecord, chatId: string) {
+  const choices = telegramRoomChoices();
+  if (!choices.length) {
+    await sendTelegramText(account, chatId, "No rooms are available.");
+    return;
+  }
+  telegramPendingSelections.set(telegramSelectionKey(account.id, chatId, "room"), {
+    ids: choices.map((room) => room.id),
+    createdAt: Date.now(),
+  });
+  const text = [
+    "Rooms:",
+    "",
+    ...choices.map((room, index) => `${telegramRoomLabel(room, index)}\n${room.status}${room.sessionId ? ` · ${room.sessionId}` : ""}`),
+    "",
+    "Tap a room to bind this chat to its session.",
+  ].join("\n\n");
+  const response = await telegramBotApi(account, "sendMessage", {
+    chat_id: chatId,
+    text: text.slice(0, 3900),
+    reply_markup: {
+      inline_keyboard: [
+        ...choices.map((room, index) => ([{
+        text: telegramRoomLabel(room, index).slice(0, 64),
+        callback_data: `room:${index}`,
+        }])),
+        [{ text: "Cancel", callback_data: "cancel" }],
+      ],
+    },
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
+  }
+}
+
+async function sendTelegramFileRootPicker(account: NotificationAccountRecord, chatId: string) {
+  const roots = telegramRootChoices(null);
+  if (!roots.length) {
+    await sendTelegramText(account, chatId, "No file roots are available.");
+    return;
+  }
+  telegramPendingFileRoots.set(telegramPendingKey(account.id, chatId), { roots, createdAt: Date.now() });
+  const response = await telegramBotApi(account, "sendMessage", {
+    chat_id: chatId,
+    text: "Select a file root:",
+    reply_markup: {
+      inline_keyboard: [
+        ...roots.map((root, index) => ([{ text: root.label.slice(0, 64), callback_data: `filectx:${index}` }])),
+        [{ text: "Cancel", callback_data: "cancel" }],
+      ],
+    },
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
+  }
+}
+
+async function sendTelegramFiles(account: NotificationAccountRecord, chatId: string, root: string, relPath = "") {
+  const safeRel = telegramSafeRelativePath(relPath);
+  const target = resolve(root, safeRel);
+  if (!pathWithinRoot(target, root) || !existsSync(target) || !statSync(target).isDirectory()) {
+    await sendTelegramText(account, chatId, "Directory is not available.");
+    return;
+  }
+  const entries = readdirSync(target, { withFileTypes: true })
+    .filter((entry) => !entry.name.startsWith("."))
+    .map((entry) => {
+      const fullPath = join(target, entry.name);
+      const stat = statSync(fullPath);
+      return { name: entry.name, directory: entry.isDirectory(), size: stat.size, updatedAt: stat.mtime.toISOString() };
+    })
+    .sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name))
+    .slice(0, 40);
+  const dirs = entries.filter((entry) => entry.directory).slice(0, 20);
+  telegramPendingFiles.set(telegramPendingKey(account.id, chatId), {
+    root,
+    relPath: safeRel,
+    dirNames: dirs.map((entry) => entry.name),
+    createdAt: Date.now(),
+  });
+  const text = [
+    `Files: /${safeRel}`,
+    "",
+    ...entries.map((entry) => `${entry.directory ? "[dir]" : "[file]"} ${entry.name}${entry.directory ? "" : ` · ${entry.size} bytes`}`),
+  ].join("\n").slice(0, 3900);
+  const keyboard = [
+    ...dirs.map((entry, index) => ([{ text: `[dir] ${entry.name}`.slice(0, 64), callback_data: `file:${index}` }])),
+    ...(safeRel ? [[{ text: "..", callback_data: "fileup" }]] : []),
+    [{ text: "Cancel", callback_data: "cancel" }],
+  ];
+  const response = await telegramBotApi(account, "sendMessage", {
+    chat_id: chatId,
+    text,
+    reply_markup: { inline_keyboard: keyboard },
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
+  }
+}
+
+async function sendTelegramTerminalRootPicker(account: NotificationAccountRecord, chatId: string, command: string) {
+  const roots = telegramRootChoices(null);
+  if (!roots.length) {
+    await sendTelegramText(account, chatId, "No terminal roots are available.");
+    return;
+  }
+  telegramPendingTerminal.set(telegramPendingKey(account.id, chatId), { command, roots, createdAt: Date.now() });
+  const response = await telegramBotApi(account, "sendMessage", {
+    chat_id: chatId,
+    text: `Select where to run:\n${command}`,
+    reply_markup: {
+      inline_keyboard: [
+        ...roots.map((root, index) => ([{ text: root.label.slice(0, 64), callback_data: `term:${index}` }])),
+        [{ text: "Cancel", callback_data: "cancel" }],
+      ],
+    },
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
+  }
+}
+
+async function runTelegramTerminal(account: NotificationAccountRecord, chatId: string, cwd: string, command: string) {
+  if (!command.trim()) {
+    await sendTelegramText(account, chatId, "Usage: /terminal <command>");
+    return;
+  }
+  if (telegramDangerousCommand(command)) {
+    await sendTelegramText(account, chatId, "Command blocked by safety guard.");
+    return;
+  }
+  if (!existsSync(cwd) || !statSync(cwd).isDirectory()) {
+    await sendTelegramText(account, chatId, "Terminal directory is not available.");
+    return;
+  }
+  await sendTelegramText(account, chatId, `Running in ${cwd}:\n${command}`);
+  const shell = resolveShellPath();
+  const output = await new Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }>((resolveRun) => {
+    const child = spawnProcess(shell, ["-lc", command], { cwd, env: process.env });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      resolveRun({ code: null, stdout, stderr, timedOut: true });
+    }, 20_000);
+    child.stdout?.on("data", (chunk) => { stdout += String(chunk).slice(0, 20_000); });
+    child.stderr?.on("data", (chunk) => { stderr += String(chunk).slice(0, 20_000); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolveRun({ code, stdout, stderr, timedOut: false });
+    });
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      resolveRun({ code: null, stdout, stderr: error.message, timedOut: false });
+    });
+  });
+  await sendTelegramText(account, chatId, [
+    output.timedOut ? "Timed out." : `Exit code: ${output.code ?? "unknown"}`,
+    `\nstdout:\n${output.stdout || "(empty)"}`,
+    output.stderr ? `\nstderr:\n${output.stderr}` : "",
+  ].join("\n").slice(0, 3900));
+}
+
+async function answerTelegramCallback(account: NotificationAccountRecord, callbackQueryId: string, text: string) {
+  await telegramBotApi(account, "answerCallbackQuery", {
+    callback_query_id: callbackQueryId,
+    text: text.slice(0, 180),
+  });
+}
+
+async function sendTelegramInputPrompt(account: NotificationAccountRecord, chatId: string, kind: "send" | "terminal") {
+  telegramPendingInputs.set(telegramPendingKey(account.id, chatId), { kind, createdAt: Date.now() });
+  const text = kind === "send"
+    ? "Send the message content in your next reply."
+    : "Send the terminal command in your next reply.";
+  const response = await telegramBotApi(account, "sendMessage", {
+    chat_id: chatId,
+    text,
+    reply_markup: { inline_keyboard: [[{ text: "Cancel", callback_data: "cancel" }]] },
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
+  }
+}
+
+async function routeTelegramSendMessage(account: NotificationAccountRecord, chatId: string, message: string) {
+  const target = telegramRouteSession(account, chatId);
+  if (!target) {
+    await sendTelegramSessionPicker(account, chatId, message);
+    return;
+  }
+  const result = dispatchMessageToSession(target, `Telegram message from chat ${chatId}:\n\n${message}`);
+  await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
+}
+
+function telegramRecentSessionsText() {
+  const rows = telegramSessionChoices(12)
+    .map((session, index) => `${telegramSessionLabel(session, index)}\n${session.status} · ${session.updatedAt}\n${session.id}`);
+  return rows.length ? rows.join("\n\n") : "No sessions yet.";
+}
+
+function resolveTelegramTargetSession(raw: string) {
+  const value = raw.trim();
+  if (!value) return null;
+  const choices = telegramSessionChoices(12);
+  const numericIndex = Number(value);
+  if (Number.isInteger(numericIndex) && numericIndex >= 1 && choices[numericIndex - 1]) return choices[numericIndex - 1];
+  return appData.sessions.find((session) => session.id === value)
+    ?? choices
+      .find((session) => session.title.toLowerCase().includes(value.toLowerCase()))
+    ?? appData.sessions.find((session) => `${session.title} ${session.id}`.toLowerCase().includes(value.toLowerCase()))
+    ?? null;
+}
+
+async function handleTelegramUpdate(account: NotificationAccountRecord, update: TelegramUpdate) {
+  if (!telegramInboundAllowed(account, update)) return;
+  if (update.callback_query) {
+    const chatId = telegramUpdateChatId(update);
+    const data = update.callback_query.data ?? "";
+    if (!chatId) return;
+    if (data === "cancel") {
+      telegramPendingSends.delete(telegramPendingKey(account.id, chatId));
+      telegramPendingSelections.delete(telegramSelectionKey(account.id, chatId, "agent"));
+      telegramPendingSelections.delete(telegramSelectionKey(account.id, chatId, "room"));
+      telegramPendingFileRoots.delete(telegramPendingKey(account.id, chatId));
+      telegramPendingFiles.delete(telegramPendingKey(account.id, chatId));
+      telegramPendingTerminal.delete(telegramPendingKey(account.id, chatId));
+      telegramPendingInputs.delete(telegramPendingKey(account.id, chatId));
+      await answerTelegramCallback(account, update.callback_query.id, "Canceled.");
+      await sendTelegramText(account, chatId, "Canceled.");
+      return;
+    }
+    if (data.startsWith("send:")) {
+      const pendingKey = telegramPendingKey(account.id, chatId);
+      const pending = telegramPendingSends.get(pendingKey);
+      if (!pending || Date.now() - pending.createdAt > 10 * 60 * 1000) {
+        telegramPendingSends.delete(pendingKey);
+        await answerTelegramCallback(account, update.callback_query.id, "This pending message expired.");
+        return;
+      }
+      const index = Number(data.slice("send:".length));
+      const sessionId = Number.isInteger(index) ? pending.sessionIds[index] : "";
+      const target = sessionId ? appData.sessions.find((session) => session.id === sessionId) ?? null : null;
+      if (!target) {
+        await answerTelegramCallback(account, update.callback_query.id, "Session is no longer available.");
+        return;
+      }
+      telegramPendingSends.delete(pendingKey);
+      const result = dispatchMessageToSession(target, `Telegram message from chat ${chatId}:\n\n${pending.message}`);
+      await answerTelegramCallback(account, update.callback_query.id, `Sent to ${target.title}`);
+      await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
+      return;
+    }
+    if (data.startsWith("agent:")) {
+      const selectionKey = telegramSelectionKey(account.id, chatId, "agent");
+      const selection = telegramPendingSelections.get(selectionKey);
+      if (!selection || Date.now() - selection.createdAt > 10 * 60 * 1000) {
+        telegramPendingSelections.delete(selectionKey);
+        await answerTelegramCallback(account, update.callback_query.id, "This agent list expired.");
+        return;
+      }
+      const index = Number(data.slice("agent:".length));
+      const agentId = Number.isInteger(index) ? selection.ids[index] : "";
+      const row = agentId ? db.prepare("select * from agents where id = ?").get(agentId) as Record<string, unknown> | undefined : undefined;
+      if (!row) {
+        await answerTelegramCallback(account, update.callback_query.id, "Agent is no longer available.");
+        return;
+      }
+      const session = createTelegramAgentSession(agentFromRow(row));
+      setTelegramRouteSession(account.id, chatId, session.id);
+      await answerTelegramCallback(account, update.callback_query.id, `Created ${session.title}`);
+      await sendTelegramText(account, chatId, `Created and bound session:\n${telegramSessionLabel(session)}\n${session.id}`);
+      return;
+    }
+    if (data.startsWith("room:")) {
+      const selectionKey = telegramSelectionKey(account.id, chatId, "room");
+      const selection = telegramPendingSelections.get(selectionKey);
+      if (!selection || Date.now() - selection.createdAt > 10 * 60 * 1000) {
+        telegramPendingSelections.delete(selectionKey);
+        await answerTelegramCallback(account, update.callback_query.id, "This room list expired.");
+        return;
+      }
+      const index = Number(data.slice("room:".length));
+      const roomId = Number.isInteger(index) ? selection.ids[index] : "";
+      const row = roomId ? db.prepare("select * from rooms where id = ?").get(roomId) as Record<string, unknown> | undefined : undefined;
+      const room = row ? roomFromRow(row) : null;
+      if (!room?.sessionId) {
+        await answerTelegramCallback(account, update.callback_query.id, "Room session is no longer available.");
+        return;
+      }
+      setTelegramRouteSession(account.id, chatId, room.sessionId);
+      await answerTelegramCallback(account, update.callback_query.id, `Bound ${room.name}`);
+      await sendTelegramText(account, chatId, `Bound room session:\n${telegramRoomLabel(room)}\n${room.sessionId}`);
+      return;
+    }
+    if (data.startsWith("filectx:")) {
+      const rootKey = telegramPendingKey(account.id, chatId);
+      const pending = telegramPendingFileRoots.get(rootKey);
+      if (!pending || Date.now() - pending.createdAt > 10 * 60 * 1000) {
+        telegramPendingFileRoots.delete(rootKey);
+        await answerTelegramCallback(account, update.callback_query.id, "This file list expired.");
+        return;
+      }
+      const index = Number(data.slice("filectx:".length));
+      const root = Number.isInteger(index) ? pending.roots[index]?.root : "";
+      if (!root) {
+        await answerTelegramCallback(account, update.callback_query.id, "File root is no longer available.");
+        return;
+      }
+      telegramPendingFileRoots.delete(rootKey);
+      await answerTelegramCallback(account, update.callback_query.id, "Opened.");
+      await sendTelegramFiles(account, chatId, root);
+      return;
+    }
+    if (data.startsWith("file:") || data === "fileup") {
+      const pendingKey = telegramPendingKey(account.id, chatId);
+      const pending = telegramPendingFiles.get(pendingKey);
+      if (!pending || Date.now() - pending.createdAt > 10 * 60 * 1000) {
+        telegramPendingFiles.delete(pendingKey);
+        await answerTelegramCallback(account, update.callback_query.id, "This file list expired.");
+        return;
+      }
+      const nextRel = data === "fileup"
+        ? dirname(pending.relPath) === "." ? "" : dirname(pending.relPath)
+        : join(pending.relPath, pending.dirNames[Number(data.slice("file:".length))] ?? "");
+      await answerTelegramCallback(account, update.callback_query.id, "Opened.");
+      await sendTelegramFiles(account, chatId, pending.root, nextRel);
+      return;
+    }
+    if (data.startsWith("term:")) {
+      const terminalKey = telegramPendingKey(account.id, chatId);
+      const pending = telegramPendingTerminal.get(terminalKey);
+      if (!pending || Date.now() - pending.createdAt > 10 * 60 * 1000) {
+        telegramPendingTerminal.delete(terminalKey);
+        await answerTelegramCallback(account, update.callback_query.id, "This terminal command expired.");
+        return;
+      }
+      const index = Number(data.slice("term:".length));
+      const root = Number.isInteger(index) ? pending.roots[index]?.root : "";
+      if (!root) {
+        await answerTelegramCallback(account, update.callback_query.id, "Terminal root is no longer available.");
+        return;
+      }
+      telegramPendingTerminal.delete(terminalKey);
+      await answerTelegramCallback(account, update.callback_query.id, "Running.");
+      await runTelegramTerminal(account, chatId, root, pending.command);
+      return;
+    }
+  }
+  const text = update.message?.text?.trim() ?? "";
+  const chatId = String(update.message?.chat?.id ?? "");
+  if (!text || !chatId) return;
+  const pendingInputKey = telegramPendingKey(account.id, chatId);
+  const pendingInput = telegramPendingInputs.get(pendingInputKey);
+  if (pendingInput) {
+    if (text === "/cancel" || Date.now() - pendingInput.createdAt > 10 * 60 * 1000) {
+      telegramPendingInputs.delete(pendingInputKey);
+      await sendTelegramText(account, chatId, text === "/cancel" ? "Canceled." : "Pending input expired.");
+      return;
+    }
+    telegramPendingInputs.delete(pendingInputKey);
+    if (pendingInput.kind === "send") {
+      await routeTelegramSendMessage(account, chatId, text);
+    } else {
+      const target = telegramRouteSession(account, chatId);
+      if (target?.workspacePath) {
+        await runTelegramTerminal(account, chatId, target.workspacePath, text);
+      } else {
+        await sendTelegramTerminalRootPicker(account, chatId, text);
+      }
+    }
+    return;
+  }
+  const [rawCommand, ...restParts] = text.split(/\s+/);
+  const command = rawCommand.replace(/@[^@\s]+$/, "");
+  const rest = restParts.join(" ").trim();
+  if (command === "/start" || command === "/help") {
+    await sendTelegramText(account, chatId, [
+      "Codex Web Telegram Bot",
+      "",
+      "/sessions - list recent sessions",
+      "/agents - list agents and create a bound agent session",
+      "/rooms - list rooms and bind a room session",
+      "/files - browse bound or system files",
+      "/terminal <command> - run in bound or selected workspace",
+      "/bind <index, title, or sessionId> - bind this chat to a session",
+      "/unbind - clear the bound session",
+      "/send <index, title, or sessionId> | <message> - send to a session",
+      "/send <message> - choose a session when no session is bound",
+      "Plain text is sent to the bound/default session, or asks you to choose one.",
+    ].join("\n"));
+    return;
+  }
+  if (command === "/sessions") {
+    await sendTelegramText(account, chatId, telegramRecentSessionsText());
+    return;
+  }
+  if (command === "/agents") {
+    await sendTelegramAgents(account, chatId);
+    return;
+  }
+  if (command === "/rooms") {
+    await sendTelegramRooms(account, chatId);
+    return;
+  }
+  if (command === "/files") {
+    const target = telegramRouteSession(account, chatId);
+    if (target?.workspacePath) {
+      await sendTelegramFiles(account, chatId, target.workspacePath, rest);
+    } else {
+      await sendTelegramFileRootPicker(account, chatId);
+    }
+    return;
+  }
+  if (command === "/terminal") {
+    if (!rest) {
+      await sendTelegramInputPrompt(account, chatId, "terminal");
+      return;
+    }
+    const target = telegramRouteSession(account, chatId);
+    if (target?.workspacePath) {
+      await runTelegramTerminal(account, chatId, target.workspacePath, rest);
+    } else {
+      await sendTelegramTerminalRootPicker(account, chatId, rest);
+    }
+    return;
+  }
+  if (command === "/bind") {
+    const target = resolveTelegramTargetSession(rest);
+    if (!target) {
+      await sendTelegramText(account, chatId, "Session not found. Use /sessions to view recent sessions.");
+      return;
+    }
+    setTelegramRouteSession(account.id, chatId, target.id);
+    await sendTelegramText(account, chatId, `Bound to: ${target.title}\n${target.id}`);
+    return;
+  }
+  if (command === "/unbind") {
+    clearTelegramRouteSession(account.id, chatId);
+    await sendTelegramText(account, chatId, "Bound session cleared.");
+    return;
+  }
+  if (command === "/send") {
+    if (!rest) {
+      await sendTelegramInputPrompt(account, chatId, "send");
+      return;
+    }
+    const separator = rest.indexOf("|");
+    const targetText = separator >= 0 ? rest.slice(0, separator).trim() : "";
+    const message = separator >= 0 ? rest.slice(separator + 1).trim() : rest;
+    if (!message) {
+      await sendTelegramText(account, chatId, "Message is empty. Use /send <sessionId or title> | <message>.");
+      return;
+    }
+    const target = targetText ? resolveTelegramTargetSession(targetText) : telegramRouteSession(account, chatId);
+    if (!target) {
+      if (targetText) {
+        await sendTelegramText(account, chatId, "Session not found. Use /sessions to view recent sessions.");
+      } else {
+        await sendTelegramSessionPicker(account, chatId, message);
+      }
+      return;
+    }
+    const result = dispatchMessageToSession(target, `Telegram message from chat ${chatId}:\n\n${message}`);
+    await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
+    return;
+  }
+  const target = telegramRouteSession(account, chatId);
+  if (!target) {
+    await sendTelegramSessionPicker(account, chatId, text);
+    return;
+  }
+  const result = dispatchMessageToSession(target, `Telegram message from chat ${chatId}:\n\n${text}`);
+  await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
+}
+
+async function pollTelegramAccount(account: NotificationAccountRecord) {
+  if (telegramPollingBusy.has(account.id)) return;
+  telegramPollingBusy.add(account.id);
+  try {
+    const offset = telegramPollingOffsets.get(account.id) ?? 0;
+    const response = await telegramBotApi(account, "getUpdates", {
+      offset: offset ? offset + 1 : undefined,
+      timeout: 0,
+      limit: 20,
+      allowed_updates: ["message", "callback_query"],
+    });
+    const body = await response.json().catch(() => null) as { ok?: boolean; result?: TelegramUpdate[] } | null;
+    if (!response.ok || !body?.ok || !Array.isArray(body.result)) return;
+    for (const update of body.result) {
+      telegramPollingOffsets.set(account.id, Math.max(telegramPollingOffsets.get(account.id) ?? 0, update.update_id));
+      await handleTelegramUpdate(account, update).catch((error) => {
+        console.error("telegram inbound update failed", account.id, error);
+      });
+    }
+  } catch (error) {
+    console.warn("telegram inbound poll failed", account.id, error instanceof Error ? error.message : error);
+  } finally {
+    telegramPollingBusy.delete(account.id);
+  }
+}
+
+function pollTelegramInboundBots() {
+  try {
+    const accounts = listNotificationAccounts(true)
+      .filter((account) => account.enabled && account.channelKind === "telegram" && (account.config as Record<string, unknown>).inboundEnabled === true);
+    for (const account of accounts) void pollTelegramAccount(account);
+  } catch (error) {
+    console.warn("telegram inbound poll scheduler failed", error instanceof Error ? error.message : error);
+  }
+}
+
+function ingestCrossSessionSkillBlocks(session: SessionSummary, message: SessionMessage, text: string) {
+  for (const request of parseCrossSessionSkillBlocks(text)) {
+    const action = String(request.action ?? request.type ?? "").trim() || "readSession";
+    if (action === "listSessions") {
+      const sessions = appData.sessions
+        .filter((item) => item.id !== session.id)
+        .slice()
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+        .slice(0, 30)
+        .map((item) => ({
+          id: item.id,
+          title: item.title,
+          status: item.status,
+          type: item.conversationType ?? "codex",
+          projectId: item.projectId ?? null,
+          updatedAt: item.updatedAt,
+        }));
+      appendMessageCard(session.id, "service", "Cross-session sessions listed", { action, sessions, messageId: message.id }, message.id);
+      enqueueCrossSessionFollowup(session, [
+        "# Cross-Session Sessions",
+        ...sessions.map((item) => `- ${item.title} (${item.id}) status=${item.status} type=${item.type} updated=${item.updatedAt}`),
+      ].join("\n"));
+      continue;
+    }
+    const target = resolveCrossSessionTarget(session, request);
+    if (!target) {
+      appendMessageCard(session.id, "service", "Cross-session target not found", { action, request, messageId: message.id }, message.id);
+      continue;
+    }
+    if (action === "readSession" || action === "readProgress" || action === "getProgress") {
+      const result = crossSessionProgressMarkdown(target);
+      appendMessageCard(session.id, "service", `Cross-session read: ${target.title}`, { action, targetSessionId: target.id, result, messageId: message.id }, message.id);
+      appendSessionMessage(session.id, "system", `Cross-session read result for ${target.title} (${target.id}):\n\n${result}`);
+      enqueueCrossSessionFollowup(session, result);
+      continue;
+    }
+    if (action === "sendMessage" || action === "messageSession") {
+      const outgoing = typeof request.message === "string" ? request.message : typeof request.content === "string" ? request.content : "";
+      try {
+        const result = sendCrossSessionMessage(session, target, outgoing);
+        appendMessageCard(session.id, "service", `Cross-session message sent: ${target.title}`, { action, targetSessionId: target.id, result, message: outgoing.slice(0, 2000), messageId: message.id }, message.id);
+      } catch (error) {
+        appendMessageCard(session.id, "service", "Cross-session message failed", { action, targetSessionId: target.id, error: error instanceof Error ? error.message : String(error), messageId: message.id }, message.id);
+      }
+    }
+  }
+}
+
+function notificationScopeFromSkill(session: SessionSummary, input: Record<string, unknown>): { scopeType: "session" | "task" | "room_task"; scopeId: string } | null {
+  const scopeType = String(input.scopeType ?? input.scope ?? "session").trim();
+  const explicitScopeId = typeof input.scopeId === "string" && input.scopeId.trim() ? input.scopeId.trim() : "";
+  if (scopeType === "session" || scopeType === "current_session") {
+    if (explicitScopeId && explicitScopeId !== session.id) return null;
+    return { scopeType: "session", scopeId: session.id };
+  }
+  if (scopeType === "task" || scopeType === "current_task") {
+    const taskRun = latestRunningTaskRun(session.id);
+    if (!taskRun?.id) return { scopeType: "session", scopeId: session.id };
+    const taskRunId = String(taskRun.id);
+    if (explicitScopeId && explicitScopeId !== taskRunId) return null;
+    return { scopeType: "task", scopeId: taskRunId };
+  }
+  if (scopeType === "room_task" || scopeType === "current_room_task") {
+    const run = db.prepare("select * from agent_runs where session_id = ? order by started_at desc, id desc limit 1").get(session.id) as Record<string, unknown> | undefined;
+    const roomTaskId = run?.task_id ? String(run.task_id) : "";
+    if (!roomTaskId) return { scopeType: "session", scopeId: session.id };
+    if (explicitScopeId && explicitScopeId !== roomTaskId) return null;
+    return { scopeType: "room_task", scopeId: roomTaskId };
+  }
+  return null;
+}
+
+function ingestNotificationSkillBlocks(session: SessionSummary, message: SessionMessage, text: string) {
+  const permissionContext = notificationPermissionContext(session);
+  for (const request of parseNotificationSkillBlocks(text)) {
+    const action = String(request.action ?? request.type ?? "").trim();
+    if (action && action !== "createOneTimeRule") continue;
+    const recipientIds = resolveNotificationRecipientIds(request, permissionContext);
+    if (!recipientIds.length) continue;
+    const requestedSenderAccountId = typeof request.senderAccountId === "string" && request.senderAccountId.trim() ? request.senderAccountId.trim() : undefined;
+    const senderAccount = requestedSenderAccountId ? listNotificationAccounts().find((account) => account.id === requestedSenderAccountId && account.enabled) : null;
+    if (requestedSenderAccountId && (!senderAccount || !notificationPermissionAllows(senderAccount.permissions, permissionContext))) continue;
+    const senderAccountId = requestedSenderAccountId;
+    const targets = recipientIds.map((recipientId) => ({ recipientId, senderAccountId }));
+    const eventTypes = notificationEventTypesFromSkill(request.eventTypes);
+    const expireMode = notificationExpireModeFromSkill(request.expireMode);
+    const scope = notificationScopeFromSkill(session, request);
+    if (!scope) continue;
+    const existing = db.prepare(`
+      select id from notification_ephemeral_rules
+      where scope_type = ? and scope_id = ? and event_types = ? and targets = ? and enabled = 1
+      limit 1
+    `).get(scope.scopeType, scope.scopeId, JSON.stringify(eventTypes), JSON.stringify(sanitizeNotificationTargets(targets))) as Record<string, unknown> | undefined;
+    if (existing) continue;
+    const rule = createNotificationEphemeralRule({
+      scopeType: scope.scopeType,
+      scopeId: scope.scopeId,
+      eventTypes,
+      targets,
+      expireMode,
+    });
+    if (!rule) continue;
+    appendMessageCard(session.id, "service", "Notification rule created", {
+      notificationEphemeralRuleId: rule.id,
+      messageId: message.id,
+      scope,
+      eventTypes,
+      recipientIds,
+      reason: typeof request.reason === "string" ? request.reason.slice(0, 500) : "",
+    }, message.id);
+  }
 }
 
 function ingestRoomUpdateBlocks(session: SessionSummary, message: SessionMessage, text: string, sourceAgentId?: string | null) {
@@ -7107,6 +9872,8 @@ function ingestRoomUpdateBlocks(session: SessionSummary, message: SessionMessage
 }
 
 function ingestAssistantArtifacts(session: SessionSummary, message: SessionMessage, text: string) {
+  ingestNotificationSkillBlocks(session, message, text);
+  ingestCrossSessionSkillBlocks(session, message, text);
   if (!session.roomId) return;
   const run = db.prepare("select * from agent_runs where session_id = ? order by started_at desc limit 1").get(session.id) as Record<string, unknown> | undefined;
   const sourceAgentId = run?.agent_id ? String(run.agent_id) : null;
@@ -7127,28 +9894,7 @@ function ingestAssistantArtifacts(session: SessionSummary, message: SessionMessa
 
 function handleCodexStdout(session: SessionSummary, value: string) {
   appendCodexOutput(session.id, value);
-  discoverPreviewUrls(session, value);
-  publishTaskEvent(session.id, { type: "output", bytes: Buffer.byteLength(value), at: new Date().toISOString() });
-  const nextBuffer = (codexTaskStdoutBuffers.get(session.id) ?? "") + value;
-  const lines = nextBuffer.split(/\r?\n/);
-  codexTaskStdoutBuffers.set(session.id, lines.pop() ?? "");
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    rememberCodexSessionId(session, line);
-    const activity = readActivityEvent(line);
-    if (activity && activity.type === "activity") {
-      publishTaskEvent(session.id, activity);
-      if ((activity.kind === "file" || activity.kind === "command") && (activity.status === "completed" || activity.status === "failed")) {
-        publishTaskEvent(session.id, { type: "workspace", session, reason: "activity", at: new Date().toISOString() });
-      }
-    }
-    const assistantText = readAssistantText(line);
-    if (assistantText) {
-      const message = appendSessionMessage(session.id, "assistant", assistantText);
-      ingestAssistantArtifacts(session, message, assistantText);
-      publishTaskEvent(session.id, { type: "message", message, session });
-    }
-  }
+  processCodexLogChunk(session, value);
 }
 
 function readCodexOutput(sessionId: string) {
@@ -7158,6 +9904,123 @@ function readCodexOutput(sessionId: string) {
     output: readTaskLogContent(sessionId).slice(-256 * 1024),
     exitCode: readTaskExitCode(sessionId),
   };
+}
+
+function tailCodexTaskLog(session: SessionSummary) {
+  const path = taskLogPath(session.id);
+  if (!existsSync(path)) return;
+  const size = statSync(path).size;
+  const offset = codexTaskLogOffsets.get(session.id) ?? 0;
+  const start = size < offset ? 0 : Math.min(offset, size);
+  if (size <= start) {
+    codexTaskLogOffsets.set(session.id, size);
+    return;
+  }
+  const chunk = readFileSync(path, "utf8").slice(start);
+  codexTaskLogOffsets.set(session.id, size);
+  if (chunk) processCodexLogChunk(session, chunk);
+}
+
+function flushCodexTaskLog(session: SessionSummary) {
+  tailCodexTaskLog(session);
+  if ((codexTaskStdoutBuffers.get(session.id) ?? "").trim()) processCodexLogChunk(session, "\n");
+}
+
+function stopCodexTaskTailer(sessionId: string) {
+  const timer = codexTaskTailers.get(sessionId);
+  if (timer) clearInterval(timer);
+  codexTaskTailers.delete(sessionId);
+  codexTaskLogOffsets.delete(sessionId);
+}
+
+function clearCodexTaskRuntime(sessionId: string, kill = false) {
+  const child = codexTaskProcesses.get(sessionId);
+  if (kill) child?.kill("SIGTERM");
+  codexTaskProcesses.delete(sessionId);
+  codexTaskOutputs.delete(sessionId);
+  codexTaskStopRequested.delete(sessionId);
+  codexTaskStdoutBuffers.delete(sessionId);
+  stopCodexTaskTailer(sessionId);
+}
+
+function finalizeCodexRunnerTask(session: SessionSummary, exitCode: number | null, reason?: string) {
+  if (finalizedRecoveredTasks.has(session.id)) return;
+  finalizedRecoveredTasks.add(session.id);
+  const running = latestRunningTaskRun(session.id);
+  const agentRun = db.prepare("select * from agent_runs where session_id = ? order by started_at desc, id desc limit 1").get(session.id) as Record<string, unknown> | undefined;
+  const wasStopped = codexTaskStopRequested.has(session.id) || Boolean((running as { stop_requested?: unknown } | undefined)?.stop_requested);
+  flushCodexTaskLog(session);
+  backfillSessionFromTaskLog(session);
+  codexTaskProcesses.delete(session.id);
+  codexTaskStdoutBuffers.delete(session.id);
+  stopCodexTaskTailer(session.id);
+  const output = codexTaskOutputs.get(session.id);
+  if (output) output.exitCode = exitCode;
+  session.status = exitCode === 0 && !wasStopped ? "done" : "paused";
+  finishTaskRun(session.id, wasStopped ? "stopped" : exitCode === 0 ? "done" : "failed", exitCode, reason ?? (wasStopped ? "user_stopped" : undefined));
+  if (exitCode !== 0 && !wasStopped) {
+    const summary = readTaskErrorSummary(session.id);
+    const content = [`任务运行失败，Codex 退出码为 ${exitCode ?? "null"}。`, summary].filter(Boolean).join("\n\n");
+    appendSessionMessage(session.id, "assistant", content);
+    publishTaskEvent(session.id, { type: "message", message: allSessionMessages(session.id).at(-1)!, session });
+  }
+  finishAutomationRun(session.id, exitCode, wasStopped);
+  finishAgentRun(session.id, exitCode, wasStopped);
+  codexTaskStopRequested.delete(session.id);
+  session.updatedAt = new Date().toISOString();
+  writeTaskExitCode(session.id, exitCode);
+  saveAppData();
+  publishTaskEvent(session.id, { type: "workspace", session, reason: "done", at: new Date().toISOString() });
+  publishTaskEvent(session.id, { type: "done", session, exitCode });
+  const notificationScopes = [
+    { scopeType: "session", scopeId: session.id },
+    running?.id ? { scopeType: "task", scopeId: String(running.id) } : null,
+    agentRun?.task_id ? { scopeType: "room_task", scopeId: String(agentRun.task_id) } : null,
+  ].filter((scope): scope is { scopeType: "session" | "task" | "room_task"; scopeId: string } => Boolean(scope));
+  const latestAssistant = allSessionMessages(session.id).filter((message) => message.role === "assistant").at(-1)?.content ?? "";
+  const isRoomTaskNotification = Boolean(agentRun?.room_id && agentRun?.task_id);
+  const shouldEmitTaskNotification = !isRoomTaskNotification || roomTaskShouldNotifyUser(String(agentRun?.room_id ?? ""), String(agentRun?.task_id ?? ""), latestAssistant);
+  if (shouldEmitTaskNotification) {
+    emitExternalNotification({
+      eventType: wasStopped ? "task_interrupted" : exitCode === 0 ? "task_completed" : "task_failed",
+      severity: wasStopped ? "warning" : exitCode === 0 ? "success" : "error",
+      title: exitCode === 0 && !wasStopped ? `任务完成：${session.title}` : `任务异常：${session.title}`,
+      message: wasStopped ? "任务已被停止。" : `Codex 退出码：${exitCode ?? "null"}`,
+      sourceType: "session",
+      sourceId: session.id,
+      metadata: {
+        exitCode,
+        status: session.status,
+        workspacePath: session.workspacePath,
+        taskRunId: running?.id ? String(running.id) : null,
+        roomId: agentRun?.room_id ? String(agentRun.room_id) : session.roomId ?? null,
+        agentId: agentRun?.agent_id ? String(agentRun.agent_id) : null,
+        roomTaskId: agentRun?.task_id ? String(agentRun.task_id) : null,
+        notificationScopes,
+      },
+    });
+  }
+  scheduleSessionAutoCompaction(session, "task-finished");
+  if (exitCode === 0 && !wasStopped) runQueuedMessageIfIdle(session);
+}
+
+function startCodexTaskTailer(session: SessionSummary, options: { finalizeOnExit: boolean }) {
+  stopCodexTaskTailer(session.id);
+  const existingSize = existsSync(taskLogPath(session.id)) ? statSync(taskLogPath(session.id)).size : 0;
+  codexTaskLogOffsets.set(session.id, existingSize);
+  const timer = setInterval(() => {
+    tailCodexTaskLog(session);
+    if (!options.finalizeOnExit) return;
+    const meta = readTaskMeta(session.id);
+    if (meta && meta.running === false && (typeof meta.exitCode === "number" || meta.exitCode === null || meta.error)) {
+      finalizeCodexRunnerTask(session, typeof meta.exitCode === "number" ? meta.exitCode : null, meta.error ?? undefined);
+      return;
+    }
+    const running = latestRunningTaskRun(session.id);
+    const pid = typeof running?.pid === "number" ? running.pid : null;
+    if (pid && !isProcessAlive(pid)) finalizeCodexRunnerTask(session, null, "runner_process_missing");
+  }, 800);
+  codexTaskTailers.set(session.id, timer);
 }
 
 function readTaskErrorSummary(sessionId: string) {
@@ -7345,7 +10208,8 @@ function tomlString(value: string) {
 function codexProviderConfigArgs(provider?: ProviderRecord) {
   if (!provider?.baseUrl) return [];
   const providerKey = "codexweb";
-  const baseUrl = provider.kind === "openai-compatible-chat" ? joinUrl(localApiBaseUrl, `/provider-proxy/${encodeURIComponent(provider.id)}/${providerProxyToken(provider)}/v1`) : provider.baseUrl;
+  const usesLocalProxy = provider.kind === "openai-compatible-chat" || (provider.kind === "openai-responses" && provider.useProxy);
+  const baseUrl = usesLocalProxy ? joinUrl(localApiBaseUrl, `/provider-proxy/${encodeURIComponent(provider.id)}/${providerProxyToken(provider)}/v1`) : provider.baseUrl;
   const args = [
     "-c", `model_provider=${tomlString(providerKey)}`,
     "-c", `model_providers.${providerKey}.name=${tomlString(provider.name || "Codex Web Provider")}`,
@@ -7353,7 +10217,7 @@ function codexProviderConfigArgs(provider?: ProviderRecord) {
     "-c", `model_providers.${providerKey}.requires_openai_auth=true`,
     "-c", `model_providers.${providerKey}.wire_api=${tomlString("responses")}`,
   ];
-  if (provider.apiKey && provider.kind !== "openai-compatible-chat") {
+  if (provider.apiKey && !usesLocalProxy) {
     args.push("-c", `model_providers.${providerKey}.experimental_bearer_token=${tomlString(provider.apiKey)}`);
   }
   return args;
@@ -7388,6 +10252,8 @@ function startCodexTask(
   const resolvedPermissions = contextInput?.resolvedPermissions ?? (directAgent ? resolvedAgentPermissions(directAgent) : defaultAgentPermissions);
   const effectiveRuntime = effectiveCodexRuntimeForPermissions(resolvedPermissions);
   const effectiveExtraWritableDirs = resolvedPermissions.canWriteFiles && resolvedPermissions.canWriteSharedWorkspace ? extraWritableDirs : [];
+  const sourceMessage = contextInput?.currentMessageId ? getSessionMessage(session.id, contextInput.currentMessageId) : null;
+  registerEphemeralNotificationsFromPrompt(session, sourceMessage?.content ?? prompt);
   const boundedPrompt = [permissionBoundaryPrompt(resolvedPermissions), prompt].filter(Boolean).join("\n\n");
   const managedPrompt = promptWithManagedContext(session, boundedPrompt, cwd, contextInput);
   const managedPromptHash = codexPromptHash(managedPrompt);
@@ -7410,6 +10276,7 @@ function startCodexTask(
   if (resetOutput) codexTaskOutputs.set(session.id, { output: "", exitCode: null });
   else if (!codexTaskOutputs.has(session.id)) codexTaskOutputs.set(session.id, readCodexOutput(session.id));
   codexTaskStdoutBuffers.set(session.id, "");
+  finalizedRecoveredTasks.delete(session.id);
   if (resetOutput) {
     mkdirSync(sessionLogsPath(session.id), { recursive: true });
     writeFileSync(taskLogPath(session.id), "", "utf8");
@@ -7431,9 +10298,6 @@ function startCodexTask(
   const env = { ...process.env };
   if (provider?.apiKey) env.OPENAI_API_KEY = provider.apiKey;
   if (provider?.baseUrl && provider.kind !== "openai-compatible-chat") env.OPENAI_BASE_URL = provider.baseUrl;
-  const child = spawnProcess("codex", args, { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
-  codexTaskProcesses.set(session.id, child);
-  createTaskRun(session.id, child.pid, { promptChars: managedPrompt.length, promptHash: managedPromptHash, contextPath: contextPackPath });
   appendCodexErrorOutput(session, [
     "[codex-web]",
     `mode=${useResume ? "resume" : "exec"}`,
@@ -7448,10 +10312,25 @@ function startCodexTask(
     (contextInput?.roomId ?? session.roomId) ? `room=${contextInput?.roomId ?? session.roomId}` : "",
   ].filter(Boolean).join(" ") + "\n");
   appendCodexErrorOutput(session, `$ codex ${redactCodexArgs(args, managedPrompt).map((arg) => JSON.stringify(arg)).join(" ")}\n`);
+  const runner = fork(codexRunnerPath, [], {
+    cwd,
+    env,
+    detached: true,
+    stdio: ["ignore", "ignore", "ignore", "ipc"],
+  });
+  codexTaskProcesses.set(session.id, runner);
+  createTaskRun(session.id, runner.pid, { promptChars: managedPrompt.length, promptHash: managedPromptHash, contextPath: contextPackPath });
+  startCodexTaskTailer(session, { finalizeOnExit: true });
   publishTaskEvent(session.id, { type: "started", session });
-  child.stdout?.on("data", (chunk: Buffer) => handleCodexStdout(session, chunk.toString("utf8")));
-  child.stderr?.on("data", (chunk: Buffer) => appendCodexErrorOutput(session, chunk.toString("utf8")));
-  child.on("error", (error) => {
+  runner.send({
+    command: "codex",
+    args,
+    cwd,
+    logPath: taskLogPath(session.id),
+    metaPath: taskMetaPath(session.id),
+  });
+  runner.unref();
+  runner.on("error", (error) => {
     appendCodexErrorOutput(session, `\n[task spawn error] ${error.message}\n`);
     session.status = "paused";
     session.updatedAt = new Date().toISOString();
@@ -7459,32 +10338,6 @@ function startCodexTask(
     finishTaskRun(session.id, "failed", null, error.message);
     saveAppData();
     publishTaskEvent(session.id, { type: "error", session, error: error.message });
-  });
-  child.on("close", (exitCode) => {
-    codexTaskProcesses.delete(session.id);
-    codexTaskStdoutBuffers.delete(session.id);
-    const output = codexTaskOutputs.get(session.id);
-    if (output) output.exitCode = exitCode;
-    const wasStopped = codexTaskStopRequested.has(session.id);
-    session.status = exitCode === 0 && !wasStopped ? "done" : "paused";
-    finishTaskRun(session.id, wasStopped ? "stopped" : exitCode === 0 ? "done" : "failed", exitCode, wasStopped ? "user_stopped" : undefined);
-    if (exitCode !== 0 && !wasStopped) {
-      const summary = readTaskErrorSummary(session.id);
-      const content = [`任务运行失败，Codex 退出码为 ${exitCode ?? "null"}。`, summary].filter(Boolean).join("\n\n");
-      appendSessionMessage(session.id, "assistant", content);
-      publishTaskEvent(session.id, { type: "message", message: allSessionMessages(session.id).at(-1)!, session });
-    }
-    finishAutomationRun(session.id, exitCode, wasStopped);
-    finishAgentRun(session.id, exitCode, wasStopped);
-    codexTaskStopRequested.delete(session.id);
-    session.updatedAt = new Date().toISOString();
-    writeTaskExitCode(session.id, exitCode);
-    saveAppData();
-    publishTaskEvent(session.id, { type: "workspace", session, reason: "done", at: new Date().toISOString() });
-    publishTaskEvent(session.id, { type: "done", session, exitCode });
-    if (exitCode === 0 && !wasStopped) {
-      runQueuedMessageIfIdle(session);
-    }
   });
 }
 
@@ -8010,7 +10863,7 @@ app.get("/api/auth/state", (c) => {
 app.post("/provider-proxy/:providerId/:proxyToken/v1/responses", async (c) => {
   const provider = appData.providers.find((item) => item.id === c.req.param("providerId"));
   if (!provider) return c.json({ error: "provider_not_found" }, 404);
-  if (provider.kind !== "openai-compatible-chat") return c.json({ error: "provider_proxy_requires_chat_provider" }, 400);
+  if (provider.kind !== "openai-compatible-chat" && !(provider.kind === "openai-responses" && provider.useProxy)) return c.json({ error: "provider_proxy_not_enabled" }, 400);
   if (!verifyProviderProxyToken(provider, c.req.param("proxyToken"))) return c.json({ error: "unauthorized" }, 401);
   const concurrent = getProviderProxyConcurrency(provider.id);
   if (rateLimitSettings.enabled && concurrent >= rateLimitSettings.providerProxyMaxConcurrent) return c.json({ error: "provider_proxy_busy", retryAfter: 5 }, 429, { "retry-after": "5" });
@@ -8018,7 +10871,9 @@ app.post("/provider-proxy/:providerId/:proxyToken/v1/responses", async (c) => {
   if (!body) return c.json({ error: "invalid_responses_request" }, 400);
   incrementProviderProxyConcurrency(provider.id);
   try {
-    return proxyResponsesToChatCompletions(provider, body);
+    return provider.kind === "openai-compatible-chat"
+      ? proxyResponsesToChatCompletions(provider, body)
+      : proxyResponsesToResponses(provider, body);
   } catch (error) {
     return c.json({ error: error instanceof Error ? error.message : "provider_proxy_failed" }, 502);
   } finally {
@@ -8046,6 +10901,15 @@ app.post("/api/auth/setup/complete", async (c) => {
   authConfig = { accessTokenHash: hashToken(body.accessToken), otpSecret: pendingOtpSecret };
   saveAuthConfig(authConfig);
   const response: LoginResponse = { ok: true, sessionToken: signSessionToken(), auth: authenticatedAuthState() };
+  emitExternalNotification({
+    eventType: "auth_login",
+    severity: "success",
+    title: "Codex Web 登录成功",
+    message: "本地管理员完成首次设置并登录。",
+    sourceType: "auth",
+    sourceId: "local-admin",
+    metadata: { action: "setup_complete", userAgent: c.req.header("user-agent") ?? null, ip: c.req.header("x-forwarded-for") ?? null },
+  });
   return c.json(response);
 });
 app.post("/api/auth/login", async (c) => {
@@ -8059,6 +10923,15 @@ app.post("/api/auth/login", async (c) => {
     return c.json(response, 401);
   }
   const response: LoginResponse = { ok: true, sessionToken: signSessionToken(), auth: authenticatedAuthState() };
+  emitExternalNotification({
+    eventType: "auth_login",
+    severity: "success",
+    title: "Codex Web 登录成功",
+    message: "本地管理员已登录。",
+    sourceType: "auth",
+    sourceId: "local-admin",
+    metadata: { action: "login", userAgent: c.req.header("user-agent") ?? null, ip: c.req.header("x-forwarded-for") ?? null },
+  });
   return c.json(response);
 });
 
@@ -8190,6 +11063,46 @@ app.get("/api/rooms/:id/events/stream", (c) => {
   });
 });
 
+app.get("/api/app-notifications/events", (c) => {
+  const token = c.req.query("token") ?? getBearerToken(c.req.header("authorization"));
+  if (!verifySessionToken(token)) return c.text("unauthorized", 401);
+  const stream = new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder();
+      const send = (event: AppNotificationStreamEvent) => {
+        controller.enqueue(encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
+      };
+      controller.enqueue(encoder.encode("retry: 5000\n\n"));
+      send({ type: "snapshot", ...listAppNotifications(30) });
+      const unsubscribe = subscribeAppNotifications(send);
+      const heartbeat = setInterval(() => {
+        try {
+          controller.enqueue(encoder.encode("event: ping\ndata: {}\n\n"));
+        } catch {
+          clearInterval(heartbeat);
+          unsubscribe();
+        }
+      }, 15_000);
+      c.req.raw.signal.addEventListener("abort", () => {
+        clearInterval(heartbeat);
+        unsubscribe();
+        try {
+          controller.close();
+        } catch {
+          return;
+        }
+      });
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+    },
+  });
+});
+
 app.use("/api/*", requireAuth);
 
 app.post("/api/auth/access-token", async (c) => {
@@ -8235,6 +11148,24 @@ app.post("/api/settings/maintenance/cleanup", async (c) => {
   return c.json(cleanupDatabaseRedundancy(body ?? {}));
 });
 
+app.get("/api/settings/task-health", (c) => {
+  const health = listTaskHealth();
+  if (!health.ok) {
+    emitExternalNotification({
+      eventType: "task_health_issue",
+      severity: "error",
+      title: "任务健康检查发现异常",
+      message: health.items.filter((item) => item.issue).map((item) => `${item.title}: ${item.issue}`).join("\n") || "运行任务状态异常。",
+      sourceType: "task-health",
+      sourceId: health.checkedAt,
+      metadata: { items: health.items.filter((item) => item.issue) },
+    });
+  }
+  return c.json(health);
+});
+
+app.post("/api/settings/task-health/repair", (c) => c.json(repairTaskHealth()));
+
 app.post("/api/settings/approvals/reset", (c) => {
   const result = db.prepare("delete from approval_grants").run();
   return c.json({ ok: true, deletedGrants: result.changes });
@@ -8254,6 +11185,20 @@ app.patch("/api/settings/preview-access", async (c) => {
   return c.json(next);
 });
 
+app.get("/api/settings/session-compaction", (c) => c.json(sessionCompactionSettings));
+
+app.patch("/api/settings/session-compaction", async (c) => {
+  const body = await c.req.json<UpdateSessionCompactionSettingsRequest>().catch(() => null);
+  const next = runtimeSettingsStore.sessionCompaction.sanitize({
+    ...sessionCompactionSettings,
+    ...(body ?? {}),
+    updatedAt: new Date().toISOString(),
+  });
+  sessionCompactionSettings = next;
+  runtimeSettingsStore.sessionCompaction.save(next);
+  return c.json(next);
+});
+
 app.get("/api/settings/rate-limit", (c) => c.json(rateLimitSettings));
 
 app.patch("/api/settings/rate-limit", async (c) => {
@@ -8266,6 +11211,408 @@ app.patch("/api/settings/rate-limit", async (c) => {
   rateLimitSettings = next;
   rateLimitStore.save(next);
   return c.json(next);
+});
+
+app.get("/api/notifications", (c) => c.json({
+  channels: listNotificationChannels(),
+  accounts: listNotificationAccounts(),
+  recipients: listNotificationRecipients(),
+  rules: listNotificationRules(20).items,
+  ephemeralRules: listNotificationEphemeralRules(20).items,
+  recentDeliveries: listNotificationDeliveries(20).items,
+}));
+
+app.get("/api/app-notifications", (c) => c.json(listAppNotifications(parsePageLimit(c.req.query("limit"), 30))));
+
+app.patch("/api/app-notifications/read", async (c) => {
+  const body = await c.req.json<{ ids?: string[]; all?: boolean }>().catch((): { ids?: string[]; all?: boolean } => ({}));
+  const now = new Date().toISOString();
+  if (body?.all) {
+    db.prepare("update app_notifications set read_at = coalesce(read_at, ?) where read_at is null").run(now);
+  } else {
+    const ids = Array.isArray(body?.ids) ? body.ids.map((id: string) => String(id)).filter(Boolean).slice(0, 100) : [];
+    const update = db.prepare("update app_notifications set read_at = coalesce(read_at, ?) where id = ?");
+    for (const id of ids) update.run(now, id);
+  }
+  const next = listAppNotifications(30);
+  publishAppNotificationEvent({ type: "snapshot", ...next });
+  return c.json(next);
+});
+
+app.delete("/api/app-notifications", (c) => {
+  const result = db.prepare("delete from app_notifications").run();
+  publishAppNotificationsSnapshot();
+  return c.json({ ok: true, deleted: result.changes });
+});
+
+app.get("/api/notifications/accounts", (c) => c.json(listNotificationAccounts()));
+
+app.get("/api/notifications/channels", (c) => c.json(listNotificationChannels()));
+
+app.post("/api/notifications/channels", async (c) => {
+  const body = await c.req.json<UpsertNotificationChannelRequest>().catch(() => null);
+  if (!body?.name?.trim() || !body.urlTemplate?.trim()) return c.json({ error: "invalid_notification_channel" }, 400);
+  const now = new Date().toISOString();
+  const id = `notification-channel-${randomUUID()}`;
+  const adapter = body.adapter === "authenticated_webhook" ? "authenticated_webhook" : "webhook";
+  const authType = body.authType && ["none", "bearer", "query_token", "token_request"].includes(body.authType) ? body.authType : "none";
+  db.prepare(`
+    insert into notification_channels (id, name, kind, adapter, auth_type, description, method, url_template, headers_template, body_template, account_fields, builtin, created_at, updated_at)
+    values (?, ?, 'webhook', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+  `).run(
+    id,
+    body.name.trim(),
+    adapter,
+    authType,
+    body.description?.trim() ?? "",
+    body.method?.trim().toUpperCase() || "POST",
+    body.urlTemplate.trim(),
+    body.headersTemplate ?? "",
+    body.bodyTemplate ?? "",
+    JSON.stringify((body.accountFields ?? []).map((field) => field.trim()).filter(Boolean)),
+    now,
+    now,
+  );
+  return c.json(notificationChannelFromRow(db.prepare("select * from notification_channels where id = ?").get(id) as Record<string, unknown>), 201);
+});
+
+app.patch("/api/notifications/channels/:id", async (c) => {
+  const current = db.prepare("select * from notification_channels where id = ? and builtin = 0").get(c.req.param("id")) as Record<string, unknown> | undefined;
+  if (!current) return c.json({ error: "notification_channel_not_found" }, 404);
+  const body = await c.req.json<UpsertNotificationChannelRequest>().catch(() => null);
+  if (!body) return c.json({ error: "invalid_notification_channel" }, 400);
+  const channel = notificationChannelFromRow(current);
+  const adapter = body.adapter === "authenticated_webhook" ? "authenticated_webhook" : channel.adapter ?? "webhook";
+  const authType = body.authType && ["none", "bearer", "query_token", "token_request"].includes(body.authType) ? body.authType : channel.authType ?? "none";
+  db.prepare(`
+    update notification_channels
+    set name = ?, adapter = ?, auth_type = ?, description = ?, method = ?, url_template = ?, headers_template = ?, body_template = ?, account_fields = ?, updated_at = ?
+    where id = ?
+  `).run(
+    body.name?.trim() || channel.name,
+    adapter,
+    authType,
+    body.description?.trim() ?? channel.description,
+    body.method?.trim().toUpperCase() || channel.method || "POST",
+    body.urlTemplate?.trim() || channel.urlTemplate || "",
+    body.headersTemplate ?? channel.headersTemplate ?? "",
+    body.bodyTemplate ?? channel.bodyTemplate ?? "",
+    JSON.stringify(body.accountFields ? body.accountFields.map((field) => field.trim()).filter(Boolean) : channel.accountFields ?? []),
+    new Date().toISOString(),
+    c.req.param("id"),
+  );
+  return c.json(notificationChannelFromRow(db.prepare("select * from notification_channels where id = ?").get(c.req.param("id")) as Record<string, unknown>));
+});
+
+app.delete("/api/notifications/channels/:id", (c) => {
+  const used = db.prepare("select id from notification_accounts where channel_id = ? limit 1").get(c.req.param("id"))
+    ?? db.prepare("select id from notification_recipients where channel_id = ? limit 1").get(c.req.param("id"));
+  if (used) return c.json({ error: "notification_channel_in_use" }, 409);
+  const result = db.prepare("delete from notification_channels where id = ? and builtin = 0").run(c.req.param("id"));
+  if (!result.changes) return c.json({ error: "notification_channel_not_found" }, 404);
+  return c.json({ ok: true });
+});
+
+app.post("/api/notifications/accounts", async (c) => {
+  const body = await c.req.json<UpsertNotificationAccountRequest>().catch(() => null);
+  const selectedChannel = getNotificationChannel(body?.channelId) ?? (body?.channelKind ? notificationChannels.find((channel) => channel.kind === body.channelKind) : null);
+  const channelKind = selectedChannel?.kind ?? null;
+  if (!body?.name?.trim() || !channelKind) return c.json({ error: "invalid_notification_account" }, 400);
+  const now = new Date().toISOString();
+  const id = `notification-account-${randomUUID()}`;
+  const config = selectedChannel?.builtin === false ? (body.config ?? {}) : sanitizeNotificationConfig(channelKind, body.config);
+  db.prepare(`
+    insert into notification_accounts (id, name, channel_id, channel_kind, enabled, config, permissions, created_at, updated_at)
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, body.name.trim(), selectedChannel?.id ?? null, channelKind, body.enabled === false ? 0 : 1, JSON.stringify(config), JSON.stringify(sanitizeNotificationPermissions(body.permissions)), now, now);
+  const account = notificationAccountFromRow(db.prepare("select * from notification_accounts where id = ?").get(id) as Record<string, unknown>, true);
+  void syncTelegramBotCommands(account).catch((error) => console.warn("telegram command menu sync failed", account.id, error));
+  return c.json(notificationAccountFromRow(db.prepare("select * from notification_accounts where id = ?").get(id) as Record<string, unknown>), 201);
+});
+
+app.patch("/api/notifications/accounts/:id", async (c) => {
+  const current = db.prepare("select * from notification_accounts where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
+  if (!current) return c.json({ error: "notification_account_not_found" }, 404);
+  const body = await c.req.json<UpsertNotificationAccountRequest>().catch(() => null);
+  if (!body) return c.json({ error: "invalid_notification_account" }, 400);
+  const currentKind = String(current.channel_kind) as NotificationAccountSummary["channelKind"];
+  const selectedChannel = getNotificationChannel(body.channelId ?? (current.channel_id ? String(current.channel_id) : null)) ?? (body.channelKind ? notificationChannels.find((channel) => channel.kind === body.channelKind) : null);
+  const channelKind = selectedChannel?.kind ?? currentKind;
+  const previousConfig = parseJsonValue<Record<string, unknown>>(current.config, {});
+  db.prepare(`
+    update notification_accounts
+    set name = ?, channel_id = ?, channel_kind = ?, enabled = ?, config = ?, permissions = ?, updated_at = ?
+    where id = ?
+  `).run(
+    body.name?.trim() || String(current.name),
+    selectedChannel?.id ?? current.channel_id ?? null,
+    channelKind,
+    body.enabled === undefined ? (Boolean(current.enabled) ? 1 : 0) : body.enabled ? 1 : 0,
+    JSON.stringify(selectedChannel?.builtin === false ? { ...previousConfig, ...(body.config ?? {}) } : sanitizeNotificationConfig(channelKind, body.config, previousConfig)),
+    JSON.stringify(body.permissions === undefined ? sanitizeNotificationPermissions(parseJsonValue<NotificationPermissionPolicy>(current.permissions, {})) : sanitizeNotificationPermissions(body.permissions)),
+    new Date().toISOString(),
+    c.req.param("id"),
+  );
+  const account = notificationAccountFromRow(db.prepare("select * from notification_accounts where id = ?").get(c.req.param("id")) as Record<string, unknown>, true);
+  void syncTelegramBotCommands(account).catch((error) => console.warn("telegram command menu sync failed", account.id, error));
+  return c.json(notificationAccountFromRow(db.prepare("select * from notification_accounts where id = ?").get(c.req.param("id")) as Record<string, unknown>));
+});
+
+app.delete("/api/notifications/accounts/:id", (c) => {
+  const result = db.prepare("delete from notification_accounts where id = ?").run(c.req.param("id"));
+  if (!result.changes) return c.json({ error: "notification_account_not_found" }, 404);
+  return c.json({ ok: true });
+});
+
+app.post("/api/notifications/accounts/:id/test", async (c) => {
+  const row = db.prepare("select * from notification_accounts where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
+  if (!row) return c.json({ error: "notification_account_not_found" }, 404);
+  const body = await c.req.json<TestNotificationAccountRequest>().catch((): TestNotificationAccountRequest => ({}));
+  const account = notificationAccountFromRow(row, true);
+  const config = account.config as Record<string, unknown>;
+  const emailTo = body?.emailTo?.length
+    ? body.emailTo
+    : Array.isArray(config.testEmailTo)
+      ? config.testEmailTo.map((item) => String(item).trim()).filter(Boolean)
+      : String(config.testEmailTo ?? "").split(",").map((item) => item.trim()).filter(Boolean);
+  const chatId = String(body?.chatId ?? config.testChatId ?? "").trim() || undefined;
+  const ok = await deliverNotification(account, {
+    eventType: "task_completed",
+    severity: "info",
+    title: "Codex Web test notification",
+    message: "This is a test notification from Codex Web.",
+    sourceType: "notification-account",
+    sourceId: account.id,
+  }, null, { accountId: account.id, emailTo, chatId });
+  db.prepare("update notification_accounts set last_test_status = ?, last_error = (select last_error from notification_deliveries where account_id = ? order by created_at desc limit 1), updated_at = ? where id = ?")
+    .run(ok ? "sent" : "failed", account.id, new Date().toISOString(), account.id);
+  return c.json({ ok, account: notificationAccountFromRow(db.prepare("select * from notification_accounts where id = ?").get(account.id) as Record<string, unknown>) }, ok ? 200 : 400);
+});
+
+app.get("/api/notifications/recipients", (c) => c.json(listNotificationRecipients()));
+
+app.post("/api/notifications/recipients", async (c) => {
+  const body = await c.req.json<UpsertNotificationRecipientRequest>().catch(() => null);
+  const kind = body?.kind && ["email", "webhook", "bark", "telegram"].includes(body.kind) ? body.kind : null;
+  if (!body?.name?.trim() || !kind) return c.json({ error: "invalid_notification_recipient" }, 400);
+  const now = new Date().toISOString();
+  const id = `notification-recipient-${randomUUID()}`;
+  db.prepare(`
+    insert into notification_recipients (id, name, kind, enabled, sender_account_id, channel_id, config, permissions, created_at, updated_at)
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, body.name.trim(), kind, body.enabled === false ? 0 : 1, body.senderAccountId ?? null, body.channelId ?? null, JSON.stringify(body.config ?? {}), JSON.stringify(sanitizeNotificationPermissions(body.permissions)), now, now);
+  return c.json(notificationRecipientFromRow(db.prepare("select * from notification_recipients where id = ?").get(id) as Record<string, unknown>), 201);
+});
+
+app.patch("/api/notifications/recipients/:id", async (c) => {
+  const current = db.prepare("select * from notification_recipients where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
+  if (!current) return c.json({ error: "notification_recipient_not_found" }, 404);
+  const body = await c.req.json<UpsertNotificationRecipientRequest>().catch(() => null);
+  if (!body) return c.json({ error: "invalid_notification_recipient" }, 400);
+  const recipient = notificationRecipientFromRow(current, true);
+  db.prepare(`
+    update notification_recipients
+    set name = ?, kind = ?, enabled = ?, sender_account_id = ?, channel_id = ?, config = ?, permissions = ?, updated_at = ?
+    where id = ?
+  `).run(
+    body.name?.trim() || recipient.name,
+    body.kind ?? recipient.kind,
+    body.enabled === undefined ? (recipient.enabled ? 1 : 0) : body.enabled ? 1 : 0,
+    body.senderAccountId === undefined ? recipient.senderAccountId : body.senderAccountId,
+    body.channelId === undefined ? recipient.channelId : body.channelId,
+    JSON.stringify({ ...recipient.config, ...(body.config ?? {}) }),
+    JSON.stringify(body.permissions === undefined ? recipient.permissions ?? {} : sanitizeNotificationPermissions(body.permissions)),
+    new Date().toISOString(),
+    c.req.param("id"),
+  );
+  return c.json(notificationRecipientFromRow(db.prepare("select * from notification_recipients where id = ?").get(c.req.param("id")) as Record<string, unknown>));
+});
+
+app.post("/api/notifications/recipients/:id/test", async (c) => {
+  const row = db.prepare("select * from notification_recipients where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
+  if (!row) return c.json({ error: "notification_recipient_not_found" }, 404);
+  const recipient = notificationRecipientFromRow(row, true);
+  try {
+    const ok = await deliverNotificationToRecipient(recipient, {
+      eventType: "task_completed",
+      severity: "info",
+      title: "Codex Web test notification",
+      message: "This is a test notification from Codex Web.",
+      sourceType: "notification-recipient",
+      sourceId: recipient.id,
+    }, null, { recipientId: recipient.id });
+    return c.json({ ok, recipient: notificationRecipientFromRow(row) }, ok ? 200 : 400);
+  } catch (error) {
+    return c.json({ ok: false, error: error instanceof Error ? error.message : String(error), recipient: notificationRecipientFromRow(row) }, 400);
+  }
+});
+
+app.post("/api/notifications/ephemeral-rules", async (c) => {
+  const body = await c.req.json<{
+    scopeType?: "session" | "task" | "room_task";
+    scopeId?: string;
+    eventTypes?: NotificationEventType[];
+    targets?: NotificationRuleTarget[];
+    expireMode?: "after_trigger" | "session_end" | "manual";
+  }>().catch(() => null);
+  const rule = body ? createNotificationEphemeralRule(body) : null;
+  if (!rule) return c.json({ error: "invalid_notification_ephemeral_rule" }, 400);
+  return c.json(rule, 201);
+});
+
+app.delete("/api/notifications/ephemeral-rules/:id", (c) => {
+  const result = db.prepare("delete from notification_ephemeral_rules where id = ?").run(c.req.param("id"));
+  if (!result.changes) return c.json({ error: "notification_ephemeral_rule_not_found" }, 404);
+  return c.json({ ok: true });
+});
+
+app.delete("/api/notifications/recipients/:id", (c) => {
+  const result = db.prepare("delete from notification_recipients where id = ?").run(c.req.param("id"));
+  if (!result.changes) return c.json({ error: "notification_recipient_not_found" }, 404);
+  return c.json({ ok: true });
+});
+
+app.get("/api/notifications/ephemeral-rules", (c) => c.json(listNotificationEphemeralRules(parsePageLimit(c.req.query("limit"), 50), c.req.query("cursor"))));
+
+app.get("/api/notifications/rules", (c) => c.json(listNotificationRules(
+  parsePageLimit(c.req.query("limit"), 50),
+  c.req.query("cursor"),
+  { enabled: c.req.query("enabled") === "true" ? true : c.req.query("enabled") === "false" ? false : undefined },
+)));
+
+app.delete("/api/notifications/rules", (c) => {
+  const rules = db.prepare("delete from notification_rules").run();
+  const ephemeral = db.prepare("delete from notification_ephemeral_rules").run();
+  return c.json({ ok: true, deleted: rules.changes + ephemeral.changes });
+});
+
+app.post("/api/notifications/rules", async (c) => {
+  const body = await c.req.json<UpsertNotificationRuleRequest>().catch(() => null);
+  if (!body?.name?.trim()) return c.json({ error: "invalid_notification_rule" }, 400);
+  const eventTypes = (body.eventTypes ?? []).filter((type) => notificationEventTypes.includes(type));
+  const targets = sanitizeNotificationTargets(body.targets);
+  if (!eventTypes.length || !targets.length) return c.json({ error: "notification_rule_requires_events_and_targets" }, 400);
+  const now = new Date().toISOString();
+  const id = `notification-rule-${randomUUID()}`;
+  db.prepare(`
+    insert into notification_rules (id, name, enabled, event_types, min_severity, targets, dedupe_minutes, created_at, updated_at)
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    body.name.trim(),
+    body.enabled === false ? 0 : 1,
+    JSON.stringify(eventTypes),
+    body.minSeverity && notificationSeverityRank[body.minSeverity] !== undefined ? body.minSeverity : "info",
+    JSON.stringify(targets),
+    Math.max(0, Number(body.dedupeMinutes) || 0),
+    now,
+    now,
+  );
+  return c.json(notificationRuleFromRow(db.prepare("select * from notification_rules where id = ?").get(id) as Record<string, unknown>), 201);
+});
+
+app.patch("/api/notifications/rules/:id", async (c) => {
+  const current = db.prepare("select * from notification_rules where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
+  if (!current) return c.json({ error: "notification_rule_not_found" }, 404);
+  const body = await c.req.json<UpsertNotificationRuleRequest>().catch(() => null);
+  if (!body) return c.json({ error: "invalid_notification_rule" }, 400);
+  const rule = notificationRuleFromRow(current);
+  const eventTypes = body.eventTypes ? body.eventTypes.filter((type) => notificationEventTypes.includes(type)) : rule.eventTypes;
+  const targets = body.targets ? sanitizeNotificationTargets(body.targets) : rule.targets;
+  if (!eventTypes.length || !targets.length) return c.json({ error: "notification_rule_requires_events_and_targets" }, 400);
+  db.prepare(`
+    update notification_rules
+    set name = ?, enabled = ?, event_types = ?, min_severity = ?, targets = ?, dedupe_minutes = ?, updated_at = ?
+    where id = ?
+  `).run(
+    body.name?.trim() || rule.name,
+    body.enabled === undefined ? (rule.enabled ? 1 : 0) : body.enabled ? 1 : 0,
+    JSON.stringify(eventTypes),
+    body.minSeverity && notificationSeverityRank[body.minSeverity] !== undefined ? body.minSeverity : rule.minSeverity,
+    JSON.stringify(targets),
+    Math.max(0, Number(body.dedupeMinutes ?? rule.dedupeMinutes) || 0),
+    new Date().toISOString(),
+    c.req.param("id"),
+  );
+  return c.json(notificationRuleFromRow(db.prepare("select * from notification_rules where id = ?").get(c.req.param("id")) as Record<string, unknown>));
+});
+
+app.delete("/api/notifications/rules/:id", (c) => {
+  const result = db.prepare("delete from notification_rules where id = ?").run(c.req.param("id"));
+  if (!result.changes) return c.json({ error: "notification_rule_not_found" }, 404);
+  return c.json({ ok: true });
+});
+
+app.get("/api/notifications/deliveries", (c) => {
+  const eventType = c.req.query("eventType") as NotificationEventType | undefined;
+  const status = c.req.query("status") as NotificationDeliveryStatus | undefined;
+  const severity = c.req.query("severity") as NotificationSeverity | undefined;
+  return c.json(listNotificationDeliveries(
+    parsePageLimit(c.req.query("limit"), 50),
+    c.req.query("cursor"),
+    {
+      eventType: eventType && notificationEventTypes.includes(eventType) ? eventType : undefined,
+      status: status && ["pending", "sent", "failed", "skipped"].includes(status) ? status : undefined,
+      severity: severity && notificationSeverityRank[severity] !== undefined ? severity : undefined,
+    },
+  ));
+});
+
+app.delete("/api/notifications/deliveries", (c) => {
+  const result = db.prepare("delete from notification_deliveries").run();
+  return c.json({ ok: true, deleted: result.changes });
+});
+
+app.post("/api/notifications/deliveries/:id/retry", async (c) => {
+  const row = db.prepare("select * from notification_deliveries where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
+  if (!row) return c.json({ error: "notification_delivery_not_found" }, 404);
+  const delivery = notificationDeliveryFromRow(row);
+  const metadata = delivery.metadata ?? {};
+  const metadataTarget = metadata.target && typeof metadata.target === "object" ? metadata.target as Record<string, unknown> : {};
+  const metadataRecipient = metadata.recipient && typeof metadata.recipient === "object" ? metadata.recipient as Record<string, unknown> : {};
+  const target: NotificationRuleTarget = sanitizeNotificationTargets([{
+    accountId: metadataTarget.accountId ? String(metadataTarget.accountId) : delivery.accountId ?? undefined,
+    recipientId: metadataTarget.recipientId ? String(metadataTarget.recipientId) : metadataRecipient.id ? String(metadataRecipient.id) : undefined,
+    senderAccountId: metadataTarget.senderAccountId ? String(metadataTarget.senderAccountId) : undefined,
+    chatId: metadataTarget.chatId ? String(metadataTarget.chatId) : undefined,
+    emailTo: Array.isArray(metadataTarget.emailTo) ? metadataTarget.emailTo.map((item) => String(item)) : undefined,
+  }])[0] ?? {};
+  const event: NotificationEventInput = {
+    eventType: delivery.eventType,
+    severity: delivery.severity,
+    title: delivery.title,
+    message: delivery.message,
+    sourceType: typeof metadata.sourceType === "string" ? metadata.sourceType : undefined,
+    sourceId: typeof metadata.sourceId === "string" ? metadata.sourceId : undefined,
+    metadata: {
+      ...(metadata.eventMetadata && typeof metadata.eventMetadata === "object" ? metadata.eventMetadata as Record<string, unknown> : {}),
+      retryOfDeliveryId: delivery.id,
+    },
+  };
+  if (target.recipientId) {
+    const recipientRow = db.prepare("select * from notification_recipients where id = ?").get(target.recipientId) as Record<string, unknown> | undefined;
+    if (!recipientRow) return c.json({ error: "notification_recipient_not_found" }, 404);
+    const ok = await deliverNotificationToRecipient(notificationRecipientFromRow(recipientRow, true), event, delivery.ruleId ?? null, target);
+    return c.json({ ok });
+  }
+  if (!delivery.accountId) return c.json({ error: "notification_delivery_target_missing" }, 400);
+  const accountRow = db.prepare("select * from notification_accounts where id = ?").get(delivery.accountId) as Record<string, unknown> | undefined;
+  if (!accountRow) {
+    const recipientRow = db.prepare("select * from notification_recipients where id = ?").get(delivery.accountId) as Record<string, unknown> | undefined;
+    if (recipientRow) {
+      const ok = await deliverNotificationToRecipient(notificationRecipientFromRow(recipientRow, true), event, delivery.ruleId ?? null, { ...target, recipientId: delivery.accountId });
+      return c.json({ ok });
+    }
+  }
+  if (!accountRow) return c.json({ error: "notification_account_not_found" }, 404);
+  const ok = await deliverNotification(notificationAccountFromRow(accountRow, true), event, delivery.ruleId ?? null, { ...target, accountId: delivery.accountId });
+  return c.json({ ok });
+});
+
+app.delete("/api/notifications/deliveries/:id", (c) => {
+  const result = db.prepare("delete from notification_deliveries where id = ?").run(c.req.param("id"));
+  if (!result.changes) return c.json({ error: "notification_delivery_not_found" }, 404);
+  return c.json({ ok: true });
 });
 
 app.get("/api/settings/storage", (c) => c.json(listStorageItems()));
@@ -8324,6 +11671,14 @@ app.get("/api/settings/backup/preview", (c) => {
     };
     return c.json(response);
   } catch (error) {
+    emitExternalNotification({
+      eventType: "backup_failed",
+      severity: "error",
+      title: "备份预览失败",
+      message: error instanceof Error ? error.message : "backup_preview_failed",
+      sourceType: "backup",
+      sourceId: "preview",
+    });
     return c.json({ error: error instanceof Error ? error.message : "backup_preview_failed" }, 500);
   }
 });
@@ -8336,6 +11691,14 @@ app.get("/api/settings/backup/download", (c) => {
     c.header("content-disposition", `attachment; filename="${filename}"`);
     return c.body(backup.buffer);
   } catch (error) {
+    emitExternalNotification({
+      eventType: "backup_failed",
+      severity: "error",
+      title: "备份下载失败",
+      message: error instanceof Error ? error.message : "backup_download_failed",
+      sourceType: "backup",
+      sourceId: "download",
+    });
     return c.json({ error: error instanceof Error ? error.message : "backup_download_failed" }, 500);
   }
 });
@@ -8345,6 +11708,14 @@ app.post("/api/settings/restore/preview", async (c) => {
     const buffer = await readBackupUpload(c);
     return c.json(systemBackupPreviewFromArchive(buffer));
   } catch (error) {
+    emitExternalNotification({
+      eventType: "restore_failed",
+      severity: "error",
+      title: "恢复预览失败",
+      message: error instanceof Error ? error.message : "restore_preview_failed",
+      sourceType: "restore",
+      sourceId: "preview",
+    });
     return c.json({ error: error instanceof Error ? error.message : "restore_preview_failed" }, 400);
   }
 });
@@ -8389,6 +11760,14 @@ app.post("/api/settings/restore", async (c) => {
     };
     return c.json(response);
   } catch (error) {
+    emitExternalNotification({
+      eventType: "restore_failed",
+      severity: "error",
+      title: "系统恢复失败",
+      message: error instanceof Error ? error.message : "restore_failed",
+      sourceType: "restore",
+      sourceId: "apply",
+    });
     return c.json({ error: error instanceof Error ? error.message : "restore_failed" }, 400);
   }
 });
@@ -8585,10 +11964,14 @@ app.get("/api/previews", (c) => {
 
 app.post("/api/previews", async (c) => {
   const body = await c.req.json<CreatePreviewRequest>().catch(() => null);
-  if (!body || (body.scopeType !== "project" && body.scopeType !== "session")) return c.json({ error: "invalid_scope" }, 400);
+  if (!body || (body.scopeType !== "project" && body.scopeType !== "session" && body.scopeType !== "folder")) return c.json({ error: "invalid_scope" }, 400);
+  if (!body.scopeId?.trim()) return c.json({ error: "invalid_scope" }, 400);
+  const folderScopePath = body.scopeType === "folder" ? resolve(body.scopeId) : "";
   const scopeExists = body.scopeType === "project"
     ? appData.projects.some((project) => project.id === body.scopeId)
-    : appData.sessions.some((session) => session.id === body.scopeId);
+    : body.scopeType === "folder"
+      ? existsSync(folderScopePath) && statSync(folderScopePath).isDirectory()
+      : appData.sessions.some((session) => session.id === body.scopeId);
   if (!scopeExists) return c.json({ error: "scope_not_found" }, 404);
   const port = Number(body.port);
   if (!Number.isInteger(port) || port < 1 || port > 65535) return c.json({ error: "invalid_port" }, 400);
@@ -8776,6 +12159,7 @@ app.patch("/api/sessions/:id", async (c) => {
   const body = await c.req.json<UpdateSessionRequest>().catch(() => null);
   if (!body) return c.json({ error: "invalid_session_update" }, 400);
   if (body.title !== undefined) session.title = body.title.trim() || session.title;
+  if (body.notificationsEnabled !== undefined) session.notificationsEnabled = body.notificationsEnabled !== false;
   session.updatedAt = new Date().toISOString();
   upsertSession(session);
   return c.json(session);
@@ -8786,21 +12170,11 @@ app.delete("/api/sessions/:id", (c) => {
   const [session] = appData.sessions.splice(index, 1);
   const deleteWorkspace = c.req.query("deleteWorkspace") === "true";
   const deleteLogs = c.req.query("deleteLogs") === "true";
-  const child = codexTaskProcesses.get(session.id);
-  if (child) child.kill("SIGTERM");
-  codexTaskProcesses.delete(session.id);
-  codexTaskOutputs.delete(session.id);
-  codexTaskStopRequested.delete(session.id);
-  codexTaskStdoutBuffers.delete(session.id);
+  clearCodexTaskRuntime(session.id, true);
   if (session.roomId) {
     const childSessions = appData.sessions.filter((item) => item.conversationType === "agent" && item.roomId === session.roomId);
     for (const childSession of childSessions) {
-      const childProcess = codexTaskProcesses.get(childSession.id);
-      if (childProcess) childProcess.kill("SIGTERM");
-      codexTaskProcesses.delete(childSession.id);
-      codexTaskOutputs.delete(childSession.id);
-      codexTaskStopRequested.delete(childSession.id);
-      codexTaskStdoutBuffers.delete(childSession.id);
+      clearCodexTaskRuntime(childSession.id, true);
       deleteSessionDatabaseRows(childSession.id);
       deleteSessionData(childSession, deleteWorkspace, deleteLogs);
     }
@@ -8840,15 +12214,31 @@ app.post("/api/codex/tasks", async (c) => {
   };
   appData.sessions.unshift(session);
   deleteSessionMessages(session.id);
-  const userMessage = appendSessionMessage(session.id, "user", body.prompt.trim());
+  let attachments: SavedSessionAttachment[] = [];
+  try {
+    attachments = saveSessionAttachments(session.id, body.attachments);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "attachment_upload_failed" }, 400);
+  }
+  const userMessage = appendSessionMessage(session.id, "user", messageWithAttachments(body.prompt, attachments));
+  for (const notificationRule of body.ephemeralNotifications ?? []) {
+    createNotificationEphemeralRule({
+      scopeType: "session",
+      scopeId: session.id,
+      eventTypes: notificationRule.eventTypes,
+      targets: notificationRule.targets,
+      expireMode: notificationRule.expireMode,
+    });
+  }
   saveAppData();
-  startCodexTask(session, body.prompt, cwd, provider, selectedModel, true, [], { currentMessageId: userMessage.id });
+  startCodexTask(session, promptWithAttachments(body.prompt, attachments), cwd, provider, selectedModel, true, attachments.length ? [sessionAttachmentsPath(session.id)] : [], { currentMessageId: userMessage.id });
   return c.json(session, 201);
 });
 app.get("/api/codex/tasks/:id", (c) => {
   const session = appData.sessions.find((item) => item.id === c.req.param("id"));
   if (!session) return c.json({ error: "task_not_found" }, 404);
   restoreCodexSessionIdFromLog(session);
+  if (session.status !== "running") backfillSessionFromTaskLog(session);
   const output = readCodexOutput(session.id);
   const response: CodexTaskDetail = {
     session,
@@ -8933,7 +12323,50 @@ app.get("/api/execution-contexts", (c) => {
 app.get("/api/sessions/:id/messages", (c) => {
   const session = appData.sessions.find((item) => item.id === c.req.param("id"));
   if (!session) return c.json({ error: "session_not_found" }, 404);
+  if (session.status !== "running") backfillSessionFromTaskLog(session);
   return c.json(listSessionMessages(session.id, Number(c.req.query("limit") ?? 20), c.req.query("before") || undefined));
+});
+app.get("/api/sessions/:id/compaction", (c) => {
+  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
+  if (!session) return c.json({ error: "session_not_found" }, 404);
+  const latest = latestSessionCompaction(session.id);
+  if (!latest) return c.json({ compaction: null, summary: "" });
+  const summary = existsSync(latest.filePath) ? readFileSync(latest.filePath, "utf8") : "";
+  return c.json({ compaction: latest, summary });
+});
+app.get("/api/sessions/:id/compactions", (c) => {
+  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
+  if (!session) return c.json({ error: "session_not_found" }, 404);
+  return c.json(listSessionCompactions(session.id, Number(c.req.query("limit") ?? 20)));
+});
+app.patch("/api/sessions/:id/compaction", async (c) => {
+  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
+  if (!session) return c.json({ error: "session_not_found" }, 404);
+  const body = await c.req.json<UpdateSessionCompactionRequest>().catch(() => null);
+  try {
+    return c.json(updateLatestSessionCompaction(session, String(body?.summary ?? "")));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "session_compaction_update_failed" }, 400);
+  }
+});
+app.post("/api/sessions/:id/compactions/:compactionId/restore", (c) => {
+  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
+  if (!session) return c.json({ error: "session_not_found" }, 404);
+  try {
+    return c.json(restoreSessionCompaction(session, c.req.param("compactionId")));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "session_compaction_restore_failed" }, 400);
+  }
+});
+app.post("/api/sessions/:id/compact", async (c) => {
+  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
+  if (!session) return c.json({ error: "session_not_found" }, 404);
+  const body = await c.req.json<CreateSessionCompactionRequest>().catch(() => null);
+  try {
+    return c.json(await createSessionCompaction(session, body));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "session_compaction_failed" }, 400);
+  }
 });
 app.get("/api/sessions/:id/cards", (c) => {
   const session = appData.sessions.find((item) => item.id === c.req.param("id"));
@@ -9073,7 +12506,9 @@ app.post("/api/codex/tasks/:id/stop", (c) => {
   const session = appData.sessions.find((item) => item.id === c.req.param("id"));
   if (!session) return c.json({ error: "task_not_found" }, 404);
   const child = codexTaskProcesses.get(session.id);
-  if (!child) {
+  const running = latestRunningTaskRun(session.id);
+  const runnerPid = typeof running?.pid === "number" ? running.pid : null;
+  if (!child && !isProcessAlive(runnerPid)) {
     session.status = session.status === "running" ? "paused" : session.status;
     session.updatedAt = new Date().toISOString();
     saveAppData();
@@ -9081,11 +12516,12 @@ app.post("/api/codex/tasks/:id/stop", (c) => {
   }
   codexTaskStopRequested.add(session.id);
   markTaskRunStopRequested(session.id);
-  child.kill("SIGTERM");
+  if (child) child.kill("SIGTERM");
+  else if (runnerPid) process.kill(runnerPid, "SIGTERM");
   session.status = "paused";
   session.updatedAt = new Date().toISOString();
   saveAppData();
-  appendCodexOutput(session.id, "\n[task stopped]\n");
+  appendCodexErrorOutput(session, "\n[task stopped]\n");
   appendSessionMessage(session.id, "assistant", `用户主动停止任务。停止时间：${new Date().toISOString()}。待发送队列：${listQueuedMessages(session.id).length} 条。`);
   return c.json(session);
 });
@@ -9121,6 +12557,7 @@ app.post("/api/codex/tasks/:id/messages", async (c) => {
   if (!body?.prompt?.trim()) return c.json({ error: "prompt_required" }, 400);
   restoreCodexSessionIdFromLog(session);
   if (codexTaskProcesses.has(session.id) || session.status === "running") {
+    if (body.attachments?.length) return c.json({ error: "attachments_cannot_queue" }, 409);
     return c.json(enqueueMessage(session, body), 202);
   }
   const providerId = body.providerId ?? session.providerId ?? null;
@@ -9131,10 +12568,16 @@ app.post("/api/codex/tasks/:id/messages", async (c) => {
   session.model = selectedModel;
   session.status = "running";
   session.updatedAt = new Date().toISOString();
-  const userMessage = appendSessionMessage(session.id, "user", body.prompt.trim(), body.replyToMessageId);
+  let attachments: SavedSessionAttachment[] = [];
+  try {
+    attachments = saveSessionAttachments(session.id, body.attachments);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "attachment_upload_failed" }, 400);
+  }
+  const userMessage = appendSessionMessage(session.id, "user", messageWithAttachments(body.prompt, attachments), body.replyToMessageId);
   saveAppData();
-  const prompt = promptWithReplyContext(session.id, body.prompt, body.replyToMessageId);
-  startCodexTask(session, promptForDirectAgentSession(session, prompt), cwd, provider, selectedModel, !session.codexSessionId, [], {
+  const prompt = promptWithReplyContext(session.id, promptWithAttachments(body.prompt, attachments), body.replyToMessageId);
+  startCodexTask(session, promptForDirectAgentSession(session, prompt), cwd, provider, selectedModel, !session.codexSessionId, attachments.length ? [sessionAttachmentsPath(session.id)] : [], {
     currentMessageId: userMessage.id,
     replyToMessageId: body.replyToMessageId,
   });
@@ -10181,7 +13624,17 @@ app.post("/api/rooms/:id/messages", async (c) => {
   const linkedSession = room.session_id ? appData.sessions.find((item) => item.id === room.session_id) : null;
   const fallbackSession = appData.sessions.find((item) => item.roomId === roomId) ?? null;
   const session = requestedSession ?? linkedSession ?? fallbackSession;
-  const message = session ? appendSessionMessage(session.id, "user", content, body?.replyToMessageId ?? null) : null;
+  let attachments: SavedSessionAttachment[] = [];
+  if (session) {
+    try {
+      attachments = saveSessionAttachments(session.id, body?.attachments);
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : "attachment_upload_failed" }, 400);
+    }
+  }
+  const contentWithAttachments = messageWithAttachments(content, attachments);
+  const promptContent = promptWithAttachments(content, attachments);
+  const message = session ? appendSessionMessage(session.id, "user", contentWithAttachments, body?.replyToMessageId ?? null) : null;
   if (session) {
     session.updatedAt = message?.createdAt ?? new Date().toISOString();
     upsertSession(session);
@@ -10190,17 +13643,18 @@ app.post("/api/rooms/:id/messages", async (c) => {
   const members = roomAgentsWithListenModes(roomId);
   const mentionableAgents = members.filter((member) => member.listenMode !== "none").map((member) => member.agent);
   const mentionedAgents = mentionedRoomAgents(content, mentionableAgents);
-  const mentionsUser = /(^|\s)@user\b/i.test(content);
-  const autoListenAgents = !mentionedAgents.length && !mentionsUser ? autoListenAgentsForRoomMessage(roomId) : [];
+  const mentionsUser = mentionsRoomUser(content);
+  const orchestration = roomOrchestrationSettings((db.prepare("select orchestration_settings from rooms where id = ?").get(roomId) as { orchestration_settings?: string } | undefined)?.orchestration_settings);
+  const autoListenAgents = !mentionedAgents.length && !mentionsUser ? autoListenAgentsForRoomMessage(roomId, orchestration.maxAutoListenTasksPerEvent) : [];
   const tasks = [
-    ...mentionedAgents.map((agent) => insertRoomTask(roomId, `@${agent.name}`, content, agent.id, 1, null, { kind: "mention", reason: "user.mentioned" })),
+    ...mentionedAgents.map((agent) => insertRoomTask(roomId, `@${agent.name}`, promptContent, agent.id, 1, null, { kind: "mention", reason: "user.mentioned", mentionsUser })),
     ...autoListenAgents.map((agent) => insertRoomTask(
       roomId,
       members.find((member) => member.agent.id === agent.id)?.listenMode === "orchestrator" ? `Orchestrate: ${content}`.slice(0, 120) : `Respond: ${content}`.slice(0, 120),
       [
         "Room event: user.message",
         "",
-        content,
+        promptContent,
         "",
         members.find((member) => member.agent.id === agent.id)?.listenMode === "orchestrator"
           ? "As the orchestrator, decide whether the room needs follow-up work and summarize the next step."
@@ -10209,7 +13663,7 @@ app.post("/api/rooms/:id/messages", async (c) => {
       agent.id,
       members.find((member) => member.agent.id === agent.id)?.listenMode === "orchestrator" ? 2 : 1,
       null,
-      { kind: "listen", reason: "user.message" },
+      { kind: "listen", reason: "user.message", mentionsUser },
     )),
   ];
   const runs = [];
@@ -10220,9 +13674,9 @@ app.post("/api/rooms/:id/messages", async (c) => {
       // Keep the assigned task visible even if the Agent cannot start immediately.
     }
   }
-  const event = roomEvent(roomId, "user.message", { content, messageId: message?.id ?? null, sessionId: session?.id ?? null, replyToMessageId: body?.replyToMessageId ?? null, mentionsUser, mentionedAgentIds: mentionedAgents.map((agent) => agent.id), autoListenAgentIds: autoListenAgents.map((agent) => agent.id), taskIds: tasks.map((task) => task.id) });
+  const event = roomEvent(roomId, "user.message", { content: contentWithAttachments, messageId: message?.id ?? null, sessionId: session?.id ?? null, replyToMessageId: body?.replyToMessageId ?? null, mentionsUser, mentionedAgentIds: mentionedAgents.map((agent) => agent.id), autoListenAgentIds: autoListenAgents.map((agent) => agent.id), taskIds: tasks.map((task) => task.id) });
   for (const task of tasks) {
-    roomEvent(roomId, "agent.mentioned", { content, taskId: task.id }, task.assignedAgentId ?? null);
+    roomEvent(roomId, "agent.mentioned", { content: promptContent, taskId: task.id }, task.assignedAgentId ?? null);
   }
   const routed = orchestrateRoom(roomId, mentionsUser ? "user.mentioned" : "user.message");
   return c.json({ event, message, session: session ?? null, tasks: [...tasks, ...routed.tasks], runs: [...runs, ...routed.runs] }, 201);
@@ -10406,6 +13860,8 @@ app.post("/api/rooms/:id/tasks/:taskId/cancel", (c) => {
     markTaskRunStopRequested(sessionId);
     if (child) {
       child.kill("SIGTERM");
+    } else if (isProcessAlive(run.pid === null || run.pid === undefined ? null : Number(run.pid))) {
+      process.kill(Number(run.pid), "SIGTERM");
     } else {
       stopOrphanRoomAgentRun(sessionId);
     }
@@ -10493,6 +13949,9 @@ app.post("/api/providers/detect", async (c) => {
     baseUrl: body.baseUrl?.trim() || undefined,
     apiKey: body.apiKey?.trim() || undefined,
     capabilities: mergeProviderCapabilities(body.kind, body.capabilities),
+    rpmLimit: sanitizeProviderRpmLimit(body.rpmLimit),
+    rpmLimitEnabled: body.rpmLimitEnabled === true,
+    useProxy: body.kind === "openai-responses" && body.useProxy === true,
   };
   return c.json(await detectProviderInterface(provider));
 });
@@ -10506,6 +13965,9 @@ app.post("/api/providers/models", async (c) => {
     defaultModel: body.defaultModel || "",
     baseUrl: body.baseUrl?.trim() || undefined,
     apiKey: body.apiKey?.trim() || undefined,
+    rpmLimit: sanitizeProviderRpmLimit(body.rpmLimit),
+    rpmLimitEnabled: body.rpmLimitEnabled === true,
+    useProxy: body.kind === "openai-responses" && body.useProxy === true,
   };
   return c.json(await discoverProviderModels(provider));
 });
@@ -10522,6 +13984,9 @@ app.post("/api/providers", async (c) => {
     baseUrl: body.baseUrl?.trim() || undefined,
     apiKey: body.apiKey?.trim() || undefined,
     capabilities: mergeProviderCapabilities(body.kind, body.capabilities),
+    rpmLimit: sanitizeProviderRpmLimit(body.rpmLimit),
+    rpmLimitEnabled: body.rpmLimitEnabled === true,
+    useProxy: body.kind === "openai-responses" && body.useProxy === true,
   };
   appData.providers.unshift(provider);
   saveAppData();
@@ -10532,6 +13997,17 @@ app.post("/api/providers/:id/test", async (c) => {
   if (!provider) return c.json({ error: "provider_not_found" }, 404);
   const result = await testProvider(provider);
   recordProviderHealthCheck(provider.id, "test", result);
+  if (!result.ok) {
+    emitExternalNotification({
+      eventType: "provider_check_failed",
+      severity: result.status === 429 ? "warning" : "error",
+      title: `Provider 测试失败：${provider.name}`,
+      message: [result.status ? `HTTP ${result.status}` : null, result.error].filter(Boolean).join(" · ") || "Provider 连接测试失败。",
+      sourceType: "provider",
+      sourceId: provider.id,
+      metadata: { status: result.status, error: result.error, durationMs: result.durationMs },
+    });
+  }
   return c.json(result);
 });
 app.post("/api/providers/:id/detect", async (c) => {
@@ -10591,6 +14067,9 @@ app.patch("/api/providers/:id", async (c) => {
   if (body.baseUrl !== undefined) provider.baseUrl = body.baseUrl.trim() || undefined;
   if (body.apiKey !== undefined) provider.apiKey = body.apiKey.trim() || undefined;
   if (body.capabilities !== undefined || body.kind !== undefined) provider.capabilities = mergeProviderCapabilities(provider.kind, body.capabilities ?? provider.capabilities);
+  if (body.rpmLimit !== undefined) provider.rpmLimit = sanitizeProviderRpmLimit(body.rpmLimit);
+  if (body.rpmLimitEnabled !== undefined) provider.rpmLimitEnabled = body.rpmLimitEnabled === true;
+  if (body.useProxy !== undefined || body.kind !== undefined) provider.useProxy = provider.kind === "openai-responses" && body.useProxy === true;
   if (body.kind !== undefined || body.defaultModel !== undefined || body.baseUrl !== undefined || body.apiKey !== undefined) clearProviderModelCache(provider.id);
   saveAppData();
   return c.json(publicProvider(provider));
@@ -10874,11 +14353,14 @@ const terminalApiWsServer = startTerminalApiWebSocket(apiServer);
 const previewWsServer = startPreviewWebSocketProxy(apiServer);
 const automationTimer = setInterval(checkScheduledWork, 60_000);
 automationTimer.unref();
+const telegramInboundTimer = setInterval(pollTelegramInboundBots, 10_000);
+telegramInboundTimer.unref();
 let shuttingDown = false;
 function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
   clearInterval(automationTimer);
+  clearInterval(telegramInboundTimer);
   console.log(`Codex Web API shutting down after ${signal}`);
   for (const child of codexTaskProcesses.values()) child.kill("SIGTERM");
   for (const previewId of Array.from(new Set([...previewProcesses.keys(), ...previewProcessGroups.keys()]))) stopPreviewProcess(previewId);

@@ -119,40 +119,49 @@ function expensiveRateLimitPath(path: string, method: string) {
     || path === "/api/files/archive/preview";
 }
 
-function providerProxyRateKey(path: string, ip: string) {
+function providerProxyIdFromPath(path: string) {
   const parts = path.split("/").filter(Boolean);
-  const providerId = parts[1] ? decodeURIComponent(parts[1]) : "unknown";
-  return `${ip}:${providerId}`;
+  return parts[1] ? decodeURIComponent(parts[1]) : "unknown";
 }
 
-export function createRateLimitMiddleware(getSettings: () => RateLimitSettings): MiddlewareHandler {
+function providerProxyRateKey(path: string, ip: string) {
+  return `${ip}:${providerProxyIdFromPath(path)}`;
+}
+
+type ProviderRateLimit = { enabled?: boolean; rpmLimit?: number | null };
+
+export function createRateLimitMiddleware(getSettings: () => RateLimitSettings, getProviderRateLimit?: (providerId: string) => ProviderRateLimit | null | undefined): MiddlewareHandler {
   return async (c, next) => {
     const settings = getSettings();
-    if (!settings.enabled) return next();
     cleanupRateLimitBuckets();
     const url = new URL(c.req.url);
     const path = url.pathname;
     const method = c.req.method;
     const ip = requestIp(c);
-    const checks: Array<{ key: string; limit: number; windowMs: number }> = [
-      { key: `global:${ip}`, limit: settings.globalPerMinute, windowMs: 60_000 },
-    ];
-    if (path.startsWith("/api/auth/")) {
+    const checks: Array<{ key: string; limit: number; windowMs: number }> = [];
+    if (settings.enabled) checks.push({ key: `global:${ip}`, limit: settings.globalPerMinute, windowMs: 60_000 });
+    if (settings.enabled && path.startsWith("/api/auth/")) {
       checks.push({ key: `auth:${ip}`, limit: settings.authPerMinute, windowMs: 60_000 });
     }
-    if (path.startsWith("/preview/") && path.includes("/access-requests")) {
+    if (settings.enabled && path.startsWith("/preview/") && path.includes("/access-requests")) {
       const parts = path.split("/").filter(Boolean);
       const previewId = parts[1] ? decodeURIComponent(parts[1]) : "unknown";
       checks.push({ key: `preview-access:${ip}:${previewId}`, limit: settings.previewAccessPerMinute, windowMs: 60_000 });
     }
     if (path.startsWith("/provider-proxy/")) {
       const key = providerProxyRateKey(path, ip);
-      checks.push(
-        { key: `provider-proxy-minute:${key}`, limit: settings.providerProxyPerMinute, windowMs: 60_000 },
-        { key: `provider-proxy-hour:${key}`, limit: settings.providerProxyPerHour, windowMs: 60 * 60_000 },
-      );
+      const providerId = providerProxyIdFromPath(path);
+      const providerRateLimit = getProviderRateLimit?.(providerId);
+      const providerRpmLimit = providerRateLimit?.rpmLimit;
+      const rpmLimit = Number.isFinite(Number(providerRpmLimit)) && Number(providerRpmLimit) > 0 ? Math.floor(Number(providerRpmLimit)) : settings.providerProxyPerMinute;
+      if (providerRateLimit?.enabled && Number.isFinite(Number(providerRpmLimit)) && Number(providerRpmLimit) > 0) {
+        checks.push({ key: `provider-proxy-minute:${key}`, limit: rpmLimit, windowMs: 60_000 });
+      } else if (settings.enabled) {
+        checks.push({ key: `provider-proxy-minute:${key}`, limit: settings.providerProxyPerMinute, windowMs: 60_000 });
+      }
+      if (settings.enabled) checks.push({ key: `provider-proxy-hour:${key}`, limit: settings.providerProxyPerHour, windowMs: 60 * 60_000 });
     }
-    if (expensiveRateLimitPath(path, method)) {
+    if (settings.enabled && expensiveRateLimitPath(path, method)) {
       checks.push({ key: `expensive:${ip}`, limit: settings.expensivePerFiveMinutes, windowMs: 5 * 60_000 });
     }
     for (const check of checks) {

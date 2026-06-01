@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import QRCode from "qrcode";
 import {
   Activity,
+  Bell,
   Bot,
   Boxes,
   Check,
@@ -80,6 +81,9 @@ import type {
   AgentRoleSummary,
   AgentRoleTemplateSummary,
   AgentSummary,
+  AppNotificationSummary,
+  AppNotificationStreamEvent,
+  AppNotificationsResponse,
   ArchiveIgnoreTemplate,
   AuthState,
   AutomationRunSummary,
@@ -110,6 +114,16 @@ import type {
   LoginResponse,
   MaintenanceCleanupResponse,
   MessageCardSummary,
+  NotificationAccountSummary,
+  NotificationChannelDefinition,
+  NotificationDeliverySummary,
+  NotificationEphemeralRuleSummary,
+  NotificationEventType,
+  NotificationRecipientSummary,
+  NotificationRuleSummary,
+  NotificationRuleTarget,
+  NotificationSeverity,
+  NotificationSettingsResponse,
   PageResponse,
   PermissionProfileId,
   ProjectCheckRunSummary,
@@ -144,8 +158,11 @@ import type {
   RoomSummary,
   RoomTaskSummary,
   SessionMessage,
+  SessionCompactionResponse,
+  SessionCompactionSettings,
   SessionMessagesPage,
   SessionSummary,
+  SessionCompactionListResponse,
   SetupStartResponse,
   ResetOtpResponse,
   StorageItemSummary,
@@ -159,10 +176,15 @@ import type {
   TaskActivitySummary,
   TaskContextFileResponse,
   TaskContextResponse,
+  TaskHealthResponse,
+  TaskHealthRepairResponse,
   TaskLogResponse,
   TaskRunSummary,
   TerminalSessionSummary,
+  UploadAttachmentInput,
   UpdateQueuedMessageRequest,
+  UpdateSessionCompactionRequest,
+  UpdateSessionCompactionSettingsRequest,
   UpdateFileMountRequest,
   UpdateProjectRequest,
   UpdateProviderRequest,
@@ -182,10 +204,30 @@ import type {
 type TFunction = (key: TranslationKey) => string;
 type ToastTone = "info" | "success" | "error";
 type ToastState = { id: number; message: string; tone: ToastTone };
+type ComposerTarget = "prompt" | "room";
+type ComposerFileReference = {
+  id: string;
+  name: string;
+  path: string;
+  absolutePath: string;
+  kind: FileEntry["kind"];
+  sourceLabel: string;
+};
 const workspaceChangedEvent = "codex-workspace-changed";
 const taskActivityChangedEvent = "codex-task-activity-changed";
+const browserNotificationsEnabledKey = "codex-web-browser-notifications-enabled";
+const suppressedAppNotificationsKey = "codex-web-suppressed-app-notifications";
 
 const listenModeOptions: AgentListenMode[] = ["none", "passive", "active", "orchestrator"];
+
+function localStorageStringSet(key: string) {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) ?? "[]") as unknown;
+    return new Set(Array.isArray(value) ? value.map(String).filter(Boolean) : []);
+  } catch {
+    return new Set<string>();
+  }
+}
 
 function readableStatus(status: SessionSummary["status"] | undefined, t: TFunction) {
   if (status === "running") return t("session.statusRunning");
@@ -199,6 +241,14 @@ function readableSessionType(session: SessionSummary | undefined, t: TFunction) 
   if (session?.conversationType === "room") return t("session.typeRoom");
   if (session?.conversationType === "agent") return t("session.typeAgent");
   return t("session.typeCodex");
+}
+
+function readableNotificationEvent(type: NotificationEventType, t: TFunction) {
+  if (type === "task_completed") return t("session.notifyEventCompleted");
+  if (type === "task_failed") return t("session.notifyEventFailed");
+  if (type === "needs_approval") return t("session.notifyEventApproval");
+  if (type === "auth_login") return t("session.notifyEventLogin");
+  return type;
 }
 
 const storageItemTypeLabels: Record<StorageItemSummary["type"], TranslationKey> = {
@@ -324,6 +374,10 @@ function readablePermissionProfile(profile: PermissionProfileId | "custom" | nul
   return t("contacts.permissionProfileCustom");
 }
 
+function newestLinesFirst(log: string) {
+  return log.split(/\r?\n/).reverse().join("\n");
+}
+
 function localUserMessage(content: string): SessionMessage {
   return {
     id: `local-${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -333,14 +387,75 @@ function localUserMessage(content: string): SessionMessage {
   };
 }
 
+function attachmentListMarkdown(files: File[]) {
+  if (!files.length) return "";
+  return [
+    "## Attachments",
+    ...files.map((file, index) => `${index + 1}. ${file.name} (${formatBytes(file.size)})`),
+  ].join("\n");
+}
+
+function messageTextWithFiles(prompt: string, files: File[]) {
+  const attachmentList = attachmentListMarkdown(files);
+  return attachmentList ? `${prompt.trim()}\n\n${attachmentList}` : prompt.trim();
+}
+
+function fileReferencesMarkdown(references: ComposerFileReference[]) {
+  if (!references.length) return "";
+  return [
+    "## Referenced files and folders",
+    ...references.map((item, index) => `${index + 1}. ${item.kind}: ${item.absolutePath}`),
+  ].join("\n");
+}
+
+function promptWithFileReferences(prompt: string, references: ComposerFileReference[]) {
+  const referenceList = fileReferencesMarkdown(references);
+  return referenceList ? `${prompt.trim()}\n\n${referenceList}` : prompt.trim();
+}
+
+function messageTextWithContext(prompt: string, files: File[], references: ComposerFileReference[]) {
+  return promptWithFileReferences(messageTextWithFiles(prompt, files), references);
+}
+
+const maxComposerAttachmentFiles = 8;
+const maxComposerAttachmentBytes = 5 * 1024 * 1024;
+
+function fileToBase64(file: File) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("file_read_failed"));
+    reader.onload = () => {
+      const result = String(reader.result ?? "");
+      resolve(result.includes(",") ? result.slice(result.indexOf(",") + 1) : result);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function filesToAttachmentInputs(files: File[]): Promise<UploadAttachmentInput[]> {
+  return Promise.all(files.map(async (file) => ({
+    name: file.name,
+    type: file.type || null,
+    size: file.size,
+    dataBase64: await fileToBase64(file),
+  })));
+}
+
 function mergeMessages(...groups: SessionMessage[][]) {
-  const seen = new Set<string>();
+  const seenIds = new Set<string>();
+  const seenPersistedContent = new Set<string>();
   return groups
     .flat()
     .filter((message) => {
-      const key = message.id.startsWith("local-") ? `${message.role}:${message.content}` : message.id;
-      if (seen.has(key)) return false;
-      seen.add(key);
+      const contentKey = `${message.role}:${message.content}`;
+      if (message.id.startsWith("local-")) {
+        if (seenPersistedContent.has(contentKey)) return false;
+        seenPersistedContent.add(contentKey);
+        return true;
+      }
+      if (seenIds.has(message.id)) return false;
+      seenIds.add(message.id);
+      seenPersistedContent.add(contentKey);
       return true;
     })
     .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
@@ -412,6 +527,104 @@ const navItems: Array<{ page: Page; labelKey: TranslationKey; icon: React.Compon
   { page: "settings", labelKey: "nav.settings", icon: Settings },
 ];
 
+const NotificationCenterContext = React.createContext<React.ReactNode>(null);
+
+function NotificationCenter({
+  items,
+  unreadCount,
+  open,
+  permission,
+  browserNotificationsEnabled,
+  t,
+  onToggle,
+  onClose,
+  onMarkRead,
+  onClear,
+  onRequestBrowser,
+  onBrowserNotificationsEnabledChange,
+  onOpenSession,
+}: {
+  items: AppNotificationSummary[];
+  unreadCount: number;
+  open: boolean;
+  permission: NotificationPermission;
+  browserNotificationsEnabled: boolean;
+  t: TFunction;
+  onToggle: () => void;
+  onClose: () => void;
+  onMarkRead: (ids?: string[]) => void;
+  onClear: () => void;
+  onRequestBrowser: () => void;
+  onBrowserNotificationsEnabledChange: (enabled: boolean) => void;
+  onOpenSession: (sessionId: string) => void;
+}) {
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    function handlePointerDown(event: PointerEvent) {
+      if (rootRef.current?.contains(event.target as Node)) return;
+      onClose();
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+    }
+    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [onClose, open]);
+  return (
+    <div className="notification-center" ref={rootRef}>
+      <button className="notification-center-trigger" type="button" aria-label={t("notificationCenter.title")} title={t("notificationCenter.title")} onClick={onToggle}>
+        <Bell size={17} />
+        {unreadCount > 0 && <span className="notification-dot">{unreadCount > 99 ? "99+" : unreadCount}</span>}
+      </button>
+      {open && (
+        <section className="notification-center-panel">
+          <div className="notification-center-head">
+            <div>
+              <strong>{t("notificationCenter.title")}</strong>
+              <span>{unreadCount > 0 ? t("notificationCenter.unread").replace("{count}", String(unreadCount)) : t("notificationCenter.allRead")}</span>
+            </div>
+            <button className="ghost-button" type="button" onClick={() => onMarkRead()}>{t("notificationCenter.markAllRead")}</button>
+          </div>
+          <div className="notification-center-actions">
+            <label className="notification-browser-toggle">
+              <span>{t("notificationCenter.browserToggle")}</span>
+              <Switch checked={browserNotificationsEnabled} onCheckedChange={onBrowserNotificationsEnabledChange} />
+            </label>
+            {browserNotificationsEnabled && permission !== "granted" && <button className="ghost-button" type="button" onClick={onRequestBrowser}>{t("notificationCenter.enableBrowser")}</button>}
+            <button className="ghost-button danger-button" type="button" disabled={!items.length} onClick={onClear}>{t("notificationCenter.clear")}</button>
+          </div>
+          <div className="notification-center-list">
+            {items.map((item) => {
+              const canOpenSession = item.sourceType === "session" && Boolean(item.sourceId);
+              return (
+                <button
+                  className={`notification-center-item ${item.readAt ? "" : "unread"}`}
+                  key={item.id}
+                  type="button"
+                  onClick={() => {
+                    onMarkRead([item.id]);
+                    if (canOpenSession) onOpenSession(String(item.sourceId));
+                  }}
+                >
+                  <strong>{item.title}</strong>
+                  <span>{item.message}</span>
+                  <small>{item.eventType} · {item.severity} · {formatShortDate(item.createdAt)}</small>
+                </button>
+              );
+            })}
+            {!items.length && <div className="empty-state">{t("notificationCenter.empty")}</div>}
+          </div>
+        </section>
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [sessionToken, setSessionToken] = useState(() => localStorage.getItem("codex-web-session") ?? "");
   const [locale, setLocale] = useState<Locale>(() => detectInitialLocale());
@@ -444,6 +657,15 @@ function App() {
   const [sessionNavOpen, setSessionNavOpen] = useState(false);
   const [mainNavOpen, setMainNavOpen] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
+  const [appNotifications, setAppNotifications] = useState<AppNotificationSummary[]>([]);
+  const [appNotificationUnreadCount, setAppNotificationUnreadCount] = useState(0);
+  const [notificationCenterOpen, setNotificationCenterOpen] = useState(false);
+  const [browserNotificationsEnabled, setBrowserNotificationsEnabled] = useState(() => localStorage.getItem(browserNotificationsEnabledKey) !== "false");
+  const [browserNotificationPermission, setBrowserNotificationPermission] = useState<NotificationPermission>(() => typeof Notification === "undefined" ? "denied" : Notification.permission);
+  const appNotificationIdsRef = useRef<Set<string>>(new Set());
+  const appNotificationsReadyRef = useRef(false);
+  const suppressedAppNotificationIdsRef = useRef<Set<string>>(localStorageStringSet(suppressedAppNotificationsKey));
+  const pageActiveRef = useRef(typeof document === "undefined" ? false : document.visibilityState === "visible");
   const toastTimerRef = useRef<number | null>(null);
   const dialog = useAppDialog();
   const activeSession = activeSessionId ? sessions.find((session) => session.id === activeSessionId) : undefined;
@@ -485,9 +707,212 @@ function App() {
     toastTimerRef.current = window.setTimeout(() => setToast(null), 3600);
   }, []);
 
+  const notificationMatchesCurrentSession = useCallback((item: AppNotificationSummary) => {
+    const metadata = item.metadata ?? {};
+    const metadataSessionId = typeof metadata.sessionId === "string" ? metadata.sessionId : "";
+    const metadataRoomId = typeof metadata.roomId === "string" ? metadata.roomId : "";
+    return page === "sessions" && Boolean(activeSessionId) && (
+      item.sourceId === activeSessionId ||
+      metadataSessionId === activeSessionId ||
+      (Boolean(activeSession?.roomId) && metadataRoomId === activeSession?.roomId)
+    );
+  }, [activeSession?.roomId, activeSessionId, page]);
+
+  const shouldSuppressAppNotification = useCallback((item: AppNotificationSummary) => pageActiveRef.current && notificationMatchesCurrentSession(item), [notificationMatchesCurrentSession]);
+
+  function rememberSuppressedAppNotifications(ids: string[]) {
+    if (!ids.length) return;
+    const suppressed = suppressedAppNotificationIdsRef.current;
+    ids.forEach((id) => suppressed.add(id));
+    const trimmed = Array.from(suppressed).slice(-300);
+    suppressedAppNotificationIdsRef.current = new Set(trimmed);
+    localStorage.setItem(suppressedAppNotificationsKey, JSON.stringify(trimmed));
+  }
+
+  function markSuppressedAppNotificationsRead(ids: string[]) {
+    if (!ids.length || !sessionToken) return;
+    void fetch("/api/app-notifications/read", {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ ids }),
+    }).catch(() => undefined);
+  }
+
+  const pushBrowserNotification = useCallback((item: AppNotificationSummary) => {
+    if (!browserNotificationsEnabled) return;
+    if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    if (pageActiveRef.current) return;
+    if (notificationMatchesCurrentSession(item) && document.visibilityState === "visible") return;
+    try {
+      new Notification(item.title, {
+        body: item.message,
+        tag: item.id,
+      });
+    } catch {
+      // Browser notification support can be blocked by runtime policy.
+    }
+  }, [browserNotificationsEnabled, notificationMatchesCurrentSession]);
+
+  const applyAppNotifications = useCallback((result: AppNotificationsResponse, options: { desktop?: boolean } = {}) => {
+    const knownIds = appNotificationIdsRef.current;
+    const suppressedNow = result.items.filter((item) => !suppressedAppNotificationIdsRef.current.has(item.id) && shouldSuppressAppNotification(item));
+    if (suppressedNow.length) {
+      rememberSuppressedAppNotifications(suppressedNow.map((item) => item.id));
+      markSuppressedAppNotificationsRead(suppressedNow.filter((item) => !item.readAt).map((item) => item.id));
+    }
+    const suppressedIds = suppressedAppNotificationIdsRef.current;
+    const visibleItems = result.items.filter((item) => !suppressedIds.has(item.id));
+    const suppressedUnreadCount = result.items.filter((item) => suppressedIds.has(item.id) && !item.readAt).length;
+    const newUnread = visibleItems
+      .filter((item) => !knownIds.has(item.id) && !item.readAt)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    setAppNotifications(visibleItems);
+    setAppNotificationUnreadCount(Math.max(0, result.unreadCount - suppressedUnreadCount));
+    result.items.forEach((item) => knownIds.add(item.id));
+    if (options.desktop && appNotificationsReadyRef.current) newUnread.forEach(pushBrowserNotification);
+    appNotificationsReadyRef.current = true;
+  }, [pushBrowserNotification, sessionToken, shouldSuppressAppNotification]);
+
+  const loadAppNotifications = useCallback(async (options: { desktop?: boolean } = {}) => {
+    if (!sessionToken) return;
+    const response = await fetch("/api/app-notifications?limit=30", {
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    if (!response.ok) return;
+    const result = await response.json() as AppNotificationsResponse;
+    applyAppNotifications(result, options);
+  }, [applyAppNotifications, sessionToken]);
+
+  async function markAppNotificationsRead(ids?: string[]) {
+    const response = await fetch("/api/app-notifications/read", {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+      body: JSON.stringify(ids ? { ids } : { all: true }),
+    });
+    if (!response.ok) return;
+    const result = await response.json() as AppNotificationsResponse;
+    setAppNotifications(result.items);
+    setAppNotificationUnreadCount(result.unreadCount);
+  }
+
+  async function clearAppNotifications() {
+    const confirmed = await dialog.confirm({
+      title: t("notificationCenter.clearConfirm"),
+      message: t("notificationCenter.clearMessage"),
+      confirmLabel: t("notificationCenter.clear"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    const response = await fetch("/api/app-notifications", {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    if (!response.ok) return;
+    setAppNotifications([]);
+    setAppNotificationUnreadCount(0);
+  }
+
+  async function requestBrowserNotifications() {
+    if (typeof Notification === "undefined") {
+      notify(t("notificationCenter.browserUnsupported"), "error");
+      return;
+    }
+    const permission = await Notification.requestPermission();
+    setBrowserNotificationPermission(permission);
+    notify(permission === "granted" ? t("notificationCenter.browserGranted") : t("notificationCenter.browserDenied"), permission === "granted" ? "success" : "error");
+  }
+
+  function changeBrowserNotificationsEnabled(enabled: boolean) {
+    localStorage.setItem(browserNotificationsEnabledKey, enabled ? "true" : "false");
+    setBrowserNotificationsEnabled(enabled);
+    if (enabled && browserNotificationPermission !== "granted") void requestBrowserNotifications();
+  }
+
   useEffect(() => () => {
     if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
   }, []);
+
+  useEffect(() => {
+    function syncPageActive() {
+      if (document.visibilityState !== "visible") {
+        pageActiveRef.current = false;
+        return;
+      }
+      pageActiveRef.current = typeof document.hasFocus === "function" ? document.hasFocus() : true;
+    }
+    function handleFocus() {
+      pageActiveRef.current = document.visibilityState === "visible";
+    }
+    function handleBlur() {
+      pageActiveRef.current = false;
+    }
+    syncPageActive();
+    window.addEventListener("focus", handleFocus);
+    window.addEventListener("blur", handleBlur);
+    document.addEventListener("visibilitychange", syncPageActive);
+    return () => {
+      window.removeEventListener("focus", handleFocus);
+      window.removeEventListener("blur", handleBlur);
+      document.removeEventListener("visibilitychange", syncPageActive);
+    };
+  }, []);
+
+  useEffect(() => {
+    appNotificationsReadyRef.current = false;
+    appNotificationIdsRef.current = new Set();
+    if (!sessionToken) return;
+    let source: EventSource | null = null;
+    let reconnectTimer: number | null = null;
+    let reconnectDelay = 2500;
+    let closed = false;
+    const eventUrl = `/api/app-notifications/events?${new URLSearchParams({ token: sessionToken })}`;
+    const connect = () => {
+      if (closed) return;
+      source?.close();
+      source = new EventSource(eventUrl);
+      source.addEventListener("snapshot", (event) => {
+        reconnectDelay = 2500;
+        const result = JSON.parse((event as MessageEvent).data) as AppNotificationStreamEvent;
+        if (result.type === "snapshot") applyAppNotifications(result, { desktop: true });
+      });
+      source.addEventListener("notification", (event) => {
+        reconnectDelay = 2500;
+        const result = JSON.parse((event as MessageEvent).data) as AppNotificationStreamEvent;
+        if (result.type !== "notification") return;
+        const knownIds = appNotificationIdsRef.current;
+        if (shouldSuppressAppNotification(result.notification)) {
+          rememberSuppressedAppNotifications([result.notification.id]);
+          if (!result.notification.readAt) markSuppressedAppNotificationsRead([result.notification.id]);
+          knownIds.add(result.notification.id);
+          appNotificationsReadyRef.current = true;
+          return;
+        }
+        if (suppressedAppNotificationIdsRef.current.has(result.notification.id)) return;
+        const isNewUnread = !knownIds.has(result.notification.id) && !result.notification.readAt;
+        setAppNotifications((items) => [result.notification, ...items.filter((item) => item.id !== result.notification.id)].slice(0, 30));
+        setAppNotificationUnreadCount(result.unreadCount);
+        knownIds.add(result.notification.id);
+        if (isNewUnread && appNotificationsReadyRef.current) pushBrowserNotification(result.notification);
+        appNotificationsReadyRef.current = true;
+      });
+      source.addEventListener("ping", () => {
+        reconnectDelay = 2500;
+      });
+      source.onerror = () => {
+        source?.close();
+        if (closed) return;
+        const delay = reconnectDelay;
+        reconnectDelay = Math.min(Math.round(reconnectDelay * 1.6), 15_000);
+        reconnectTimer = window.setTimeout(connect, delay);
+      };
+    };
+    connect();
+    return () => {
+      closed = true;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      source?.close();
+    };
+  }, [applyAppNotifications, pushBrowserNotification, sessionToken, shouldSuppressAppNotification]);
 
   const resetToLogin = useCallback((nextAuth?: AuthState) => {
     localStorage.removeItem("codex-web-session");
@@ -598,12 +1023,14 @@ function App() {
     });
   }, []);
 
-  async function createCodexTask(prompt: string, projectId: string | null, providerId: string | null, model: string | null) {
+  async function createCodexTask(prompt: string, projectId: string | null, providerId: string | null, model: string | null, ephemeralNotifications?: CreateCodexTaskRequest["ephemeralNotifications"], attachments?: UploadAttachmentInput[], displayPrompt = prompt) {
     const body: CreateCodexTaskRequest = {
       prompt,
       projectId,
       providerId,
       model,
+      ephemeralNotifications,
+      attachments,
     };
     const response = await fetch("/api/codex/tasks", {
       method: "POST",
@@ -620,7 +1047,7 @@ function App() {
       ...items,
       [session.id]: {
         session,
-        messages: [localUserMessage(prompt)],
+        messages: [localUserMessage(displayPrompt)],
         output: "",
         exitCode: null,
       },
@@ -644,8 +1071,8 @@ function App() {
     setSessions((items) => items.map((item) => item.id === nextSession.id ? nextSession : item));
   }
 
-  async function continueCodexTask(sessionId: string, prompt: string, providerId: string | null, model: string | null, replyToMessageId?: string | null) {
-    const body: ContinueCodexTaskRequest = { prompt, providerId, model, replyToMessageId };
+  async function continueCodexTask(sessionId: string, prompt: string, providerId: string | null, model: string | null, replyToMessageId?: string | null, attachments?: UploadAttachmentInput[], displayPrompt = prompt) {
+    const body: ContinueCodexTaskRequest = { prompt, providerId, model, replyToMessageId, attachments };
     const response = await fetch(`/api/codex/tasks/${sessionId}/messages`, {
       method: "POST",
       headers: {
@@ -666,7 +1093,7 @@ function App() {
     }
     setOptimisticMessages((items) => ({
       ...items,
-      [sessionId]: [...(items[sessionId] ?? []), localUserMessage(prompt)],
+      [sessionId]: [...(items[sessionId] ?? []), localUserMessage(displayPrompt)],
     }));
     const nextSession = (await response.json()) as SessionSummary;
     setSessions((items) => items.map((item) => item.id === nextSession.id ? nextSession : item));
@@ -802,7 +1229,29 @@ function App() {
     );
   }
 
+  const notificationCenterNode = (
+    <NotificationCenter
+      items={appNotifications}
+      unreadCount={appNotificationUnreadCount}
+      open={notificationCenterOpen}
+      permission={browserNotificationPermission}
+      browserNotificationsEnabled={browserNotificationsEnabled}
+      t={t}
+      onToggle={() => {
+        setNotificationCenterOpen((value) => !value);
+        void loadAppNotifications();
+      }}
+      onClose={() => setNotificationCenterOpen(false)}
+      onMarkRead={(ids) => void markAppNotificationsRead(ids)}
+      onClear={() => void clearAppNotifications()}
+      onRequestBrowser={() => void requestBrowserNotifications()}
+      onBrowserNotificationsEnabledChange={changeBrowserNotificationsEnabled}
+      onOpenSession={navigateSession}
+    />
+  );
+
   return (
+    <NotificationCenterContext.Provider value={notificationCenterNode}>
     <div className={`app ${page === "sessions" ? "task-layout" : "wide-layout"}`}>
       {dialog.node}
       <ToastViewport toast={toast} onClose={() => setToast(null)} t={t} />
@@ -872,7 +1321,12 @@ function App() {
       )}
       {page === "sessions" && (routeSessionPending ? <SessionLoadingPage t={t} onOpenMainNav={() => setMainNavOpen(true)} onOpenSessionNav={() => setSessionNavOpen(true)} /> : <SessionPage sessionToken={sessionToken} t={t} notify={notify} session={activeSession} project={activeSession ? projects.find((project) => project.id === activeSession.projectId) : projects.find((project) => project.id === draftTaskProjectId)} projects={projects} draftProjectId={draftTaskProjectId} onDraftProjectId={setDraftTaskProjectId} providers={providers} selectedProviderId={selectedProviderId} onSelectProvider={setSelectedProviderId} taskDetail={activeSession ? taskDetails[activeSession.id] : undefined} optimisticMessages={activeSession ? optimisticMessages[activeSession.id] ?? [] : []} queuedMessages={activeSession ? messageQueues[activeSession.id] ?? [] : []} onQueueChange={(sessionId, queue) => setMessageQueues((items) => ({ ...items, [sessionId]: queue }))} onTaskDetail={handleTaskDetail} onSubmitTask={createCodexTask} onContinueTask={continueCodexTask} onRecoverTask={recoverCodexTask} onUpdateQueuedMessage={updateQueuedMessage} onDeleteQueuedMessage={deleteQueuedMessage} onStopTask={stopCodexTask} onDeleteSession={deleteSession} onSessionUpdated={(nextSession) => setSessions((items) => items.map((item) => item.id === nextSession.id ? nextSession : item))} onOpenSession={navigateSession} onOpenMainNav={() => setMainNavOpen(true)} onOpenSessionNav={() => setSessionNavOpen(true)} />)}
       {page === "sessions" && <ContextPanel sessionToken={sessionToken} session={activeSession} t={t} onOpenFile={(path) => {
-        window.location.hash = `files?${new URLSearchParams({ path })}`;
+        const params = new URLSearchParams({ path });
+        if (activeSession?.workspacePath) {
+          params.set("rootPath", activeSession.workspacePath);
+          params.set("mountName", activeSession.title || "Session Workspace");
+        }
+        window.location.hash = `files?${params}`;
         setPage("files");
       }} />}
       {page === "files" && <FilesPage sessionToken={sessionToken} t={t} onOpenMainNav={() => setMainNavOpen(true)} />}
@@ -900,12 +1354,13 @@ function App() {
       {page === "automations" && <AutomationsPage sessionToken={sessionToken} automations={automations} projects={projects} providers={providers} onChange={loadAppData} onOpenSession={navigateSession} title={t("nav.automations")} t={t} notify={notify} onOpenMainNav={() => setMainNavOpen(true)} />}
       {page === "providers" && <ProvidersPage sessionToken={sessionToken} providers={providers} onChange={loadAppData} t={t} notify={notify} onOpenMainNav={() => setMainNavOpen(true)} />}
       {page === "approvals" && <ApprovalsPage sessionToken={sessionToken} t={t} notify={notify} onPendingChange={setPendingApprovalsCount} onOpenMainNav={() => setMainNavOpen(true)} />}
-      {page === "settings" && <SettingsPage sessionToken={sessionToken} t={t} onOpenMainNav={() => setMainNavOpen(true)} onSessionRefresh={(token, nextAuth) => {
+      {page === "settings" && <SettingsPage sessionToken={sessionToken} t={t} onOpenSession={navigateSession} onOpenMainNav={() => setMainNavOpen(true)} onSessionRefresh={(token, nextAuth) => {
         localStorage.setItem("codex-web-session", token);
         setSessionToken(token);
         setAuth(nextAuth);
       }} onLogout={() => resetToLogin()} notify={notify} />}
     </div>
+    </NotificationCenterContext.Provider>
   );
 }
 
@@ -1051,6 +1506,7 @@ function MobileSessionToggle({ label, onClick }: { label: string; onClick?: () =
 }
 
 function SessionLoadingPage({ t, onOpenMainNav, onOpenSessionNav }: { t: TFunction; onOpenMainNav?: () => void; onOpenSessionNav?: () => void }) {
+  const notificationCenter = React.useContext(NotificationCenterContext);
   return (
     <main className="conversation">
       <header className="task-header page-header">
@@ -1062,6 +1518,7 @@ function SessionLoadingPage({ t, onOpenMainNav, onOpenSessionNav }: { t: TFuncti
             <div className="task-path">{t("session.loadingHint")}</div>
           </div>
         </div>
+        {notificationCenter && <div className="header-actions session-actions">{notificationCenter}</div>}
       </header>
       <div className="mobile-session-bar">
         <MobileSessionToggle label={t("session.sessionList")} onClick={onOpenSessionNav} />
@@ -1118,8 +1575,8 @@ function SessionPage({
   queuedMessages: QueuedMessage[];
   onQueueChange: (sessionId: string, queue: QueuedMessage[]) => void;
   onTaskDetail: (detail: CodexTaskDetail) => void;
-  onSubmitTask: (prompt: string, projectId: string | null, providerId: string | null, model: string | null) => Promise<void>;
-  onContinueTask: (sessionId: string, prompt: string, providerId: string | null, model: string | null, replyToMessageId?: string | null) => Promise<void>;
+  onSubmitTask: (prompt: string, projectId: string | null, providerId: string | null, model: string | null, ephemeralNotifications?: CreateCodexTaskRequest["ephemeralNotifications"], attachments?: UploadAttachmentInput[], displayPrompt?: string) => Promise<void>;
+  onContinueTask: (sessionId: string, prompt: string, providerId: string | null, model: string | null, replyToMessageId?: string | null, attachments?: UploadAttachmentInput[], displayPrompt?: string) => Promise<void>;
   onRecoverTask: (sessionId: string, prompt: string, providerId: string | null, model: string | null) => Promise<void>;
   onUpdateQueuedMessage: (sessionId: string, queueId: string, prompt: string, providerId: string | null, model: string | null, replyToMessageId?: string | null) => Promise<void>;
   onDeleteQueuedMessage: (sessionId: string, queueId: string) => Promise<void>;
@@ -1170,6 +1627,34 @@ function SessionPage({
   const [roomMessageMode, setRoomMessageMode] = useState<"sse" | "polling">(() => readLocalStorageValue("codex-web-room-message-mode", "sse") === "polling" ? "polling" : "sse");
   const [roomDisplayName, setRoomDisplayName] = useState("");
   const [replyTarget, setReplyTarget] = useState<SessionMessage | null>(null);
+  const [compactingMemory, setCompactingMemory] = useState(false);
+  const [slashMenuTarget, setSlashMenuTarget] = useState<"prompt" | "room" | null>(null);
+  const [slashMenuIndex, setSlashMenuIndex] = useState(0);
+  const [slashMenuQuery, setSlashMenuQuery] = useState("");
+  const [slashTokenRange, setSlashTokenRange] = useState<{ target: "prompt" | "room"; start: number; end: number } | null>(null);
+  const [promptAttachments, setPromptAttachments] = useState<File[]>([]);
+  const [roomAttachments, setRoomAttachments] = useState<File[]>([]);
+  const [promptFileReferences, setPromptFileReferences] = useState<ComposerFileReference[]>([]);
+  const [roomFileReferences, setRoomFileReferences] = useState<ComposerFileReference[]>([]);
+  const [fileReferencePicker, setFileReferencePicker] = useState<{
+    target: ComposerTarget;
+    rootPath: string;
+    sourceLabel: string;
+    list: FileListResponse | null;
+  } | null>(null);
+  const [taskTemplateTarget, setTaskTemplateTarget] = useState<ComposerTarget | null>(null);
+  const [agentPickerOpen, setAgentPickerOpen] = useState(false);
+  const [notifyBuilderOpen, setNotifyBuilderOpen] = useState(false);
+  const [notifySettings, setNotifySettings] = useState<NotificationSettingsResponse | null>(null);
+  const [notifyEventType, setNotifyEventType] = useState<NotificationEventType>("task_completed");
+  const [notifyChannelKind, setNotifyChannelKind] = useState<NotificationRecipientSummary["kind"]>("email");
+  const [notifyRecipientId, setNotifyRecipientId] = useState("");
+  const [notifySenderAccountId, setNotifySenderAccountId] = useState("");
+  const [sessionNotifyRules, setSessionNotifyRules] = useState<Array<{ id: string; eventType: NotificationEventType; recipientName: string; recipientId: string; senderAccountId?: string; persisted: boolean }>>([]);
+  const promptFileInputRef = useRef<HTMLInputElement | null>(null);
+  const roomFileInputRef = useRef<HTMLInputElement | null>(null);
+  const promptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const roomTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   useEffect(() => {
     try {
       localStorage.setItem("codex-web-room-message-mode", roomMessageMode);
@@ -1177,6 +1662,12 @@ function SessionPage({
       // ignore storage failures
     }
   }, [roomMessageMode]);
+  useEffect(() => {
+    setSessionNotifyRules([]);
+    setPromptFileReferences([]);
+    setRoomFileReferences([]);
+    setFileReferencePicker(null);
+  }, [draftProjectId, session?.id]);
   const timelineRef = useRef<HTMLElement | null>(null);
   const skipNextTimelineScrollRef = useRef(false);
   const onQueueChangeRef = useRef(onQueueChange);
@@ -1205,6 +1696,10 @@ function SessionPage({
   const visibleMessages = session
     ? mergeMessages(persistedMessages.length ? persistedMessages : fallbackMessages, optimisticMessages)
     : draftSubmittedMessages;
+  const notifyRecipients = (notifySettings?.recipients ?? []).filter((recipient) => recipient.enabled);
+  const notifyRecipientKinds = [...new Set(notifyRecipients.map((recipient) => recipient.kind))];
+  const filteredNotifyRecipients = notifyRecipients.filter((recipient) => recipient.kind === notifyChannelKind);
+  const notifySenders = (notifySettings?.accounts ?? []).filter((account) => account.enabled && account.channelKind === notifyChannelKind);
   function displayMessage(message: SessionMessage) {
     if (isRoomSession && message.role === "assistant") {
       const match = message.content.match(/^([^:\n]{1,80}):\n([\s\S]*)$/);
@@ -1277,6 +1772,7 @@ function SessionPage({
 
   useEffect(() => {
     if (session) setDraftSubmittedMessages([]);
+    setSessionNotifyRules([]);
     setRoomDisplayName("");
     setReplyTarget(null);
   }, [session?.id]);
@@ -1590,12 +2086,16 @@ function SessionPage({
         publishWorkspaceChanged(data.session.id);
         publishTaskActivityChanged(data.session.id);
         void loadTaskRuns();
+        void loadMessages(false, true);
+        setSessionNotifyRules((items) => items.filter((rule) => rule.eventType !== (data.exitCode === 0 ? "task_completed" : "task_failed")));
         mergeDetail(data.session, [], data.exitCode);
       }
       if (data.type === "error") {
         setLiveStatus(`${t("session.failed")}：${data.error}`);
         publishTaskActivityChanged(data.session.id);
         void loadTaskRuns();
+        void loadMessages(false, true);
+        setSessionNotifyRules((items) => items.filter((rule) => rule.eventType !== "task_failed"));
         mergeDetail(data.session);
       }
     };
@@ -1657,6 +2157,419 @@ function SessionPage({
     setRoomMessage((current) => `${current}${current && !current.endsWith(" ") ? " " : ""}${roomMentionToken(value)} `);
   }
 
+  function insertComposerText(target: ComposerTarget, text: string) {
+    const update = (current: string) => `${current}${current.trim() ? "\n\n" : ""}${text}`;
+    if (target === "room") setRoomMessage(update);
+    else setPrompt(update);
+    window.setTimeout(() => {
+      const node = target === "room" ? roomTextareaRef.current : promptTextareaRef.current;
+      node?.focus();
+      const value = target === "room" ? roomTextareaRef.current?.value ?? "" : promptTextareaRef.current?.value ?? "";
+      node?.setSelectionRange(value.length, value.length);
+    }, 0);
+  }
+
+  const taskTemplates = [
+    { id: "fix", title: t("session.taskTemplateFix"), prompt: t("session.taskTemplateFixPrompt") },
+    { id: "review", title: t("session.taskTemplateReview"), prompt: t("session.taskTemplateReviewPrompt") },
+    { id: "test", title: t("session.taskTemplateTest"), prompt: t("session.taskTemplateTestPrompt") },
+    { id: "refactor", title: t("session.taskTemplateRefactor"), prompt: t("session.taskTemplateRefactorPrompt") },
+    { id: "docs", title: t("session.taskTemplateDocs"), prompt: t("session.taskTemplateDocsPrompt") },
+  ];
+
+  function insertTaskTemplate(template: { prompt: string }) {
+    if (!taskTemplateTarget) return;
+    insertComposerText(taskTemplateTarget, template.prompt);
+    setTaskTemplateTarget(null);
+  }
+
+  function composerReferenceRoot() {
+    if (session?.workspacePath) {
+      return { rootPath: session.workspacePath, sourceLabel: pageSessionTitle ?? session.title };
+    }
+    const projectRoot = project?.workspacePath ?? selectedComposerProject?.workspacePath;
+    if (projectRoot) {
+      return { rootPath: projectRoot, sourceLabel: composerProjectName };
+    }
+    return null;
+  }
+
+  async function loadFileReferencePicker(path = ".", target: ComposerTarget = fileReferencePicker?.target ?? "prompt") {
+    const root = fileReferencePicker && fileReferencePicker.target === target
+      ? { rootPath: fileReferencePicker.rootPath, sourceLabel: fileReferencePicker.sourceLabel }
+      : composerReferenceRoot();
+    if (!root) {
+      notify(t("session.commandFileNeedsWorkspace"), "error");
+      return;
+    }
+    setFileReferencePicker((current) => ({
+      target,
+      rootPath: root.rootPath,
+      sourceLabel: root.sourceLabel,
+      list: current?.rootPath === root.rootPath && current.target === target ? current.list : null,
+    }));
+    const response = await fetch(`/api/files?${new URLSearchParams({ rootPath: root.rootPath, path })}`, {
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    if (!response.ok) {
+      notify(t("session.commandFileReadFailed"), "error");
+      return;
+    }
+    const list = (await response.json()) as FileListResponse;
+    setFileReferencePicker({ target, rootPath: root.rootPath, sourceLabel: root.sourceLabel, list });
+  }
+
+  function openFileReferencePicker(target: ComposerTarget) {
+    void loadFileReferencePicker(".", target);
+  }
+
+  function addFileReference(entry?: FileEntry) {
+    if (!fileReferencePicker?.list) return;
+    const list = fileReferencePicker.list;
+    const itemPath = entry?.path ?? list.path;
+    const kind = entry?.kind ?? "directory";
+    const name = entry?.name ?? (itemPath === "." ? fileReferencePicker.sourceLabel : itemPath.split("/").at(-1) ?? itemPath);
+    const absolutePath = itemPath === "."
+      ? fileReferencePicker.rootPath
+      : `${fileReferencePicker.rootPath.replace(/\/+$/, "")}/${itemPath.replace(/^\/+/, "")}`;
+    const reference: ComposerFileReference = {
+      id: `${fileReferencePicker.rootPath}:${itemPath}:${Date.now()}`,
+      name,
+      path: itemPath,
+      absolutePath,
+      kind,
+      sourceLabel: fileReferencePicker.sourceLabel,
+    };
+    const update = (items: ComposerFileReference[]) => items.some((item) => item.absolutePath === reference.absolutePath)
+      ? items
+      : [...items, reference];
+    if (fileReferencePicker.target === "room") setRoomFileReferences(update);
+    else setPromptFileReferences(update);
+    setFileReferencePicker(null);
+  }
+
+  async function loadNotifySettings() {
+    const response = await fetch("/api/notifications", { headers: { authorization: `Bearer ${sessionToken}` } });
+    if (!response.ok) return null;
+    const settings = await response.json() as NotificationSettingsResponse;
+    setNotifySettings(settings);
+    const firstRecipient = settings.recipients.find((recipient) => recipient.enabled);
+    if (firstRecipient) {
+      setNotifyChannelKind(firstRecipient.kind);
+      setNotifyRecipientId(firstRecipient.id);
+    }
+    return settings;
+  }
+
+  async function openNotifyBuilder() {
+    const settings = notifySettings ?? await loadNotifySettings();
+    const firstRecipient = settings?.recipients.find((recipient) => recipient.enabled);
+    if (!firstRecipient) {
+      notify(t("session.commandNotifyNoRecipients"), "error");
+      return;
+    }
+    setNotifyBuilderOpen(true);
+  }
+
+  async function createNotifyRule(event: React.FormEvent) {
+    event.preventDefault();
+    if (!notifyRecipientId) return;
+    const recipient = notifyRecipients.find((item) => item.id === notifyRecipientId);
+    let persisted = false;
+    let id = `local-${Date.now()}`;
+    if (session?.id) {
+      const response = await fetch("/api/notifications/ephemeral-rules", {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          scopeType: "session",
+          scopeId: session.id,
+          eventTypes: [notifyEventType],
+          targets: [{ recipientId: notifyRecipientId, senderAccountId: notifySenderAccountId || undefined }],
+          expireMode: "after_trigger",
+        }),
+      });
+      if (!response.ok) {
+        notify(t("session.commandNotifyCreateFailed"), "error");
+        return;
+      }
+      const result = await response.json().catch(() => null) as { id?: string } | null;
+      id = result?.id ?? id;
+      persisted = true;
+    }
+    setSessionNotifyRules((items) => [
+      ...items,
+      { id, eventType: notifyEventType, recipientName: recipient?.name ?? notifyRecipientId, recipientId: notifyRecipientId, senderAccountId: notifySenderAccountId || undefined, persisted },
+    ]);
+    setNotifyBuilderOpen(false);
+    notify(t("session.commandNotifyCreated"), "success");
+  }
+
+  const slashCommands = [
+    {
+      id: "file",
+      command: "/file",
+      icon: Files,
+      title: t("session.commandFile"),
+      description: t("session.commandFileHelp"),
+      disabled: !composerReferenceRoot(),
+      run: (target: ComposerTarget) => {
+        openFileReferencePicker(target);
+      },
+    },
+    {
+      id: "preview",
+      command: "/preview",
+      icon: Globe,
+      title: t("session.commandPreview"),
+      description: t("session.commandPreviewHelp"),
+      disabled: !session,
+      run: () => {
+        void openSessionPreviews();
+      },
+    },
+    {
+      id: "task",
+      command: "/task",
+      icon: Send,
+      title: t("session.commandTask"),
+      description: t("session.commandTaskHelp"),
+      run: (target: ComposerTarget) => {
+        setTaskTemplateTarget(target);
+      },
+    },
+    {
+      id: "context",
+      command: "/context",
+      icon: FolderGit2,
+      title: t("session.commandContext"),
+      description: t("session.commandContextHelp"),
+      disabled: !session,
+      run: () => {
+        void openTaskContext();
+      },
+    },
+    {
+      id: "agent",
+      command: "/agent",
+      icon: Bot,
+      title: t("session.commandAgent"),
+      description: t("session.commandAgentHelp"),
+      disabled: !isRoomSession,
+      run: () => {
+        setAgentPickerOpen(true);
+      },
+    },
+    {
+      id: "notify",
+      command: "/notify",
+      icon: Bell,
+      title: t("session.commandNotify"),
+      description: t("session.commandNotifyHelp"),
+      run: () => {
+        void openNotifyBuilder();
+      },
+    },
+    {
+      id: "stop",
+      command: "/stop",
+      icon: Square,
+      title: t("session.commandStop"),
+      description: t("session.commandStopHelp"),
+      disabled: !session || !taskRunning,
+      run: () => {
+        if (session) void onStopTask(session.id);
+      },
+    },
+    {
+      id: "new",
+      command: "/new",
+      icon: RotateCcw,
+      title: t("session.commandNew"),
+      description: t("session.commandNewHelp"),
+      run: (target: "prompt" | "room") => {
+        if (target === "room") setRoomMessage("");
+        else setPrompt("");
+        setReplyTarget(null);
+      },
+    },
+    {
+      id: "compact",
+      command: "/compact",
+      icon: Boxes,
+      title: t("session.commandCompact"),
+      description: t("session.commandCompactHelp"),
+      disabled: !session || compactingMemory,
+      run: () => {
+        void compactSessionMemory();
+      },
+    },
+  ];
+
+  function commandMatches(value: string) {
+    const query = value.toLowerCase();
+    if (!query.startsWith("/")) return [];
+    return slashCommands.filter((item) => item.command.toLowerCase().startsWith(query) || item.title.toLowerCase().includes(query.slice(1)));
+  }
+
+  function activeSlashCommands(target: "prompt" | "room") {
+    return slashMenuTarget === target ? commandMatches(slashMenuQuery) : [];
+  }
+
+  function closeSlashMenu() {
+    setSlashMenuTarget(null);
+    setSlashMenuIndex(0);
+    setSlashMenuQuery("");
+    setSlashTokenRange(null);
+  }
+
+  function replaceActiveSlashToken(target: "prompt" | "room", replacement = "") {
+    if (!slashTokenRange || slashTokenRange.target !== target) return;
+    const value = target === "room" ? roomMessage : prompt;
+    const before = value.slice(0, slashTokenRange.start);
+    const after = value.slice(slashTokenRange.end);
+    const next = `${before}${replacement}${after}`.replace(/[ \t]{2,}/g, " ");
+    if (target === "room") setRoomMessage(next);
+    else setPrompt(next);
+    window.setTimeout(() => {
+      const node = target === "room" ? roomTextareaRef.current : promptTextareaRef.current;
+      const cursor = Math.max(0, before.length + replacement.length);
+      node?.focus();
+      node?.setSelectionRange(cursor, cursor);
+    }, 0);
+  }
+
+  function runSlashCommand(target: "prompt" | "room", command = activeSlashCommands(target)[slashMenuIndex]) {
+    if (!command || command.disabled) return;
+    replaceActiveSlashToken(target, "");
+    command.run(target);
+    closeSlashMenu();
+  }
+
+  function handleSlashKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>, target: "prompt" | "room") {
+    const commands = slashMenuTarget === target ? activeSlashCommands(target) : [];
+    if (!commands.length) return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setSlashMenuIndex((index) => Math.min(commands.length - 1, index + 1));
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setSlashMenuIndex((index) => Math.max(0, index - 1));
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      runSlashCommand(target, commands[slashMenuIndex]);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      closeSlashMenu();
+    }
+  }
+
+  function updateComposerValue(target: "prompt" | "room", value: string, cursor = value.length) {
+    if (target === "room") setRoomMessage(value);
+    else setPrompt(value);
+    const beforeCursor = value.slice(0, cursor);
+    const match = beforeCursor.match(/(^|\s)(\/[^\s]*)$/);
+    if (!match || match.index === undefined) {
+      if (slashMenuTarget === target) closeSlashMenu();
+      return;
+    }
+    const query = match[2] ?? "";
+    const start = match.index + (match[1]?.length ?? 0);
+    setSlashMenuTarget(target);
+    setSlashMenuQuery(query);
+    setSlashTokenRange({ target, start, end: cursor });
+    setSlashMenuIndex(0);
+  }
+
+  function addComposerFiles(target: "prompt" | "room", files: FileList | null) {
+    const current = target === "room" ? roomAttachments : promptAttachments;
+    const next = Array.from(files ?? []).filter((file) => {
+      if (file.size <= maxComposerAttachmentBytes) return true;
+      notify(t("session.attachmentTooLarge").replace("{name}", file.name).replace("{size}", formatBytes(maxComposerAttachmentBytes)), "error");
+      return false;
+    });
+    if (!next.length) return;
+    if (current.length + next.length > maxComposerAttachmentFiles) {
+      notify(t("session.attachmentTooMany").replace("{count}", String(maxComposerAttachmentFiles)), "error");
+      next.splice(Math.max(0, maxComposerAttachmentFiles - current.length));
+    }
+    if (!next.length) return;
+    if (target === "room") setRoomAttachments((current) => [...current, ...next]);
+    else setPromptAttachments((current) => [...current, ...next]);
+  }
+
+  function removeComposerFile(target: "prompt" | "room", index: number) {
+    const removeAt = (items: File[]) => items.filter((_, itemIndex) => itemIndex !== index);
+    if (target === "room") setRoomAttachments(removeAt);
+    else setPromptAttachments(removeAt);
+  }
+
+  function removeFileReference(target: ComposerTarget, id: string) {
+    const remove = (items: ComposerFileReference[]) => items.filter((item) => item.id !== id);
+    if (target === "room") setRoomFileReferences(remove);
+    else setPromptFileReferences(remove);
+  }
+
+  function renderComposerAttachments(target: "prompt" | "room") {
+    const files = target === "room" ? roomAttachments : promptAttachments;
+    const references = target === "room" ? roomFileReferences : promptFileReferences;
+    if (!files.length && !references.length && !sessionNotifyRules.length) return null;
+    return (
+      <div className="composer-attachments">
+        {sessionNotifyRules.map((rule) => (
+          <span className="composer-attachment notification-intent-chip" key={rule.id}>
+            <Bell size={14} />
+            <span>{readableNotificationEvent(rule.eventType, t)}{" -> "}{rule.recipientName}</span>
+          </span>
+        ))}
+        {files.map((file, index) => (
+          <span className="composer-attachment" key={`${file.name}-${file.size}-${index}`}>
+            <span>{file.name}</span>
+            <small>{formatBytes(file.size)}</small>
+            <button className="icon-only" type="button" title={t("action.delete")} aria-label={t("action.delete")} onClick={() => removeComposerFile(target, index)}><X size={14} /></button>
+          </span>
+        ))}
+        {references.map((reference) => (
+          <span className="composer-attachment file-reference-chip" key={reference.id} title={reference.absolutePath}>
+            <Files size={14} />
+            <span>{reference.name}</span>
+            <small>{reference.kind === "directory" ? t("file.directoryShort") : reference.sourceLabel}</small>
+            <button className="icon-only" type="button" title={t("action.delete")} aria-label={t("action.delete")} onClick={() => removeFileReference(target, reference.id)}><X size={14} /></button>
+          </span>
+        ))}
+      </div>
+    );
+  }
+
+  function renderSlashCommandMenu(target: "prompt" | "room") {
+    const commands = activeSlashCommands(target);
+    if (slashMenuTarget !== target || !commands.length) return null;
+    return (
+      <div className="slash-command-menu" role="listbox" aria-label={t("session.commandMenuTitle")}>
+        <div className="slash-command-title">{t("session.commandMenuTitle")}</div>
+        {commands.map((item, index) => {
+          const Icon = item.icon;
+          return (
+            <button
+              className={`slash-command-item ${index === slashMenuIndex ? "active" : ""}`}
+              type="button"
+              disabled={item.disabled}
+              key={item.id}
+              onMouseEnter={() => setSlashMenuIndex(index)}
+              onClick={() => runSlashCommand(target, item)}
+            >
+              <span className="slash-command-icon"><Icon size={18} /></span>
+              <span className="slash-command-copy">
+                <strong>{item.command}</strong>
+                <span>{item.description}</span>
+              </span>
+            </button>
+          );
+        })}
+      </div>
+    );
+  }
+
   function replaceActiveRoomMention(value: string) {
     setRoomMessage((current) => {
       const match = current.match(/(^|\s)@(?:"([^"]*)|([^\s@]*))$/);
@@ -1673,19 +2586,30 @@ function SessionPage({
 
   async function submitRoomMessage(event: React.FormEvent) {
     event.preventDefault();
-    if (!session?.roomId || !roomMessage.trim()) return;
-    const content = roomMessage.trim();
+    if (!session?.roomId || (!roomMessage.trim() && !roomAttachments.length && !roomFileReferences.length)) return;
+    const content = promptWithFileReferences(roomMessage.trim() || t("session.attachmentOnlyPrompt"), roomFileReferences);
+    const attachments = await filesToAttachmentInputs(roomAttachments).catch(() => null);
+    if (roomAttachments.length && !attachments) {
+      notify(t("session.attachmentReadFailed"), "error");
+      return;
+    }
     const response = await fetch(`/api/rooms/${session.roomId}/messages`, {
       method: "POST",
       headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
-      body: JSON.stringify({ content, sessionId: session.id, replyToMessageId: replyTarget?.id ?? null }),
+      body: JSON.stringify({ content, sessionId: session.id, replyToMessageId: replyTarget?.id ?? null, attachments: attachments ?? undefined }),
     });
-    if (!response.ok) return;
+    if (!response.ok) {
+      notify(t("session.attachmentUploadFailed"), "error");
+      return;
+    }
     const result = (await response.json()) as CreateRoomMessageResponse;
+    const displayContent = messageTextWithContext(roomMessage.trim() || t("session.attachmentOnlyPrompt"), roomAttachments, roomFileReferences);
     const nextMessage = result.message
       ? { ...result.message, replyTo: replyTarget ? { id: replyTarget.id, role: replyTarget.role, content: replyTarget.content } : result.message.replyTo }
-      : { ...localUserMessage(content), replyToMessageId: replyTarget?.id ?? null, replyTo: replyTarget ? { id: replyTarget.id, role: replyTarget.role, content: replyTarget.content } : null };
+      : { ...localUserMessage(displayContent), replyToMessageId: replyTarget?.id ?? null, replyTo: replyTarget ? { id: replyTarget.id, role: replyTarget.role, content: replyTarget.content } : null };
     setRoomMessage("");
+    setRoomAttachments([]);
+    setRoomFileReferences([]);
     setReplyTarget(null);
     setMessagePage((current) => ({ ...current, items: mergeMessages(current.items, [nextMessage]) }));
     if (result.session) onSessionUpdated(result.session);
@@ -1722,18 +2646,56 @@ function SessionPage({
     notify(t("session.renameTitleUpdated"), "success");
   }
 
+  async function updateSessionNotifications(enabled: boolean) {
+    if (!session) return;
+    const body: UpdateSessionRequest = { notificationsEnabled: enabled };
+    const response = await fetch(`/api/sessions/${session.id}`, {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      notify(t("session.notificationToggleFailed"), "error");
+      return;
+    }
+    const nextSession = (await response.json()) as SessionSummary;
+    onSessionUpdated(nextSession);
+    notify(enabled ? t("session.notificationEnabled") : t("session.notificationDisabled"), "success");
+  }
+
   async function submitTask(event: React.FormEvent) {
     event.preventDefault();
-    if (!prompt.trim()) return;
-    const nextPrompt = prompt;
+    if (!prompt.trim() && !promptAttachments.length && !promptFileReferences.length) return;
+    if (taskRunning && promptAttachments.length) {
+      notify(t("session.attachmentsCannotQueue"), "error");
+      return;
+    }
+    const basePrompt = prompt.trim() || t("session.attachmentOnlyPrompt");
+    const nextPrompt = promptWithFileReferences(basePrompt, promptFileReferences);
+    const nextAttachments = promptAttachments;
+    const attachmentInputs = await filesToAttachmentInputs(nextAttachments).catch(() => null);
+    if (nextAttachments.length && !attachmentInputs) {
+      notify(t("session.attachmentReadFailed"), "error");
+      return;
+    }
+    const displayPrompt = messageTextWithContext(basePrompt, nextAttachments, promptFileReferences);
     const replyToMessageId = replyTarget?.id ?? null;
     setPrompt("");
+    setPromptAttachments([]);
+    setPromptFileReferences([]);
     setReplyTarget(null);
     if (session) {
-      await onContinueTask(session.id, nextPrompt, selectedProviderId || null, draftModel || null, replyToMessageId);
+      await onContinueTask(session.id, nextPrompt, selectedProviderId || null, draftModel || null, replyToMessageId, attachmentInputs ?? undefined, displayPrompt);
     } else {
-      setDraftSubmittedMessages([localUserMessage(nextPrompt)]);
-      await onSubmitTask(nextPrompt, draftProjectId ?? null, selectedProviderId || null, draftModel || null);
+      setDraftSubmittedMessages([localUserMessage(displayPrompt)]);
+      const pendingNotifications = sessionNotifyRules
+        .filter((rule) => !rule.persisted)
+        .map((rule) => ({
+          eventTypes: [rule.eventType],
+          targets: [{ recipientId: rule.recipientId, senderAccountId: rule.senderAccountId }],
+          expireMode: "after_trigger" as const,
+        }));
+      await onSubmitTask(nextPrompt, draftProjectId ?? null, selectedProviderId || null, draftModel || null, pendingNotifications.length ? pendingNotifications : undefined, attachmentInputs ?? undefined, displayPrompt);
     }
   }
 
@@ -1859,11 +2821,151 @@ function SessionPage({
     await loadTaskContextFile(first.name, result.files);
   }
 
+  async function compactSessionMemory() {
+    if (!session?.id || compactingMemory) return;
+    setCompactingMemory(true);
+    try {
+      const response = await fetch(`/api/sessions/${session.id}/compact`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const result = await response.json().catch(() => null) as (SessionCompactionResponse & { error?: string }) | null;
+      if (!response.ok || !result?.compaction) {
+        notify(result?.error ? `${t("session.compactMemoryFailed")}：${result.error}` : t("session.compactMemoryFailed"), "error");
+        return;
+      }
+      notify(`${t("session.compactMemoryDone")} · ${result.compaction.sourceMessageCount}`, "success");
+      setTaskContextPanel({
+        files: [],
+        selectedName: "latest-summary.md",
+        content: result.summary || t("session.noTaskContext"),
+      });
+    } finally {
+      setCompactingMemory(false);
+    }
+  }
+
+  async function openSessionMemory() {
+    if (!session?.id) return;
+    const response = await fetch(`/api/sessions/${session.id}/compaction`, {
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    if (!response.ok) return;
+    const result = (await response.json()) as (Partial<SessionCompactionResponse> & { compaction?: SessionCompactionResponse["compaction"] | null });
+    if (!result.compaction) {
+      notify(t("session.noSessionMemory"), "info");
+      return;
+    }
+    setTaskContextPanel({
+      files: [],
+      selectedName: "latest-summary.md",
+      content: result.summary || t("session.noTaskContext"),
+    });
+  }
+
+  async function editSessionMemory() {
+    if (!session?.id) return;
+    const response = await fetch(`/api/sessions/${session.id}/compaction`, {
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    if (!response.ok) return;
+    const current = (await response.json()) as (Partial<SessionCompactionResponse> & { compaction?: SessionCompactionResponse["compaction"] | null });
+    if (!current.compaction) {
+      notify(t("session.noSessionMemory"), "info");
+      return;
+    }
+    const summary = await dialog.prompt({
+      title: t("session.editMemory"),
+      message: t("session.editMemoryHint"),
+      defaultValue: current.summary ?? "",
+      confirmLabel: t("action.save"),
+      multiline: true,
+    });
+    if (summary === null) return;
+    const body: UpdateSessionCompactionRequest = { summary };
+    const update = await fetch(`/api/sessions/${session.id}/compaction`, {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const result = await update.json().catch(() => null) as (SessionCompactionResponse & { error?: string }) | null;
+    if (!update.ok || !result?.compaction) {
+      notify(result?.error ? `${t("session.editMemoryFailed")}：${result.error}` : t("session.editMemoryFailed"), "error");
+      return;
+    }
+    notify(t("session.editMemoryDone"), "success");
+    setTaskContextPanel({ files: [], selectedName: "latest-summary.md", content: result.summary });
+  }
+
+  async function openSessionMemoryHistory() {
+    if (!session?.id) return;
+    const response = await fetch(`/api/sessions/${session.id}/compactions?limit=30`, {
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    if (!response.ok) return;
+    const result = (await response.json()) as SessionCompactionListResponse;
+    if (!result.items.length) {
+      notify(t("session.noSessionMemory"), "info");
+      return;
+    }
+    const content = [
+      "# Session Memory History",
+      "",
+      ...result.items.map((item, index) => [
+        `## ${index === 0 ? t("session.latestMemory") : item.id}`,
+        `- id: ${item.id}`,
+        `- created: ${formatShortDate(item.createdAt)}`,
+        `- source messages: ${item.sourceMessageCount}`,
+        `- source chars: ${item.sourceChars}`,
+        `- provider: ${item.providerId ?? "-"}`,
+        `- model: ${item.model ?? "-"}`,
+        `- supersedes: ${item.supersedesId ?? "-"}`,
+        `- file: ${item.filePath}`,
+      ].join("\n")),
+    ].join("\n\n");
+    setTaskContextPanel({ files: [], selectedName: "memory-history.md", content });
+  }
+
+  async function restoreSessionMemory() {
+    if (!session?.id) return;
+    const response = await fetch(`/api/sessions/${session.id}/compactions?limit=30`, {
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    if (!response.ok) return;
+    const history = (await response.json()) as SessionCompactionListResponse;
+    if (!history.items.length) {
+      notify(t("session.noSessionMemory"), "info");
+      return;
+    }
+    const defaultValue = history.items[1]?.id ?? history.items[0]?.id ?? "";
+    const compactionId = await dialog.prompt({
+      title: t("session.restoreMemory"),
+      message: t("session.restoreMemoryHint"),
+      defaultValue,
+      placeholder: "compaction-...",
+      confirmLabel: t("session.restoreMemory"),
+    });
+    if (!compactionId?.trim()) return;
+    const restore = await fetch(`/api/sessions/${session.id}/compactions/${encodeURIComponent(compactionId.trim())}/restore`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    const result = await restore.json().catch(() => null) as (SessionCompactionResponse & { error?: string }) | null;
+    if (!restore.ok || !result?.compaction) {
+      notify(result?.error ? `${t("session.restoreMemoryFailed")}：${result.error}` : t("session.restoreMemoryFailed"), "error");
+      return;
+    }
+    notify(t("session.restoreMemoryDone"), "success");
+    setTaskContextPanel({ files: [], selectedName: "latest-summary.md", content: result.summary });
+  }
+
   const roomMentionQuery = isRoomSession ? activeRoomMentionQuery() : null;
   const roomMentionSuggestions = roomMentionQuery === null ? [] : [
     { id: "user", label: "user" },
     ...roomMentionAgents.map((agent) => ({ id: agent.id, label: agent.name })),
   ].filter((item) => item.label.toLowerCase().includes(roomMentionQuery)).slice(0, 8);
+  const notificationCenter = React.useContext(NotificationCenterContext);
 
   return (
     <>
@@ -1880,6 +2982,7 @@ function SessionPage({
             </div>
           </div>
           <div className="header-actions session-actions">
+            {notificationCenter}
             <button className="ghost-button icon-only session-secondary-action" title={t("session.infoTitle")} aria-label={t("session.infoTitle")} onClick={() => setInfoOpen(true)}><IconText icon={Info}>{t("session.infoTitle")}</IconText></button>
             <button className="ghost-button icon-only session-primary-action" title={t("nav.files")} aria-label={t("nav.files")} disabled={!session} onClick={openWorkspaceFiles}><IconText icon={Files}>{t("nav.files")}</IconText></button>
             <button className="ghost-button icon-only session-primary-action" title={t("nav.terminal")} aria-label={t("nav.terminal")} disabled={!session} onClick={openWorkspaceTerminal}><IconText icon={TerminalIcon}>{t("nav.terminal")}</IconText></button>
@@ -1993,8 +3096,14 @@ function SessionPage({
               ))}
             </div>
             <div className="mention-composer-wrap">
-              <textarea name="roommessage" rows={2} value={roomMessage} onChange={(event) => setRoomMessage(event.target.value)} placeholder={t("room.messagePlaceholder")} />
-              {!replyTarget && roomMentionSuggestions.length > 0 && (
+              {renderComposerAttachments("room")}
+              <div className="composer-input-row">
+                <button className="composer-upload-button" type="button" title={t("session.addAttachment")} aria-label={t("session.addAttachment")} onClick={() => roomFileInputRef.current?.click()}><Plus size={20} /></button>
+                <input ref={roomFileInputRef} name="roomattachments" type="file" multiple hidden onChange={(event) => { addComposerFiles("room", event.currentTarget.files); event.currentTarget.value = ""; }} />
+                <textarea ref={roomTextareaRef} name="roommessage" rows={2} value={roomMessage} onChange={(event) => updateComposerValue("room", event.target.value, event.currentTarget.selectionStart)} onClick={(event) => updateComposerValue("room", event.currentTarget.value, event.currentTarget.selectionStart)} onKeyDown={(event) => handleSlashKeyDown(event, "room")} placeholder={t("room.messagePlaceholder")} />
+              </div>
+              {renderSlashCommandMenu("room")}
+              {!replyTarget && slashMenuTarget !== "room" && roomMentionSuggestions.length > 0 && (
                 <div className="mention-suggestions">
                   {roomMentionSuggestions.map((item) => (
                     <button type="button" key={item.id} onClick={() => replaceActiveRoomMention(item.label)}>@{item.label}</button>
@@ -2013,7 +3122,15 @@ function SessionPage({
               <button className="ghost-button icon-only" type="button" title={t("action.close")} aria-label={t("action.close")} onClick={() => setReplyTarget(null)}><IconText icon={X}>{t("action.close")}</IconText></button>
             </div>
           )}
-          <textarea name="prompt" rows={2} value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder={t("form.composerPrompt")} />
+          <div className="mention-composer-wrap">
+            {renderComposerAttachments("prompt")}
+            <div className="composer-input-row">
+              <button className="composer-upload-button" type="button" title={t("session.addAttachment")} aria-label={t("session.addAttachment")} onClick={() => promptFileInputRef.current?.click()}><Plus size={20} /></button>
+              <input ref={promptFileInputRef} name="promptattachments" type="file" multiple hidden onChange={(event) => { addComposerFiles("prompt", event.currentTarget.files); event.currentTarget.value = ""; }} />
+              <textarea ref={promptTextareaRef} name="prompt" rows={2} value={prompt} onChange={(event) => updateComposerValue("prompt", event.target.value, event.currentTarget.selectionStart)} onClick={(event) => updateComposerValue("prompt", event.currentTarget.value, event.currentTarget.selectionStart)} onKeyDown={(event) => handleSlashKeyDown(event, "prompt")} placeholder={t("form.composerPrompt")} />
+            </div>
+            {renderSlashCommandMenu("prompt")}
+          </div>
           <div className="composer-actions">
             <select name="draftmodel" className="model-select" value={draftModel} onChange={(event) => setDraftModel(event.target.value)}>
               {composerModels.map((model) => <option value={model} key={model}>{model}</option>)}
@@ -2163,6 +3280,15 @@ function SessionPage({
                 </div>
               ))}
             </div>
+            {session && (
+              <div className="room-settings-grid">
+                <label className="room-setting-row">
+                  <span>{t("session.notifications")}</span>
+                  <Switch checked={session.notificationsEnabled !== false} onCheckedChange={(checked) => void updateSessionNotifications(checked)} />
+                </label>
+                <span className="subtle">{t("session.notificationsHelp")}</span>
+              </div>
+            )}
             {session?.conversationType === "room" && (
               <div className="room-settings-grid">
                 <label className="room-setting-row room-message-mode-row">
@@ -2209,6 +3335,11 @@ function SessionPage({
             <div className="settings-actions">
               <button className="ghost-button" type="button" disabled={!session} onClick={() => void openTaskLog()}>{t("session.viewTaskLog")}</button>
               <button className="ghost-button" type="button" disabled={!session} onClick={() => void openTaskContext()}>{t("session.viewTaskContext")}</button>
+              <button className="ghost-button" type="button" disabled={!session} onClick={() => void openSessionMemory()}>{t("session.viewMemory")}</button>
+              <button className="ghost-button" type="button" disabled={!session} onClick={() => void openSessionMemoryHistory()}>{t("session.memoryHistory")}</button>
+              <button className="ghost-button" type="button" disabled={!session} onClick={() => void editSessionMemory()}>{t("session.editMemory")}</button>
+              <button className="ghost-button" type="button" disabled={!session} onClick={() => void restoreSessionMemory()}>{t("session.restoreMemory")}</button>
+              <button className="ghost-button" type="button" disabled={!session || compactingMemory} onClick={() => void compactSessionMemory()}>{compactingMemory ? t("session.compactingMemory") : t("session.compactMemory")}</button>
             </div>
           </section>
         </div>
@@ -2265,6 +3396,146 @@ function SessionPage({
             </div>
             <pre className="task-log-viewer">{taskContextPanel.content}</pre>
           </div>
+        </div>
+      )}
+      {taskTemplateTarget && (
+        <div className="dialog-layer" role="presentation">
+          <button className="dialog-backdrop" type="button" aria-label={t("action.close")} onClick={() => setTaskTemplateTarget(null)} />
+          <div className="dialog-card command-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="task-template-title">
+            <div className="dialog-head">
+              <div>
+                <strong id="task-template-title">{t("session.commandTask")}</strong>
+                <p>{t("session.commandTaskHelp")}</p>
+              </div>
+              <button className="drawer-close" type="button" onClick={() => setTaskTemplateTarget(null)} title={t("action.close")}><X size={16} /></button>
+            </div>
+            <div className="command-picker-list">
+              {taskTemplates.map((template) => (
+                <button className="file-list-item" type="button" key={template.id} onClick={() => insertTaskTemplate(template)}>
+                  <span>{template.title}</span>
+                  <em>{template.prompt}</em>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+      {agentPickerOpen && (
+        <div className="dialog-layer" role="presentation">
+          <button className="dialog-backdrop" type="button" aria-label={t("action.close")} onClick={() => setAgentPickerOpen(false)} />
+          <div className="dialog-card command-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="agent-picker-title">
+            <div className="dialog-head">
+              <div>
+                <strong id="agent-picker-title">{t("session.commandAgent")}</strong>
+                <p>{t("session.commandAgentHelp")}</p>
+              </div>
+              <button className="drawer-close" type="button" onClick={() => setAgentPickerOpen(false)} title={t("action.close")}><X size={16} /></button>
+            </div>
+            <div className="command-picker-list">
+              <button className="file-list-item" type="button" onClick={() => { insertRoomMention("user"); setAgentPickerOpen(false); }}>
+                <span>@user</span>
+                <em>{t("session.user")}</em>
+              </button>
+              {roomMentionAgents.map((agent) => (
+                <button className="file-list-item" type="button" key={agent.id} onClick={() => { insertRoomMention(agent.name); setAgentPickerOpen(false); }}>
+                  <span>@{agent.name}</span>
+                  <em>{agent.description ?? agent.id}</em>
+                </button>
+              ))}
+              {!roomMentionAgents.length && <div className="empty-state">{t("contacts.noAgents")}</div>}
+            </div>
+          </div>
+        </div>
+      )}
+      {fileReferencePicker && (
+        <div className="dialog-layer" role="presentation">
+          <button className="dialog-backdrop" type="button" aria-label={t("action.close")} onClick={() => setFileReferencePicker(null)} />
+          <div className="dialog-card file-reference-dialog" role="dialog" aria-modal="true" aria-labelledby="file-reference-title">
+            <div className="dialog-head">
+              <div>
+                <strong id="file-reference-title">{t("session.commandFile")}</strong>
+                <p>{fileReferencePicker.sourceLabel}</p>
+              </div>
+              <button className="drawer-close" type="button" onClick={() => setFileReferencePicker(null)} title={t("action.close")}><X size={16} /></button>
+            </div>
+            <div className="file-reference-toolbar">
+              <strong>{fileReferencePicker.list?.path ?? "."}</strong>
+              <button className="ghost-button" type="button" disabled={!fileReferencePicker.list} onClick={() => addFileReference()}>{t("session.commandFileUseCurrent")}</button>
+            </div>
+            <div className="file-reference-list">
+              {!fileReferencePicker.list && <div className="subtle">{t("file.loadingFiles")}</div>}
+              {fileReferencePicker.list?.parentPath && (
+                <button className="file-list-item" type="button" onClick={() => void loadFileReferencePicker(fileReferencePicker.list?.parentPath ?? ".", fileReferencePicker.target)}>
+                  <span>↩ {t("file.parentDirectory")}</span>
+                  <em>{fileReferencePicker.list.parentPath}</em>
+                </button>
+              )}
+              {fileReferencePicker.list?.entries.map((entry) => (
+                <div className="file-reference-row" key={entry.path}>
+                  <button className="file-list-item" type="button" onClick={() => entry.kind === "directory" ? void loadFileReferencePicker(entry.path, fileReferencePicker.target) : addFileReference(entry)}>
+                    <span>{entry.kind === "directory" ? "▸" : "◇"} {entry.name}</span>
+                    <em>{entry.kind === "directory" ? t("file.directoryShort") : t("file.sizeKb").replace("{size}", String(Math.ceil(entry.size / 1024)))}</em>
+                  </button>
+                  {entry.kind === "directory" && (
+                    <button className="ghost-button" type="button" onClick={() => addFileReference(entry)}>{t("session.commandFileAdd")}</button>
+                  )}
+                </div>
+              ))}
+              {fileReferencePicker.list && !fileReferencePicker.list.entries.length && <div className="empty-state">{t("project.noDirectories")}</div>}
+            </div>
+          </div>
+        </div>
+      )}
+      {notifyBuilderOpen && (
+        <div className="dialog-layer" role="presentation">
+          <button className="dialog-backdrop" type="button" aria-label={t("action.close")} onClick={() => setNotifyBuilderOpen(false)} />
+          <form className="dialog-card notify-builder-dialog" role="dialog" aria-modal="true" aria-labelledby="notify-builder-title" onSubmit={createNotifyRule}>
+            <div className="dialog-head">
+              <div>
+                <strong id="notify-builder-title">{t("session.commandNotify")}</strong>
+                <p>{t("session.commandNotifyBuilderHelp")}</p>
+              </div>
+              <button className="drawer-close" type="button" onClick={() => setNotifyBuilderOpen(false)} title={t("action.close")}><X size={16} /></button>
+            </div>
+            <label>
+              <span>{t("settings.notificationEvents")}</span>
+              <select name="notify-event-type" value={notifyEventType} onChange={(event) => setNotifyEventType(event.target.value as NotificationEventType)}>
+                <option value="task_completed">{t("session.notifyEventCompleted")}</option>
+                <option value="task_failed">{t("session.notifyEventFailed")}</option>
+                <option value="needs_approval">{t("session.notifyEventApproval")}</option>
+              </select>
+            </label>
+            <label>
+              <span>{t("settings.notificationRecipientKind")}</span>
+              <select name="notify-channel-kind" value={notifyChannelKind} onChange={(event) => {
+                const kind = event.target.value as NotificationRecipientSummary["kind"];
+                setNotifyChannelKind(kind);
+                setNotifyRecipientId(notifyRecipients.find((recipient) => recipient.kind === kind)?.id ?? "");
+                setNotifySenderAccountId("");
+              }}>
+                {notifyRecipientKinds.map((kind) => <option value={kind} key={kind}>{kind}</option>)}
+              </select>
+            </label>
+            <label>
+              <span>{t("settings.notificationRecipientName")}</span>
+              <select name="notify-recipient-id" value={notifyRecipientId} onChange={(event) => setNotifyRecipientId(event.target.value)}>
+                {filteredNotifyRecipients.map((recipient) => <option value={recipient.id} key={recipient.id}>{recipient.name}</option>)}
+              </select>
+            </label>
+            {notifySenders.length > 1 && (
+              <label>
+                <span>{t("settings.notificationChooseSender")}</span>
+                <select name="notify-sender-id" value={notifySenderAccountId} onChange={(event) => setNotifySenderAccountId(event.target.value)}>
+                  <option value="">{t("settings.notificationUseRecipientDefaultSender")}</option>
+                  {notifySenders.map((sender) => <option value={sender.id} key={sender.id}>{sender.name}</option>)}
+                </select>
+              </label>
+            )}
+            <div className="dialog-actions">
+              <button className="ghost-button" type="button" onClick={() => setNotifyBuilderOpen(false)}>{t("action.cancel")}</button>
+              <button className="dark-button" type="submit" disabled={!notifyRecipientId}>{t("action.create")}</button>
+            </div>
+          </form>
         </div>
       )}
       {dialog.node}
@@ -3128,12 +4399,24 @@ function RoomConsole({ sessionToken, roomId, sessionWorkspacePath, projectWorksp
                 <input name="room-orchestration-autocreatereviewtasks" type="checkbox" checked={room.orchestration.autoCreateReviewTasks} onChange={(event) => void updateRoomSettings({ autoCreateReviewTasks: event.target.checked })} />
               </label>
               <label className="room-setting-row">
+                <span>{t("room.autoListenAfterAgentEvents")}</span>
+                <input name="room-orchestration-autolistenafteragentevents" type="checkbox" checked={room.orchestration.autoListenAfterAgentEvents} onChange={(event) => void updateRoomSettings({ autoListenAfterAgentEvents: event.target.checked })} />
+              </label>
+              <label className="room-setting-row">
                 <span>{t("room.notifyUserOnFailure")}</span>
                 <input name="room-orchestration-notifyuseronfailure" type="checkbox" checked={room.orchestration.notifyUserOnFailure} onChange={(event) => void updateRoomSettings({ notifyUserOnFailure: event.target.checked })} />
               </label>
               <label className="room-setting-row">
                 <span>{t("room.maxAutoRetries")}</span>
                 <Input name="room-orchestration-maxautoretries" className="room-setting-number" type="number" min={0} max={10} value={room.orchestration.maxAutoRetries} onChange={(event) => void updateRoomSettings({ maxAutoRetries: Number(event.target.value) })} />
+              </label>
+              <label className="room-setting-row">
+                <span>{t("room.maxAutoListenChainDepth")}</span>
+                <Input name="room-orchestration-maxautolistenchaindepth" className="room-setting-number" type="number" min={0} max={10} value={room.orchestration.maxAutoListenChainDepth} onChange={(event) => void updateRoomSettings({ maxAutoListenChainDepth: Number(event.target.value) })} />
+              </label>
+              <label className="room-setting-row">
+                <span>{t("room.maxAutoListenTasksPerEvent")}</span>
+                <Input name="room-orchestration-maxautolistentasks" className="room-setting-number" type="number" min={1} max={20} value={room.orchestration.maxAutoListenTasksPerEvent} onChange={(event) => void updateRoomSettings({ maxAutoListenTasksPerEvent: Number(event.target.value) })} />
               </label>
             </div>
           )}
@@ -3214,6 +4497,18 @@ async function copyText(value: string) {
   const copied = document.execCommand("copy");
   document.body.removeChild(textarea);
   return copied;
+}
+
+function downloadTextFile(filename: string, content: string) {
+  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  URL.revokeObjectURL(url);
 }
 
 function Bubble({
@@ -3544,6 +4839,7 @@ function FilesPage({
   t,
   initialRootPath,
   initialMountName,
+  initialPath,
   embedded = false,
   onOpenMainNav,
 }: {
@@ -3551,6 +4847,7 @@ function FilesPage({
   t: TFunction;
   initialRootPath?: string;
   initialMountName?: string;
+  initialPath?: string;
   embedded?: boolean;
   onOpenMainNav?: () => void;
 }) {
@@ -3571,19 +4868,26 @@ function FilesPage({
   const [terminalCwd, setTerminalCwd] = useState<string | null>(null);
   const [previewExpanded, setPreviewExpanded] = useState(false);
   const [mountsPanelOpen, setMountsPanelOpen] = useState(false);
+  const [transientRootPath, setTransientRootPath] = useState<string | null>(null);
+  const [transientMountName, setTransientMountName] = useState<string | null>(null);
   const [archivePanel, setArchivePanel] = useState<{ path: string; displayPath: string } | null>(null);
   const [archiveTemplateItems, setArchiveTemplateItems] = useState<ArchiveIgnoreTemplate[]>([]);
   const [archiveTemplates, setArchiveTemplates] = useState<string[]>(["common", "sensitive"]);
   const [archiveRules, setArchiveRules] = useState("");
   const [archivePreview, setArchivePreview] = useState<FileArchivePreviewResponse | null>(null);
   const [archiveBusy, setArchiveBusy] = useState(false);
+  const [folderPreviewPanel, setFolderPreviewPanel] = useState<{ path: string; displayPath: string; previews: PreviewSummary[] | null } | null>(null);
+  const [folderPreviewCommand, setFolderPreviewCommand] = useState("python3 -m http.server {port} --bind 127.0.0.1 --directory {dir}");
+  const [folderPreviewPort, setFolderPreviewPort] = useState("4179");
+  const [folderPreviewAccess, setFolderPreviewAccess] = useState<PreviewAccess>("private");
 
   const authHeaders = { authorization: `Bearer ${sessionToken}` };
   const activeMount = mounts.find((mount) => mount.id === activeMountId) ?? mounts[0] ?? null;
   const lockedRootPath = embedded ? initialRootPath : undefined;
-  const fileQuery = (path: string) => new URLSearchParams({
+  const activeRootPath = lockedRootPath ?? transientRootPath ?? undefined;
+  const fileQuery = (path: string, mountIdOverride = activeMountId, rootPathOverride = activeRootPath) => new URLSearchParams({
     path,
-    ...(lockedRootPath ? { rootPath: lockedRootPath } : activeMountId ? { mountId: activeMountId } : {}),
+    ...(rootPathOverride ? { rootPath: rootPathOverride } : mountIdOverride ? { mountId: mountIdOverride } : {}),
   });
 
   function requestedFileParamsFromHash() {
@@ -3605,26 +4909,10 @@ function FilesPage({
     return nextMounts;
   }
 
-  async function ensureMountForRoot(rootPath: string, name = "Session Workspace") {
-    const existingMounts = mounts.length ? mounts : await loadMounts();
-    const existing = existingMounts.find((mount) => mount.rootPath === rootPath);
-    if (existing) return existing;
-    const body: CreateFileMountRequest = { name, rootPath };
-    const response = await fetch("/api/file-mounts", {
-      method: "POST",
-      headers: { ...authHeaders, "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) throw new Error("mount_create_failed");
-    const mount = (await response.json()) as FileMount;
-    await loadMounts();
-    return mount;
-  }
-
   useEffect(() => {
-    if (lockedRootPath) return;
+    if (activeRootPath) return;
     loadMounts().catch(() => setMessage(t("file.readMountsFailed")));
-  }, [lockedRootPath, sessionToken]);
+  }, [activeRootPath, sessionToken]);
 
   useEffect(() => {
     fetch("/api/files/archive/templates", { headers: authHeaders })
@@ -3639,7 +4927,7 @@ function FilesPage({
   }, [sessionToken]);
 
   useEffect(() => {
-    if (!lockedRootPath && !activeMountId) return;
+    if (!activeRootPath && !activeMountId) return;
     setMessage("");
     fetch(`/api/files?${fileQuery(currentPath)}`, { headers: authHeaders })
       .then((response) => {
@@ -3656,14 +4944,14 @@ function FilesPage({
         }
       })
       .catch(() => {
-        setFileList({ mountId: activeMountId, root: lockedRootPath ?? activeMount?.rootPath ?? "", path: currentPath, parentPath: null, entries: [] });
+        setFileList({ mountId: activeMountId, root: activeRootPath ?? activeMount?.rootPath ?? "", path: currentPath, parentPath: null, entries: [] });
         setMessage(t("file.readDirectoryFailed"));
       });
-  }, [activeMountId, currentPath, lockedRootPath, reloadKey, sessionToken, pendingOpenPath]);
+  }, [activeMountId, activeRootPath, currentPath, reloadKey, sessionToken, pendingOpenPath]);
 
   useEffect(() => {
     setFileVisibleCount(100);
-  }, [activeMountId, currentPath, lockedRootPath, fileFilter, reloadKey]);
+  }, [activeMountId, activeRootPath, currentPath, fileFilter, reloadKey]);
 
   useEffect(() => {
     function handleWorkspaceChanged() {
@@ -3675,6 +4963,8 @@ function FilesPage({
   }, [dirty]);
 
   function switchMount(mountId: string) {
+    setTransientRootPath(null);
+    setTransientMountName(null);
     setActiveMountId(mountId);
     setMountsPanelOpen(false);
     setCurrentPath(".");
@@ -3708,16 +4998,16 @@ function FilesPage({
     setDirty(false);
   }
 
-  async function openPath(path: string) {
+  async function openPath(path: string, mountIdOverride = activeMountId, rootPathOverride = activeRootPath) {
     const parent = path.includes("/") ? path.split("/").slice(0, -1).join("/") || "." : ".";
     setPendingOpenPath(path);
     setCurrentPath(parent);
-    await openFilePath(path);
+    await openFilePath(path, mountIdOverride, rootPathOverride);
     setPendingOpenPath(null);
   }
 
-  async function openFilePath(path: string) {
-    const response = await fetch(`/api/files/content?${fileQuery(path)}`, {
+  async function openFilePath(path: string, mountIdOverride = activeMountId, rootPathOverride = activeRootPath) {
+    const response = await fetch(`/api/files/content?${fileQuery(path, mountIdOverride, rootPathOverride)}`, {
       headers: authHeaders,
     });
     if (!response.ok) return;
@@ -3730,10 +5020,14 @@ function FilesPage({
 
   useEffect(() => {
     const hashParams = requestedFileParamsFromHash();
-    const path = lockedRootPath ? null : hashParams.path;
+    const path = lockedRootPath ? initialPath ?? null : hashParams.path;
     const rootPath = lockedRootPath ?? hashParams.rootPath;
     const mountName = initialMountName ?? hashParams.mountName;
     if (lockedRootPath) {
+      if (path) {
+        void openPath(path);
+        return;
+      }
       setCurrentPath(".");
       setFileList(null);
       setSelectedEntry(null);
@@ -3744,13 +5038,20 @@ function FilesPage({
       return;
     }
     if (rootPath) {
-      ensureMountForRoot(rootPath, mountName ?? "Session Workspace")
-        .then((mount) => switchMount(mount.id))
-        .catch(() => setMessage(t("file.mountSessionFailed")));
+      setTransientRootPath(rootPath);
+      setTransientMountName(mountName ?? "Session Workspace");
+      setCurrentPath(".");
+      setFileList(null);
+      setSelectedEntry(null);
+      setSelectedFile(null);
+      setDraft("");
+      setDirty(false);
+      if (path) window.setTimeout(() => void openPath(path, "", rootPath), 0);
+      else setReloadKey((key) => key + 1);
       return;
     }
     if (path) void openPath(path);
-  }, [initialMountName, lockedRootPath, sessionToken]);
+  }, [initialMountName, initialPath, lockedRootPath, sessionToken]);
 
   async function createEntry(kind: CreateFileRequest["kind"]) {
     const name = await dialog.prompt({
@@ -3766,7 +5067,7 @@ function FilesPage({
       name,
       kind,
     };
-    const response = await fetch(`/api/files?${new URLSearchParams(lockedRootPath ? { rootPath: lockedRootPath } : activeMountId ? { mountId: activeMountId } : {})}`, {
+    const response = await fetch(`/api/files?${new URLSearchParams(activeRootPath ? { rootPath: activeRootPath } : activeMountId ? { mountId: activeMountId } : {})}`, {
       method: "POST",
       headers: {
         ...authHeaders,
@@ -3796,7 +5097,7 @@ function FilesPage({
       path: selectedEntry.path,
       newName,
     };
-    const response = await fetch(`/api/files?${new URLSearchParams(lockedRootPath ? { rootPath: lockedRootPath } : activeMountId ? { mountId: activeMountId } : {})}`, {
+    const response = await fetch(`/api/files?${new URLSearchParams(activeRootPath ? { rootPath: activeRootPath } : activeMountId ? { mountId: activeMountId } : {})}`, {
       method: "PATCH",
       headers: {
         ...authHeaders,
@@ -3867,7 +5168,7 @@ function FilesPage({
   }
 
   function absoluteFilePath(path: string) {
-    const root = fileList?.root ?? lockedRootPath ?? activeMount?.rootPath ?? "";
+    const root = fileList?.root ?? activeRootPath ?? activeMount?.rootPath ?? "";
     if (!root) return path;
     if (path === ".") return root;
     return `${root.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
@@ -3880,6 +5181,12 @@ function FilesPage({
       return absoluteFilePath(parent);
     }
     return absoluteFilePath(fileList?.path ?? currentPath);
+  }
+
+  function selectedDirectoryRelativePath() {
+    if (selectedEntry?.kind === "directory") return selectedEntry.path;
+    if (selectedEntry?.kind === "file") return selectedEntry.path.includes("/") ? selectedEntry.path.split("/").slice(0, -1).join("/") || "." : ".";
+    return fileList?.path ?? currentPath;
   }
 
   async function closeSelectedFile() {
@@ -3914,6 +5221,92 @@ function FilesPage({
     setArchivePreview(null);
   }
 
+  async function openFolderPreviewPanel() {
+    const path = selectedDirectoryRelativePath();
+    const displayPath = absoluteFilePath(path);
+    setFolderPreviewPanel({ path: displayPath, displayPath, previews: null });
+    await loadFolderPreviews(displayPath);
+  }
+
+  async function loadFolderPreviews(displayPath: string) {
+    const params = new URLSearchParams({ scopeType: "folder", scopeId: displayPath });
+    const response = await fetch(`/api/previews?${params}`, { headers: authHeaders });
+    if (!response.ok) {
+      setMessage(t("project.previewReadFailed"));
+      setFolderPreviewPanel((current) => current?.path === displayPath ? { ...current, previews: [] } : current);
+      return;
+    }
+    const previews = (await response.json()) as PreviewSummary[];
+    setFolderPreviewPanel((current) => current?.path === displayPath ? { ...current, previews } : current);
+  }
+
+  async function createFolderPreview(event: React.FormEvent) {
+    event.preventDefault();
+    if (!folderPreviewPanel) return;
+    const folderName = folderPreviewPanel.displayPath.split("/").filter(Boolean).at(-1) ?? "folder";
+    const body: CreatePreviewRequest = {
+      scopeType: "folder",
+      scopeId: folderPreviewPanel.displayPath,
+      label: `${folderName}:${folderPreviewPort}`,
+      targetHost: "127.0.0.1",
+      port: Number(folderPreviewPort),
+      command: renderPreviewCommand(folderPreviewCommand, folderPreviewPort, "."),
+      cwd: ".",
+      access: folderPreviewAccess,
+      autoStart: true,
+    };
+    const response = await fetch("/api/previews", {
+      method: "POST",
+      headers: { ...authHeaders, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const result = await response.json().catch(() => null) as { error?: string } | null;
+      setMessage(result?.error ? `${t("project.previewStartFailed")}：${result.error}` : t("project.previewStartFailed"));
+      if (response.status === 409 && result?.error === "approval_required") await loadFolderPreviews(folderPreviewPanel.displayPath);
+      return;
+    }
+    const preview = (await response.json()) as PreviewSummary;
+    setFolderPreviewPanel((current) => current ? { ...current, previews: [preview, ...(current.previews ?? []).filter((item) => item.id !== preview.id)] } : current);
+    setMessage(t("project.previewStarted"));
+  }
+
+  async function stopFolderPreview(preview: PreviewSummary) {
+    const response = await fetch(`/api/previews/${preview.id}/stop`, {
+      method: "POST",
+      headers: authHeaders,
+    });
+    if (!response.ok) return;
+    const nextPreview = (await response.json()) as PreviewSummary;
+    setFolderPreviewPanel((current) => current ? { ...current, previews: (current.previews ?? []).map((item) => item.id === nextPreview.id ? nextPreview : item) } : current);
+  }
+
+  async function deleteFolderPreview(preview: PreviewSummary) {
+    const confirmed = await dialog.confirm({
+      title: t("project.deletePreview"),
+      message: `${preview.label}\n${preview.targetHost}:${preview.port}`,
+      confirmLabel: t("action.delete"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    const response = await fetch(`/api/previews/${preview.id}`, {
+      method: "DELETE",
+      headers: authHeaders,
+    });
+    if (!response.ok) {
+      setMessage(t("project.previewDeleteFailed"));
+      return;
+    }
+    setFolderPreviewPanel((current) => current ? { ...current, previews: (current.previews ?? []).filter((item) => item.id !== preview.id) } : current);
+    setMessage(t("project.previewDeleted"));
+  }
+
+  useEffect(() => {
+    if (!folderPreviewPanel?.previews?.some((preview) => preview.status === "starting")) return;
+    const timer = window.setTimeout(() => void loadFolderPreviews(folderPreviewPanel.displayPath), 1500);
+    return () => window.clearTimeout(timer);
+  }, [folderPreviewPanel, sessionToken]);
+
   function toggleArchiveTemplate(templateId: string) {
     setArchiveTemplates((current) => {
       const next = current.includes(templateId) ? current.filter((id) => id !== templateId) : [...current, templateId];
@@ -3927,7 +5320,7 @@ function FilesPage({
     if (!archivePanel) return null;
     return {
       path: archivePanel.path,
-      ...(lockedRootPath ? { rootPath: lockedRootPath } : activeMountId ? { mountId: activeMountId } : {}),
+      ...(activeRootPath ? { rootPath: activeRootPath } : activeMountId ? { mountId: activeMountId } : {}),
       excludes: archiveRules.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
     };
   }
@@ -4098,20 +5491,21 @@ function FilesPage({
     <main className={`files-page ${embedded ? "embedded-page" : ""}`}>
       {dialog.node}
       {!embedded && <PageHeader crumb={`${t("page.global")} / ${t("nav.files")}`} title={t("page.files")} action={t("action.refresh")} onAction={() => setReloadKey((key) => key + 1)} onOpenMainNav={onOpenMainNav} menuLabel={t("nav.files")} />}
-      <section className={`file-workbench ${lockedRootPath ? "locked-workspace" : ""}`}>
-        {!lockedRootPath && (
+      <section className={`file-workbench ${activeRootPath ? "locked-workspace" : ""}`}>
+        {!activeRootPath && (
           <aside className="mounts-pane">
             {renderMounts()}
           </aside>
         )}
         <section className="file-list-pane">
           <div className="file-toolbar">
-            <div><strong>{fileList?.path ?? currentPath}</strong><span className="subtle"> · {fileCountText}</span></div>
+            <div><strong>{transientMountName ? `${transientMountName} · ${fileList?.path ?? currentPath}` : fileList?.path ?? currentPath}</strong><span className="subtle"> · {fileCountText}</span></div>
             <div className="file-actions">
-              {!lockedRootPath && <button className="ghost-button icon-only file-mobile-mounts" type="button" title={t("file.mounts")} aria-label={t("file.mounts")} onClick={() => setMountsPanelOpen(true)}><IconText icon={FolderOpen}>{t("file.mounts")}</IconText></button>}
+              {!activeRootPath && <button className="ghost-button icon-only file-mobile-mounts" type="button" title={t("file.mounts")} aria-label={t("file.mounts")} onClick={() => setMountsPanelOpen(true)}><IconText icon={FolderOpen}>{t("file.mounts")}</IconText></button>}
               <button className="ghost-button icon-only" type="button" title={t("file.newFile")} aria-label={t("file.newFile")} onClick={() => createEntry("file")}><IconText icon={FilePlus2}>{t("file.newFile")}</IconText></button>
               <button className="ghost-button icon-only" type="button" title={t("file.newDirectory")} aria-label={t("file.newDirectory")} onClick={() => createEntry("directory")}><IconText icon={FolderPlus}>{t("file.newDirectory")}</IconText></button>
               {!embedded && <button className="ghost-button icon-only" type="button" title={t("file.openTerminal")} aria-label={t("file.openTerminal")} onClick={openTerminalHere}><IconText icon={TerminalIcon}>{t("file.openTerminal")}</IconText></button>}
+              <button className="ghost-button icon-only" type="button" title={t("file.previewFolder")} aria-label={t("file.previewFolder")} onClick={() => void openFolderPreviewPanel()}><IconText icon={Globe}>{t("file.previewFolder")}</IconText></button>
               <button className="ghost-button icon-only" type="button" title={t("file.archiveDownload")} aria-label={t("file.archiveDownload")} onClick={openArchivePanel}><IconText icon={Download}>{t("file.archiveDownload")}</IconText></button>
               <button className="ghost-button icon-only" type="button" title={t("file.copyPath")} aria-label={t("file.copyPath")} onClick={() => void copyCurrentPath()}><IconText icon={Copy}>{t("file.copyPath")}</IconText></button>
               <button className="ghost-button icon-only" type="button" title={t("action.rename")} aria-label={t("action.rename")} disabled={!selectedEntry} onClick={renameEntry}><IconText icon={Pencil}>{t("action.rename")}</IconText></button>
@@ -4168,7 +5562,7 @@ function FilesPage({
           )}
         </section>
       </section>
-      {!lockedRootPath && mountsPanelOpen && (
+      {!activeRootPath && mountsPanelOpen && (
         <div className="workspace-modal compact-modal file-mounts-modal" role="dialog" aria-modal="true">
           <div className="workspace-modal-head">
             <div>
@@ -4226,6 +5620,57 @@ function FilesPage({
               <button className="ghost-button" type="button" disabled={archiveBusy} onClick={() => void previewArchive()}>{t("file.archivePreview")}</button>
               <button className="dark-button" type="button" disabled={archiveBusy} onClick={() => void downloadArchive()}><IconText icon={Download}>{t("file.archiveDownload")}</IconText></button>
             </div>
+          </div>
+        </div>
+      )}
+      {folderPreviewPanel && (
+        <div className="workspace-modal compact-modal" role="dialog" aria-modal="true">
+          <div className="workspace-modal-head">
+            <div>
+              <strong>{t("file.previewFolder")}</strong>
+              <span>{folderPreviewPanel.displayPath}</span>
+            </div>
+            <button className="ghost-button" type="button" onClick={() => setFolderPreviewPanel(null)}>{t("action.close")}</button>
+          </div>
+          <div className="extension-detail">
+            <form className="preview-form" onSubmit={createFolderPreview}>
+              <label>
+                <span>{t("project.previewCommand")}</span>
+                <input name="folder-preview-command" value={folderPreviewCommand} onChange={(event) => setFolderPreviewCommand(event.target.value)} placeholder="python3 -m http.server {port} --bind 127.0.0.1 --directory {dir}" required />
+              </label>
+              <label>
+                <span>{t("project.previewDirectory")}</span>
+                <input name="folder-preview-directory" value={folderPreviewPanel.displayPath} readOnly />
+              </label>
+              <label>
+                <span>{t("project.previewPort")}</span>
+                <input name="folder-preview-port" value={folderPreviewPort} onChange={(event) => setFolderPreviewPort(event.target.value)} inputMode="numeric" placeholder="4179" required />
+              </label>
+              <label>
+                <span>{t("preview.access")}</span>
+                <select name="folder-preview-access" value={folderPreviewAccess} onChange={(event) => setFolderPreviewAccess(event.target.value as PreviewAccess)}>
+                  <option value="private">{t("preview.private")}</option>
+                  <option value="public">{t("preview.public")}</option>
+                </select>
+              </label>
+              <button className="ghost-button" type="submit"><IconText icon={Play}>{t("project.startPreview")}</IconText></button>
+            </form>
+            {!folderPreviewPanel.previews && <div className="subtle">{t("project.loadingPreviews")}</div>}
+            {folderPreviewPanel.previews?.map((preview) => (
+              <div className="preview-row" key={preview.id}>
+                <div>
+                  <strong>{preview.label}</strong>
+                  <span>{preview.status} · {preview.access} · {preview.targetHost}:{preview.port}</span>
+                  {preview.command && <code>{preview.command}</code>}
+                </div>
+                <div className="preview-actions">
+                  <button className="ghost-button" type="button" onClick={() => void openPreviewUrl(preview, sessionToken, undefined, t)}>{t("project.openPreview")}</button>
+                  <button className="ghost-button" type="button" disabled={preview.status !== "running" && preview.status !== "starting"} onClick={() => void stopFolderPreview(preview)}>{t("action.disconnect")}</button>
+                  <button className="ghost-button danger-button" type="button" onClick={() => void deleteFolderPreview(preview)}>{t("action.delete")}</button>
+                </div>
+              </div>
+            ))}
+            {folderPreviewPanel.previews && !folderPreviewPanel.previews.length && <div className="empty-state">{t("project.noPreviews")}</div>}
           </div>
         </div>
       )}
@@ -4646,8 +6091,12 @@ function PreviewsPage({
   const [previewScopeFilter, setPreviewScopeFilter] = useState("");
   const [detailPreview, setDetailPreview] = useState<PreviewSummary | null>(null);
   const [detailLogs, setDetailLogs] = useState<string | null>(null);
+  const [detailLogSearch, setDetailLogSearch] = useState("");
   const [message, setMessage] = useState("");
   const previewLogsRef = useRef<HTMLPreElement | null>(null);
+  const visibleDetailLogs = detailLogs && detailLogSearch.trim()
+    ? detailLogs.split(/\r?\n/).filter((line) => line.toLowerCase().includes(detailLogSearch.trim().toLowerCase())).join("\n")
+    : detailLogs;
 
   const sources = [
     ...projects.map((project) => ({
@@ -4662,6 +6111,14 @@ function PreviewsPage({
       scopeId: session.id,
       label: `${t("nav.sessions")} · ${session.title}`,
     })),
+    ...Array.from(new Map((previews ?? [])
+      .filter((preview) => preview.scopeType === "folder")
+      .map((preview) => [preview.scopeId, {
+        key: `folder:${preview.scopeId}`,
+        scopeType: "folder" as const,
+        scopeId: preview.scopeId,
+        label: `${t("nav.files")} · ${preview.scopeId}`,
+      }])).values()),
   ];
 
   useEffect(() => {
@@ -4707,7 +6164,7 @@ function PreviewsPage({
 
   useEffect(() => {
     if (!previewLogsRef.current) return;
-    previewLogsRef.current.scrollTop = previewLogsRef.current.scrollHeight;
+    previewLogsRef.current.scrollTop = 0;
   }, [detailLogs]);
 
   async function loadPreviews(older = false, showLoading = true) {
@@ -4891,7 +6348,7 @@ function PreviewsPage({
               <strong>{detailPreview.label}</strong>
               <span>{sourceForPreview(detailPreview)}</span>
             </div>
-            <button className="modal-head-close" type="button" aria-label={t("action.close")} onClick={() => { setDetailPreview(null); setDetailLogs(null); }}><X size={16} /></button>
+            <button className="modal-head-close" type="button" aria-label={t("action.close")} onClick={() => { setDetailPreview(null); setDetailLogs(null); setDetailLogSearch(""); }}><X size={16} /></button>
           </div>
           <div className="preview-detail">
             <PreviewDetailRow label={t("preview.status")} value={detailPreview.status} />
@@ -4905,7 +6362,11 @@ function PreviewsPage({
             <PreviewDetailRow label={t("preview.updatedAt")} value={formatShortDate(detailPreview.updatedAt)} />
             <div className="preview-detail-row">
               <span>{t("preview.logs")}</span>
-              <pre ref={previewLogsRef} className="preview-logs">{detailLogs === null ? t("preview.logsLoading") : detailLogs || t("preview.noLogs")}</pre>
+              <div className="preview-log-tools">
+                <input className="search-input" name="preview-log-search" value={detailLogSearch} onChange={(event) => setDetailLogSearch(event.target.value)} placeholder={t("preview.searchLogs")} />
+                <button className="ghost-button" type="button" disabled={!detailLogs} onClick={() => detailPreview && detailLogs !== null && downloadTextFile(`${(detailPreview.label || detailPreview.id).replace(/[\\/:*?"<>|]+/g, "-")}.log`, detailLogs)}><IconText icon={Download}>{t("preview.downloadLogs")}</IconText></button>
+              </div>
+              <pre ref={previewLogsRef} className="preview-logs">{detailLogs === null ? t("preview.logsLoading") : visibleDetailLogs ? newestLinesFirst(visibleDetailLogs) : t("preview.noLogs")}</pre>
             </div>
           </div>
         </div>
@@ -5767,6 +7228,9 @@ function ProvidersPage({
   const [defaultModel, setDefaultModel] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [apiKey, setApiKey] = useState("");
+  const [rpmLimit, setRpmLimit] = useState("");
+  const [rpmLimitEnabled, setRpmLimitEnabled] = useState(false);
+  const [useProxy, setUseProxy] = useState(false);
   const [capabilities, setCapabilities] = useState<ProviderCapabilities>({
     responsesApi: false,
     chatCompletions: true,
@@ -5786,7 +7250,26 @@ function ProvidersPage({
   const [discoveringDraftModels, setDiscoveringDraftModels] = useState(false);
   const [detectingDraftInterface, setDetectingDraftInterface] = useState(false);
   const [draftModels, setDraftModels] = useState<ProviderModelsResponse | null>(null);
+  const [discoveringEditModels, setDiscoveringEditModels] = useState(false);
+  const [editModels, setEditModels] = useState<ProviderModelsResponse | null>(null);
+  const [providerModelPicker, setProviderModelPicker] = useState<{
+    target: "draft" | "edit";
+    title: string;
+    result: ProviderModelsResponse;
+  } | null>(null);
   const [healthPanel, setHealthPanel] = useState<{ provider: ProviderSummary; checks: ProviderHealthCheck[] | null; cursor?: string | null; hasMore?: boolean } | null>(null);
+  const [editPanel, setEditPanel] = useState<{
+    provider: ProviderSummary;
+    name: string;
+    kind: ProviderSummary["kind"];
+    defaultModel: string;
+    baseUrl: string;
+    apiKey: string;
+    rpmLimit: string;
+    rpmLimitEnabled: boolean;
+    useProxy: boolean;
+    capabilities: ProviderCapabilities;
+  } | null>(null);
   const [createPanelOpen, setCreatePanelOpen] = useState(false);
   const [providerSearch, setProviderSearch] = useState("");
   const [providerKindFilter, setProviderKindFilter] = useState<ProviderSummary["kind"] | "all">("all");
@@ -5807,6 +7290,8 @@ function ProvidersPage({
       provider.kind,
       provider.defaultModel,
       provider.baseUrl ?? "",
+      provider.rpmLimitEnabled && provider.rpmLimit ? `${t("provider.rpmLimit")} ${provider.rpmLimit}` : t("provider.rpmDisabled"),
+      provider.useProxy ? t("provider.proxyLocal") : t("provider.proxyDirect"),
       provider.apiKeyConfigured ? t("provider.keyConfigured") : t("provider.keyMissing"),
     ].some((value) => value.toLowerCase().includes(providerSearchText));
   });
@@ -5821,11 +7306,33 @@ function ProvidersPage({
     return payload?.error ?? `${fallback}: http_${response.status}`;
   }
 
+  function openProviderModelPicker(target: "draft" | "edit", result: ProviderModelsResponse) {
+    setProviderModelPicker({
+      target,
+      title: target === "draft" ? t("provider.createTitle") : editPanel?.provider.name ?? t("provider.editTitle"),
+      result,
+    });
+  }
+
+  function selectProviderModelFromDialog(model: string) {
+    if (!providerModelPicker) return;
+    if (providerModelPicker.target === "draft") {
+      setDefaultModel(model);
+    } else {
+      setEditPanel((current) => current ? { ...current, defaultModel: model } : current);
+    }
+    setProviderModelPicker(null);
+  }
+
   async function createProvider(event: React.FormEvent) {
     event.preventDefault();
     setMessage("");
     if (kind !== "local" && !apiKey.trim()) {
       showError(t("provider.apiKeyRequired"));
+      return;
+    }
+    if (rpmLimitEnabled && !rpmLimit.trim()) {
+      showError(t("provider.rpmRequired"));
       return;
     }
     let detectedKind = kind;
@@ -5854,6 +7361,9 @@ function ProvidersPage({
       baseUrl,
       apiKey,
       capabilities: detectedCapabilities,
+      rpmLimit: rpmLimit.trim() ? Number(rpmLimit) : null,
+      rpmLimitEnabled,
+      useProxy: detectedKind === "openai-responses" && useProxy,
     };
     const response = await fetch("/api/providers", {
       method: "POST",
@@ -5871,6 +7381,9 @@ function ProvidersPage({
     setDefaultModel("");
     setBaseUrl("");
     setApiKey("");
+    setRpmLimit("");
+    setRpmLimitEnabled(false);
+    setUseProxy(false);
     setCapabilities(defaultProviderCapabilitiesForKind(detectedKind));
     setDraftModels(null);
     setCreatePanelOpen(false);
@@ -5985,6 +7498,9 @@ function ProvidersPage({
       defaultModel,
       baseUrl,
       apiKey,
+      rpmLimit: rpmLimit.trim() ? Number(rpmLimit) : null,
+      rpmLimitEnabled,
+      useProxy: kind === "openai-responses" && useProxy,
     };
     const response = await fetch("/api/providers/models", {
       method: "POST",
@@ -6003,10 +7519,71 @@ function ProvidersPage({
           status: response.status,
           durationMs: 0,
           error: await providerError(response, "provider_models_failed"),
-        };
+    };
     setDraftModels(result);
+    openProviderModelPicker("draft", result);
     if (result.models[0] && !defaultModel) setDefaultModel(result.models[0]);
     setDiscoveringDraftModels(false);
+  }
+
+  async function discoverEditProviderModels() {
+    if (!editPanel) return;
+    setDiscoveringEditModels(true);
+    setMessage("");
+    const useDraftConfig = Boolean(editPanel.apiKey.trim()) || !editPanel.provider.apiKeyConfigured;
+    let result: ProviderModelsResponse;
+    if (useDraftConfig) {
+      const body: CreateProviderRequest = {
+        name: editPanel.name || editPanel.provider.name || t("provider.draftName"),
+        kind: editPanel.kind,
+        defaultModel: editPanel.defaultModel,
+        baseUrl: editPanel.baseUrl,
+        apiKey: editPanel.apiKey,
+        rpmLimit: editPanel.rpmLimit.trim() ? Number(editPanel.rpmLimit) : null,
+        rpmLimitEnabled: editPanel.rpmLimitEnabled,
+        useProxy: editPanel.kind === "openai-responses" && editPanel.useProxy,
+        capabilities: editPanel.capabilities,
+      };
+      const response = await fetch("/api/providers/models", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${sessionToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+      result = response.ok
+        ? ((await response.json()) as ProviderModelsResponse)
+        : {
+            ok: false,
+            providerId: editPanel.provider.id,
+            models: [],
+            status: response.status,
+            durationMs: 0,
+            error: await providerError(response, "provider_models_failed"),
+          };
+    } else {
+      const response = await fetch(`/api/providers/${editPanel.provider.id}/models?refresh=1`, {
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      result = response.ok
+        ? ((await response.json()) as ProviderModelsResponse)
+        : {
+            ok: false,
+            providerId: editPanel.provider.id,
+            models: [],
+            status: response.status,
+            durationMs: 0,
+            error: await providerError(response, "provider_models_failed"),
+          };
+    }
+    setEditModels(result);
+    openProviderModelPicker("edit", result);
+    if (result.models[0] && !editPanel.defaultModel) {
+      setEditPanel((current) => current ? { ...current, defaultModel: result.models[0] } : current);
+    }
+    if (result.ok) await onChange();
+    setDiscoveringEditModels(false);
   }
 
   async function requestDraftInterfaceDetection() {
@@ -6017,6 +7594,9 @@ function ProvidersPage({
       baseUrl,
       apiKey,
       capabilities,
+      rpmLimit: rpmLimit.trim() ? Number(rpmLimit) : null,
+      rpmLimitEnabled,
+      useProxy: kind === "openai-responses" && useProxy,
     };
     const response = await fetch("/api/providers/detect", {
       method: "POST",
@@ -6096,6 +7676,99 @@ function ProvidersPage({
       await onChange();
       notify(t("provider.updated"), "success");
     }
+  }
+
+  async function toggleProviderProxy(provider: ProviderSummary) {
+    const body: UpdateProviderRequest = { useProxy: !provider.useProxy };
+    const response = await fetch(`/api/providers/${provider.id}`, {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (response.ok) {
+      await onChange();
+      notify(t("provider.updated"), "success");
+    }
+  }
+
+  async function toggleProviderRpmLimit(provider: ProviderSummary) {
+    const body: UpdateProviderRequest = { rpmLimitEnabled: !provider.rpmLimitEnabled };
+    const response = await fetch(`/api/providers/${provider.id}`, {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (response.ok) {
+      await onChange();
+      notify(t("provider.updated"), "success");
+    }
+  }
+
+  function openEditProvider(provider: ProviderSummary) {
+    setEditModels(provider.models?.length ? {
+      ok: true,
+      providerId: provider.id,
+      models: provider.models,
+      status: null,
+      durationMs: 0,
+    } : null);
+    setEditPanel({
+      provider,
+      name: provider.name,
+      kind: provider.kind,
+      defaultModel: provider.defaultModel,
+      baseUrl: provider.baseUrl ?? "",
+      apiKey: "",
+      rpmLimit: provider.rpmLimit ? String(provider.rpmLimit) : "",
+      rpmLimitEnabled: provider.rpmLimitEnabled ?? false,
+      useProxy: provider.useProxy ?? false,
+      capabilities: { ...defaultProviderCapabilitiesForKind(provider.kind), ...(provider.capabilities ?? {}) },
+    });
+  }
+
+  async function saveEditedProvider(event: React.FormEvent) {
+    event.preventDefault();
+    if (!editPanel) return;
+    if (!editPanel.name.trim() || !editPanel.defaultModel.trim()) {
+      showError(t("provider.createFailed"));
+      return;
+    }
+    if (editPanel.kind === "openai-compatible-chat" && !editPanel.baseUrl.trim()) {
+      showError(t("provider.baseUrlRequired"));
+      return;
+    }
+    if (editPanel.kind !== "local" && !editPanel.provider.apiKeyConfigured && !editPanel.apiKey.trim()) {
+      showError(t("provider.apiKeyRequired"));
+      return;
+    }
+    if (editPanel.rpmLimitEnabled && !editPanel.rpmLimit.trim()) {
+      showError(t("provider.rpmRequired"));
+      return;
+    }
+    const body: UpdateProviderRequest = {
+      name: editPanel.name.trim(),
+      kind: editPanel.kind,
+      defaultModel: editPanel.defaultModel.trim(),
+      baseUrl: editPanel.baseUrl,
+      rpmLimit: editPanel.rpmLimit.trim() ? Number(editPanel.rpmLimit) : null,
+      rpmLimitEnabled: editPanel.rpmLimitEnabled,
+      useProxy: editPanel.kind === "openai-responses" && editPanel.useProxy,
+      capabilities: editPanel.capabilities,
+    };
+    if (editPanel.apiKey.trim()) body.apiKey = editPanel.apiKey;
+    const response = await fetch(`/api/providers/${editPanel.provider.id}`, {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      showError(t("provider.updateFailed"));
+      return;
+    }
+    setEditPanel(null);
+    setEditModels(null);
+    await onChange();
+    notify(t("provider.updated"), "success");
   }
 
   function renderModelPicker(key: string, result: ProviderModelsResponse, selectedModel: string, onSelect: (model: string) => void, onClose?: () => void) {
@@ -6199,22 +7872,27 @@ function ProvidersPage({
           <input name="baseurl" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder={t("form.baseUrl")} />
           <input name="apikey" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={t("form.apiKey")} type="password" />
           <input name="defaultmodel" value={defaultModel} onChange={(event) => setDefaultModel(event.target.value)} placeholder={t("form.defaultModel")} required />
+          <input name="rpmlimit" value={rpmLimit} onChange={(event) => setRpmLimit(event.target.value)} placeholder={t("form.rpmLimit")} type="number" min="1" inputMode="numeric" />
+          <label className="checkbox-row">
+            <input name="rpmlimitenabled" type="checkbox" checked={rpmLimitEnabled} onChange={(event) => setRpmLimitEnabled(event.target.checked)} />
+            <span>{t("provider.rpmEnabled")}</span>
+          </label>
+          {kind === "openai-responses" && (
+            <label className="checkbox-row">
+              <input name="useproxy" type="checkbox" checked={useProxy} onChange={(event) => setUseProxy(event.target.checked)} />
+              <span>{t("provider.useProxy")}</span>
+            </label>
+          )}
           <button className="ghost-button" type="button" onClick={detectDraftInterface} disabled={detectingDraftInterface || !defaultModel.trim()}>
             <IconText icon={Activity}>{detectingDraftInterface ? t("provider.detecting") : t("provider.detectInterface")}</IconText>
           </button>
           <button className="ghost-button" type="button" onClick={discoverDraftModels} disabled={discoveringDraftModels}>
             <IconText icon={RefreshCw}>{discoveringDraftModels ? t("provider.detecting") : t("provider.detectModels")}</IconText>
           </button>
-          <div className="checkbox-grid">
-            {capabilityItems.map((item) => (
-              <label key={item.key}>
-                <input name="capabilities-item-key" type="checkbox" checked={capabilities[item.key]} onChange={(event) => setCapabilities((current) => ({ ...current, [item.key]: event.target.checked }))} />
-                <span>{item.label}</span>
-              </label>
-            ))}
-          </div>
           {draftModels && (
-            renderModelPicker("draft", draftModels, defaultModel, setDefaultModel, () => setDraftModels(null))
+            <button className="ghost-button" type="button" onClick={() => openProviderModelPicker("draft", draftModels)}>
+              {t("provider.detectModels")} · {draftModels.models.length || t("provider.noModels")}
+            </button>
           )}
           {message && <span className="form-error">{message}</span>}
           <button className="dark-button"><IconText icon={Save}>{t("provider.saveProvider")}</IconText></button>
@@ -6241,7 +7919,19 @@ function ProvidersPage({
             <div className="provider-card" key={provider.id}>
               <strong>{provider.name}</strong>
               <span>{provider.kind} · {provider.defaultModel}</span>
-              <span>{provider.baseUrl ?? t("provider.defaultEndpoint")} · {t("provider.keyLabel")} {provider.apiKeyConfigured ? t("provider.keyConfigured") : t("provider.keyMissing")}</span>
+              <span>{provider.baseUrl ?? t("provider.defaultEndpoint")} · {t("provider.keyLabel")} {provider.apiKeyConfigured ? t("provider.keyConfigured") : t("provider.keyMissing")} · {provider.rpmLimitEnabled && provider.rpmLimit ? `${t("provider.rpmLimit")} ${provider.rpmLimit}` : t("provider.rpmDisabled")} · {provider.useProxy ? t("provider.proxyLocal") : t("provider.proxyDirect")}</span>
+              {provider.rpmLimit && (
+                <label className="checkbox-row">
+                  <input name="provider-rpmlimitenabled" type="checkbox" checked={provider.rpmLimitEnabled ?? false} onChange={() => void toggleProviderRpmLimit(provider)} />
+                  <span>{t("provider.rpmEnabled")}</span>
+                </label>
+              )}
+              {provider.kind === "openai-responses" && (
+                <label className="checkbox-row">
+                  <input name="provider-useproxy" type="checkbox" checked={provider.useProxy ?? false} onChange={() => void toggleProviderProxy(provider)} />
+                  <span>{t("provider.useProxy")}</span>
+                </label>
+              )}
               <div className="checkbox-grid compact-capabilities">
                 {capabilityItems.map((item) => {
                   const current = { ...defaultProviderCapabilitiesForKind(provider.kind), ...(provider.capabilities ?? {}) };
@@ -6260,6 +7950,9 @@ function ProvidersPage({
                 </span>
               )}
               <div className="provider-card-actions">
+                <button className="ghost-button" type="button" onClick={() => openEditProvider(provider)}>
+                  <IconText icon={Pencil}>{t("provider.editTitle")}</IconText>
+                </button>
                 <button className="ghost-button" type="button" onClick={() => testProvider(provider.id)} disabled={testingProviderId === provider.id}>
                   <IconText icon={Activity}>{testingProviderId === provider.id ? t("provider.testing") : t("provider.testConnection")}</IconText>
                 </button>
@@ -6275,6 +7968,22 @@ function ProvidersPage({
                 <button className="ghost-button danger-button" type="button" onClick={() => deleteProvider(provider.id, provider.name)}>
                   <IconText icon={Trash2}>{t("action.delete")}</IconText>
                 </button>
+              </div>
+              <div className="provider-card-action-menu">
+                <Button className="icon-only" variant="outline" size="sm" type="button" title={t("provider.editTitle")} aria-label={t("provider.editTitle")} onClick={() => openEditProvider(provider)}><IconText icon={Pencil}>{t("provider.editTitle")}</IconText></Button>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button className="icon-only" variant="outline" size="sm" type="button" title={t("action.more")} aria-label={t("action.more")}><IconText icon={MoreHorizontal}>{t("action.more")}</IconText></Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuItem disabled={testingProviderId === provider.id} onSelect={() => void testProvider(provider.id)}><IconText icon={Activity}>{testingProviderId === provider.id ? t("provider.testing") : t("provider.testConnection")}</IconText></DropdownMenuItem>
+                    <DropdownMenuItem disabled={detectingProviderInterfaceId === provider.id} onSelect={() => void detectProviderInterface(provider.id)}><IconText icon={Activity}>{detectingProviderInterfaceId === provider.id ? t("provider.detecting") : t("provider.detectInterface")}</IconText></DropdownMenuItem>
+                    <DropdownMenuItem disabled={discoveringProviderId === provider.id} onSelect={() => void discoverModels(provider.id)}><IconText icon={RefreshCw}>{discoveringProviderId === provider.id ? t("provider.detecting") : t("provider.detectModels")}</IconText></DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => void openProviderHealth(provider)}><IconText icon={History}>{t("provider.healthHistory")}</IconText></DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem className="danger-menu-item" onSelect={() => deleteProvider(provider.id, provider.name)}><IconText icon={Trash2}>{t("action.delete")}</IconText></DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
               </div>
               {modelResults[provider.id] && (
                 renderModelPicker(provider.id, modelResults[provider.id], provider.defaultModel, (model) => void applyDefaultModel(provider.id, model), () => setModelResults((items) => {
@@ -6311,6 +8020,91 @@ function ProvidersPage({
           </div>
         </div>
       )}
+      {providerModelPicker && (
+        <div className="workspace-modal compact-modal provider-model-picker-modal" role="dialog" aria-modal="true">
+          <div className="workspace-modal-head">
+            <div>
+              <strong>{t("provider.detectModels")}</strong>
+              <span>{providerModelPicker.title}</span>
+            </div>
+            <button className="ghost-button icon-only" type="button" onClick={() => setProviderModelPicker(null)} title={t("action.close")} aria-label={t("action.close")}><X size={16} /></button>
+          </div>
+          <div className="provider-model-picker-body">
+            {renderModelPicker(
+              `provider-picker-${providerModelPicker.target}`,
+              providerModelPicker.result,
+              providerModelPicker.target === "draft" ? defaultModel : editPanel?.defaultModel ?? "",
+              selectProviderModelFromDialog,
+            )}
+          </div>
+        </div>
+      )}
+      {editPanel && (
+        <div className="workspace-modal compact-modal provider-create-modal" role="dialog" aria-modal="true">
+          <div className="workspace-modal-head">
+            <div>
+              <strong>{t("provider.editTitle")}</strong>
+              <span>{editPanel.provider.name}</span>
+            </div>
+            <button className="ghost-button icon-only" type="button" onClick={() => { setEditPanel(null); setEditModels(null); }} title={t("action.close")} aria-label={t("action.close")}><X size={16} /></button>
+          </div>
+          <form className="management-form" onSubmit={saveEditedProvider}>
+            <input name="edit-provider-name" value={editPanel.name} onChange={(event) => setEditPanel((current) => current ? { ...current, name: event.target.value } : current)} placeholder={t("form.providerName")} required />
+            <select name="edit-provider-kind" value={editPanel.kind} onChange={(event) => {
+              const nextKind = event.target.value as ProviderSummary["kind"];
+              setEditModels(null);
+              setEditPanel((current) => current ? {
+                ...current,
+                kind: nextKind,
+                useProxy: nextKind === "openai-responses" ? current.useProxy : false,
+                capabilities: defaultProviderCapabilitiesForKind(nextKind),
+              } : current);
+            }}>
+              <option value="openai-compatible-chat">{t("provider.kindCompatible")}</option>
+              <option value="openai-responses">{t("provider.kindResponses")}</option>
+              <option value="local">{t("provider.kindLocal")}</option>
+            </select>
+            <input name="edit-provider-baseurl" value={editPanel.baseUrl} onChange={(event) => {
+              setEditModels(null);
+              setEditPanel((current) => current ? { ...current, baseUrl: event.target.value } : current);
+            }} placeholder={t("form.baseUrl")} />
+            <input name="edit-provider-apikey" value={editPanel.apiKey} onChange={(event) => {
+              setEditModels(null);
+              setEditPanel((current) => current ? { ...current, apiKey: event.target.value } : current);
+            }} placeholder={t("provider.apiKeyEditPlaceholder")} type="password" />
+            <input name="edit-provider-defaultmodel" value={editPanel.defaultModel} onChange={(event) => setEditPanel((current) => current ? { ...current, defaultModel: event.target.value } : current)} placeholder={t("form.defaultModel")} required />
+            <button className="ghost-button" type="button" onClick={() => void discoverEditProviderModels()} disabled={discoveringEditModels}>
+              <IconText icon={RefreshCw}>{discoveringEditModels ? t("provider.detecting") : t("provider.detectModels")}</IconText>
+            </button>
+            {editModels && (
+              <button className="ghost-button" type="button" onClick={() => openProviderModelPicker("edit", editModels)}>
+                {t("provider.detectModels")} · {editModels.models.length || t("provider.noModels")}
+              </button>
+            )}
+            <input name="edit-provider-rpmlimit" value={editPanel.rpmLimit} onChange={(event) => setEditPanel((current) => current ? { ...current, rpmLimit: event.target.value } : current)} placeholder={t("form.rpmLimit")} type="number" min="1" inputMode="numeric" />
+            <label className="checkbox-row">
+              <input name="edit-provider-rpmlimitenabled" type="checkbox" checked={editPanel.rpmLimitEnabled} onChange={(event) => setEditPanel((current) => current ? { ...current, rpmLimitEnabled: event.target.checked } : current)} />
+              <span>{t("provider.rpmEnabled")}</span>
+            </label>
+            {editPanel.kind === "openai-responses" && (
+              <label className="checkbox-row">
+                <input name="edit-provider-useproxy" type="checkbox" checked={editPanel.useProxy} onChange={(event) => setEditPanel((current) => current ? { ...current, useProxy: event.target.checked } : current)} />
+                <span>{t("provider.useProxy")}</span>
+              </label>
+            )}
+            <div className="checkbox-grid">
+              {capabilityItems.map((item) => (
+                <label key={item.key}>
+                  <input name={`edit-provider-capability-${item.key}`} type="checkbox" checked={editPanel.capabilities[item.key]} onChange={(event) => setEditPanel((current) => current ? { ...current, capabilities: { ...current.capabilities, [item.key]: event.target.checked } } : current)} />
+                  <span>{item.label}</span>
+                </label>
+              ))}
+            </div>
+            {message && <span className="form-error">{message}</span>}
+            <button className="dark-button"><IconText icon={Save}>{t("provider.saveChanges")}</IconText></button>
+          </form>
+        </div>
+      )}
       {createPanelOpen && (
         <div className="workspace-modal compact-modal provider-create-modal" role="dialog" aria-modal="true">
           <div className="workspace-modal-head">
@@ -6334,22 +8128,27 @@ function ProvidersPage({
             <input name="mobile-baseurl" value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder={t("form.baseUrl")} />
             <input name="mobile-apikey" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={t("form.apiKey")} type="password" />
             <input name="mobile-defaultmodel" value={defaultModel} onChange={(event) => setDefaultModel(event.target.value)} placeholder={t("form.defaultModel")} required />
+            <input name="mobile-rpmlimit" value={rpmLimit} onChange={(event) => setRpmLimit(event.target.value)} placeholder={t("form.rpmLimit")} type="number" min="1" inputMode="numeric" />
+            <label className="checkbox-row">
+              <input name="mobile-rpmlimitenabled" type="checkbox" checked={rpmLimitEnabled} onChange={(event) => setRpmLimitEnabled(event.target.checked)} />
+              <span>{t("provider.rpmEnabled")}</span>
+            </label>
+            {kind === "openai-responses" && (
+              <label className="checkbox-row">
+                <input name="mobile-useproxy" type="checkbox" checked={useProxy} onChange={(event) => setUseProxy(event.target.checked)} />
+                <span>{t("provider.useProxy")}</span>
+              </label>
+            )}
             <button className="ghost-button" type="button" onClick={detectDraftInterface} disabled={detectingDraftInterface || !defaultModel.trim()}>
               <IconText icon={Activity}>{detectingDraftInterface ? t("provider.detecting") : t("provider.detectInterface")}</IconText>
             </button>
             <button className="ghost-button" type="button" onClick={discoverDraftModels} disabled={discoveringDraftModels}>
               <IconText icon={RefreshCw}>{discoveringDraftModels ? t("provider.detecting") : t("provider.detectModels")}</IconText>
             </button>
-            <div className="checkbox-grid">
-              {capabilityItems.map((item) => (
-                <label key={item.key}>
-                  <input name="mobile-capabilities-item-key" type="checkbox" checked={capabilities[item.key]} onChange={(event) => setCapabilities((current) => ({ ...current, [item.key]: event.target.checked }))} />
-                  <span>{item.label}</span>
-                </label>
-              ))}
-            </div>
             {draftModels && (
-              renderModelPicker("mobile-draft", draftModels, defaultModel, setDefaultModel, () => setDraftModels(null))
+              <button className="ghost-button" type="button" onClick={() => openProviderModelPicker("draft", draftModels)}>
+                {t("provider.detectModels")} · {draftModels.models.length || t("provider.noModels")}
+              </button>
             )}
             {message && <span className="form-error">{message}</span>}
             <button className="dark-button"><IconText icon={Save}>{t("provider.saveProvider")}</IconText></button>
@@ -8764,6 +10563,7 @@ function ApprovalsPage({
 function SettingsPage({
   sessionToken,
   t,
+  onOpenSession,
   onOpenMainNav,
   onSessionRefresh,
   onLogout,
@@ -8771,6 +10571,7 @@ function SettingsPage({
 }: {
   sessionToken: string;
   t: TFunction;
+  onOpenSession: (sessionId: string) => void;
   onOpenMainNav?: () => void;
   onSessionRefresh: (token: string, auth: AuthState) => void;
   onLogout: () => void;
@@ -8803,7 +10604,8 @@ function SettingsPage({
   const [cleanupArchivedApprovals, setCleanupArchivedApprovals] = useState(true);
   const [cleanupArchivedApprovalDays, setCleanupArchivedApprovalDays] = useState(30);
   const [cleanupApprovalAuditLog, setCleanupApprovalAuditLog] = useState(false);
-  const [settingsTab, setSettingsTab] = useState<"account" | "runtime" | "network" | "maintenance" | "storage" | "backup">("account");
+  const [taskHealth, setTaskHealth] = useState<TaskHealthResponse | null>(null);
+  const [settingsTab, setSettingsTab] = useState<"account" | "runtime" | "network" | "notifications" | "maintenance" | "storage" | "backup">("account");
   const [busy, setBusy] = useState("");
   const [codexRuntime, setCodexRuntime] = useState<CodexRuntimeSettings | null>(null);
   const [sandboxMode, setSandboxMode] = useState<CodexSandboxMode>("workspace-write");
@@ -8811,6 +10613,14 @@ function SettingsPage({
   const [bypassSandbox, setBypassSandbox] = useState(false);
   const [previewAccessSettings, setPreviewAccessSettings] = useState<PreviewAccessSettings | null>(null);
   const [previewAccessRequestTtlMinutes, setPreviewAccessRequestTtlMinutes] = useState("30");
+  const [sessionCompactionSettings, setSessionCompactionSettings] = useState<SessionCompactionSettings | null>(null);
+  const [sessionCompactionEnabled, setSessionCompactionEnabled] = useState(true);
+  const [sessionCompactionForm, setSessionCompactionForm] = useState({
+    autoCompactMessages: "80",
+    autoCompactChars: "80000",
+    minNewMessages: "20",
+    minNewChars: "12000",
+  });
   const [rateLimitSettings, setRateLimitSettings] = useState<RateLimitSettings | null>(null);
   const [rateLimitEnabled, setRateLimitEnabled] = useState(true);
   const [rateLimitForm, setRateLimitForm] = useState({
@@ -8821,6 +10631,99 @@ function SettingsPage({
     providerProxyPerMinute: "60",
     providerProxyPerHour: "600",
     providerProxyMaxConcurrent: "5",
+  });
+  const [notificationSettings, setNotificationSettings] = useState<NotificationSettingsResponse | null>(null);
+  const [notificationView, setNotificationView] = useState<"senders" | "recipients" | "rules" | "logs">("senders");
+  const [notificationRuleEnabledFilter, setNotificationRuleEnabledFilter] = useState("");
+  const [notificationRuleCursor, setNotificationRuleCursor] = useState<string | null>(null);
+  const [notificationRuleLoading, setNotificationRuleLoading] = useState(false);
+  const [notificationEphemeralRuleCursor, setNotificationEphemeralRuleCursor] = useState<string | null>(null);
+  const [notificationEphemeralRuleLoading, setNotificationEphemeralRuleLoading] = useState(false);
+  const [notificationDeliveryEventFilter, setNotificationDeliveryEventFilter] = useState("");
+  const [notificationDeliveryStatusFilter, setNotificationDeliveryStatusFilter] = useState("");
+  const [notificationDeliverySeverityFilter, setNotificationDeliverySeverityFilter] = useState("");
+  const [notificationDeliveryCursor, setNotificationDeliveryCursor] = useState<string | null>(null);
+  const [notificationDeliveryLoading, setNotificationDeliveryLoading] = useState(false);
+  const [notificationAccountForm, setNotificationAccountForm] = useState({
+    name: "",
+    channelId: "email",
+    channelKind: "email" as NotificationAccountSummary["channelKind"],
+    enabled: true,
+    customConfig: {} as Record<string, string>,
+    webhookUrl: "",
+    webhookMethod: "POST",
+    webhookHeaders: "",
+    webhookBodyTemplate: "",
+    barkServerUrl: "https://api.day.app",
+    barkDeviceKey: "",
+    barkGroup: "Codex Web",
+    barkSound: "",
+    barkIcon: "",
+    barkUrl: "",
+    emailHost: "",
+    emailPort: "587",
+    emailSecure: false,
+    emailUsername: "",
+    emailPassword: "",
+    emailFromName: "Codex Web",
+    emailFromEmail: "",
+    emailCreateRecipient: true,
+    telegramBotToken: "",
+    telegramProxyUrl: "",
+    telegramTestChatId: "",
+    telegramInboundEnabled: false,
+    telegramAllowedChatIds: "",
+    telegramAllowedUserIds: "",
+    telegramDefaultSessionId: "",
+    testEmailTo: "",
+    permissionAgentIds: "",
+    permissionRoomIds: "",
+    permissionProjectIds: "",
+  });
+  const [notificationEditingAccountId, setNotificationEditingAccountId] = useState("");
+  const [notificationRuleForm, setNotificationRuleForm] = useState({
+    name: "",
+    enabled: true,
+    eventTypes: ["task_completed", "task_failed", "needs_approval"] as NotificationEventType[],
+    minSeverity: "info" as NotificationSeverity,
+    recipientIds: [] as string[],
+    senderAccountId: "",
+    telegramSenderAccountId: "",
+    emailTo: "",
+    dedupeMinutes: "5",
+  });
+  const [notificationEditingRuleId, setNotificationEditingRuleId] = useState("");
+  const [notificationRecipientForm, setNotificationRecipientForm] = useState({
+    name: "",
+    kind: "email" as NotificationRecipientSummary["kind"],
+    enabled: true,
+    senderAccountId: "",
+    channelId: "webhook",
+    email: "",
+    webhookUrl: "",
+    barkServerUrl: "https://api.day.app",
+    barkDeviceKey: "",
+    barkGroup: "Codex Web",
+    telegramChatId: "",
+    telegramSenderAccountId: "",
+    customConfig: {} as Record<string, string>,
+    permissionAgentIds: "",
+    permissionRoomIds: "",
+    permissionProjectIds: "",
+  });
+  const [notificationEditingRecipientId, setNotificationEditingRecipientId] = useState("");
+  const [notificationChannelManagerOpen, setNotificationChannelManagerOpen] = useState(false);
+  const [notificationEditingChannelId, setNotificationEditingChannelId] = useState("");
+  const [notificationChannelForm, setNotificationChannelForm] = useState({
+    name: "",
+    description: "",
+    adapter: "webhook",
+    authType: "none",
+    method: "POST",
+    urlTemplate: "",
+    headersTemplate: "",
+    bodyTemplate: "{\n  \"title\": \"{{title}}\",\n  \"message\": \"{{message}}\"\n}",
+    accountFields: "",
   });
 
   function showTokenNotice(value: string) {
@@ -8853,6 +10756,20 @@ function SettingsPage({
         setPreviewAccessRequestTtlMinutes(String(settings.requestTtlMinutes));
       })
       .catch(() => undefined);
+    fetch("/api/settings/session-compaction", { headers })
+      .then((response) => response.ok ? response.json() : null)
+      .then((settings: SessionCompactionSettings | null) => {
+        if (!settings) return;
+        setSessionCompactionSettings(settings);
+        setSessionCompactionEnabled(settings.enabled);
+        setSessionCompactionForm({
+          autoCompactMessages: String(settings.autoCompactMessages),
+          autoCompactChars: String(settings.autoCompactChars),
+          minNewMessages: String(settings.minNewMessages),
+          minNewChars: String(settings.minNewChars),
+        });
+      })
+      .catch(() => undefined);
     fetch("/api/settings/rate-limit", { headers })
       .then((response) => response.ok ? response.json() : null)
       .then((settings: RateLimitSettings | null) => {
@@ -8878,7 +10795,762 @@ function SettingsPage({
         setBackupIgnoreRules(settings.ignorePatterns.join("\n"));
       })
       .catch(() => undefined);
+    void loadNotifications();
   }, [sessionToken]);
+
+  useEffect(() => {
+    if (!notificationSettings) return;
+    void loadNotifications();
+  }, [notificationRuleEnabledFilter, notificationDeliveryEventFilter, notificationDeliveryStatusFilter, notificationDeliverySeverityFilter]);
+
+  async function loadNotifications() {
+    const headers = { authorization: `Bearer ${sessionToken}` };
+    const response = await fetch("/api/notifications", { headers });
+    if (!response.ok) return;
+    const result = await response.json() as NotificationSettingsResponse;
+    const ruleParams = new URLSearchParams({ limit: "20" });
+    if (notificationRuleEnabledFilter) ruleParams.set("enabled", notificationRuleEnabledFilter);
+    const deliveryParams = new URLSearchParams({ limit: "20" });
+    if (notificationDeliveryEventFilter) deliveryParams.set("eventType", notificationDeliveryEventFilter);
+    if (notificationDeliveryStatusFilter) deliveryParams.set("status", notificationDeliveryStatusFilter);
+    if (notificationDeliverySeverityFilter) deliveryParams.set("severity", notificationDeliverySeverityFilter);
+    const [rulesResponse, ephemeralRulesResponse, deliveriesResponse] = await Promise.all([
+      fetch(`/api/notifications/rules?${ruleParams}`, { headers }),
+      fetch("/api/notifications/ephemeral-rules?limit=20", { headers }),
+      fetch(`/api/notifications/deliveries?${deliveryParams}`, { headers }),
+    ]);
+    const rulesPage = rulesResponse.ok ? await rulesResponse.json() as PageResponse<NotificationRuleSummary> : null;
+    const ephemeralRulesPage = ephemeralRulesResponse.ok ? await ephemeralRulesResponse.json() as PageResponse<NotificationEphemeralRuleSummary> : null;
+    const deliveriesPage = deliveriesResponse.ok ? await deliveriesResponse.json() as PageResponse<NotificationDeliverySummary> : null;
+    setNotificationSettings({
+      ...result,
+      rules: rulesPage?.items ?? result.rules,
+      ephemeralRules: ephemeralRulesPage?.items ?? result.ephemeralRules,
+      recentDeliveries: deliveriesPage?.items ?? result.recentDeliveries,
+    });
+    setNotificationRuleCursor(rulesPage?.nextCursor ?? null);
+    setNotificationEphemeralRuleCursor(ephemeralRulesPage?.nextCursor ?? null);
+    setNotificationDeliveryCursor(deliveriesPage?.nextCursor ?? null);
+  }
+
+  async function loadMoreNotificationRules() {
+    if (!notificationRuleCursor || notificationRuleLoading) return;
+    setNotificationRuleLoading(true);
+    try {
+      const params = new URLSearchParams({ limit: "20", cursor: notificationRuleCursor });
+      if (notificationRuleEnabledFilter) params.set("enabled", notificationRuleEnabledFilter);
+      const response = await fetch(`/api/notifications/rules?${params}`, {
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) return;
+      const page = await response.json() as PageResponse<NotificationRuleSummary>;
+      setNotificationSettings((current) => current ? { ...current, rules: [...current.rules, ...page.items] } : current);
+      setNotificationRuleCursor(page.nextCursor);
+    } finally {
+      setNotificationRuleLoading(false);
+    }
+  }
+
+  async function loadMoreNotificationEphemeralRules() {
+    if (!notificationEphemeralRuleCursor || notificationEphemeralRuleLoading) return;
+    setNotificationEphemeralRuleLoading(true);
+    try {
+      const response = await fetch(`/api/notifications/ephemeral-rules?limit=20&cursor=${encodeURIComponent(notificationEphemeralRuleCursor)}`, {
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) return;
+      const page = await response.json() as PageResponse<NotificationEphemeralRuleSummary>;
+      setNotificationSettings((current) => current ? { ...current, ephemeralRules: [...current.ephemeralRules, ...page.items] } : current);
+      setNotificationEphemeralRuleCursor(page.nextCursor);
+    } finally {
+      setNotificationEphemeralRuleLoading(false);
+    }
+  }
+
+  async function loadMoreNotificationDeliveries() {
+    if (!notificationDeliveryCursor || notificationDeliveryLoading) return;
+    setNotificationDeliveryLoading(true);
+    try {
+      const params = new URLSearchParams({ limit: "20", cursor: notificationDeliveryCursor });
+      if (notificationDeliveryEventFilter) params.set("eventType", notificationDeliveryEventFilter);
+      if (notificationDeliveryStatusFilter) params.set("status", notificationDeliveryStatusFilter);
+      if (notificationDeliverySeverityFilter) params.set("severity", notificationDeliverySeverityFilter);
+      const response = await fetch(`/api/notifications/deliveries?${params}`, {
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) return;
+      const page = await response.json() as PageResponse<NotificationDeliverySummary>;
+      setNotificationSettings((current) => current ? { ...current, recentDeliveries: [...current.recentDeliveries, ...page.items] } : current);
+      setNotificationDeliveryCursor(page.nextCursor);
+    } finally {
+      setNotificationDeliveryLoading(false);
+    }
+  }
+
+  function selectedNotificationChannel() {
+    return notificationSettings?.channels.find((channel) => channel.id === notificationAccountForm.channelId)
+      ?? notificationSettings?.channels.find((channel) => channel.kind === notificationAccountForm.channelKind)
+      ?? null;
+  }
+
+  function emailNotificationSenders() {
+    return (notificationSettings?.accounts ?? []).filter((account) => account.enabled && account.channelKind === "email");
+  }
+
+  function telegramNotificationSenders() {
+    return (notificationSettings?.accounts ?? []).filter((account) => account.enabled && account.channelKind === "telegram");
+  }
+
+  function csvIds(value: string) {
+    return value.split(",").map((item) => item.trim()).filter(Boolean);
+  }
+
+  function configListToCsv(value: unknown) {
+    if (Array.isArray(value)) return value.map(String).join(", ");
+    return String(value ?? "").split(",").map((item) => item.trim()).filter(Boolean).join(", ");
+  }
+
+  function notificationPermissionsFromForm(form: { permissionAgentIds: string; permissionRoomIds: string; permissionProjectIds: string }) {
+    return {
+      allowedAgentIds: csvIds(form.permissionAgentIds),
+      allowedRoomIds: csvIds(form.permissionRoomIds),
+      allowedProjectIds: csvIds(form.permissionProjectIds),
+    };
+  }
+
+  function notificationPermissionsToForm(permissions?: { allowedAgentIds?: string[]; allowedRoomIds?: string[]; allowedProjectIds?: string[] }) {
+    return {
+      permissionAgentIds: (permissions?.allowedAgentIds ?? []).join(", "),
+      permissionRoomIds: (permissions?.allowedRoomIds ?? []).join(", "),
+      permissionProjectIds: (permissions?.allowedProjectIds ?? []).join(", "),
+    };
+  }
+
+  function notificationPermissionSummary(permissions?: { allowedAgentIds?: string[]; allowedRoomIds?: string[]; allowedProjectIds?: string[] }) {
+    const count = (permissions?.allowedAgentIds?.length ?? 0) + (permissions?.allowedRoomIds?.length ?? 0) + (permissions?.allowedProjectIds?.length ?? 0);
+    return count ? t("settings.notificationPermissionRestricted") : t("settings.notificationPermissionUnrestricted");
+  }
+
+  function notificationAccountConfig() {
+    const selectedChannel = selectedNotificationChannel();
+    if (selectedChannel && selectedChannel.builtin === false) return notificationAccountForm.customConfig;
+    if (notificationAccountForm.channelKind === "email") {
+      return {
+        host: notificationAccountForm.emailHost,
+        port: Number(notificationAccountForm.emailPort) || 587,
+        secure: notificationAccountForm.emailSecure,
+        username: notificationAccountForm.emailUsername,
+        password: notificationAccountForm.emailPassword,
+        fromName: notificationAccountForm.emailFromName,
+        fromEmail: notificationAccountForm.emailFromEmail,
+        testEmailTo: csvIds(notificationAccountForm.testEmailTo),
+      };
+    }
+    if (notificationAccountForm.channelKind === "telegram") {
+      return {
+        botToken: notificationAccountForm.telegramBotToken,
+        proxyUrl: notificationAccountForm.telegramProxyUrl,
+        inboundEnabled: notificationAccountForm.telegramInboundEnabled,
+        allowedChatIds: csvIds(notificationAccountForm.telegramAllowedChatIds),
+        allowedUserIds: csvIds(notificationAccountForm.telegramAllowedUserIds),
+        defaultSessionId: notificationAccountForm.telegramDefaultSessionId,
+        testChatId: notificationAccountForm.telegramTestChatId,
+      };
+    }
+    if (notificationAccountForm.channelKind === "webhook") {
+      const headers = Object.fromEntries(notificationAccountForm.webhookHeaders.split("\n").map((line) => {
+        const index = line.indexOf(":");
+        return index > 0 ? [line.slice(0, index).trim(), line.slice(index + 1).trim()] : ["", ""];
+      }).filter(([key]) => key));
+      return {
+        url: notificationAccountForm.webhookUrl,
+        method: notificationAccountForm.webhookMethod,
+        headers,
+        bodyTemplate: notificationAccountForm.webhookBodyTemplate,
+      };
+    }
+    return {
+      serverUrl: notificationAccountForm.barkServerUrl,
+      deviceKey: notificationAccountForm.barkDeviceKey,
+      group: notificationAccountForm.barkGroup,
+      sound: notificationAccountForm.barkSound,
+      icon: notificationAccountForm.barkIcon,
+      url: notificationAccountForm.barkUrl,
+    };
+  }
+
+  function resetNotificationAccountForm() {
+    setNotificationEditingAccountId("");
+    setNotificationAccountForm({
+      name: "",
+      channelId: "email",
+      channelKind: "email",
+      enabled: true,
+      customConfig: {},
+      webhookUrl: "",
+      webhookMethod: "POST",
+      webhookHeaders: "",
+      webhookBodyTemplate: "",
+      barkServerUrl: "https://api.day.app",
+      barkDeviceKey: "",
+      barkGroup: "Codex Web",
+      barkSound: "",
+      barkIcon: "",
+      barkUrl: "",
+      emailHost: "",
+      emailPort: "587",
+      emailSecure: false,
+      emailUsername: "",
+      emailPassword: "",
+      emailFromName: "Codex Web",
+      emailFromEmail: "",
+      emailCreateRecipient: true,
+      telegramBotToken: "",
+      telegramProxyUrl: "",
+      telegramTestChatId: "",
+      telegramInboundEnabled: false,
+      telegramAllowedChatIds: "",
+      telegramAllowedUserIds: "",
+      telegramDefaultSessionId: "",
+      testEmailTo: "",
+      permissionAgentIds: "",
+      permissionRoomIds: "",
+      permissionProjectIds: "",
+    });
+  }
+
+  function editNotificationAccount(account: NotificationAccountSummary) {
+    const config = account.config as Record<string, unknown>;
+    setNotificationEditingAccountId(account.id);
+    setNotificationAccountForm({
+      name: account.name,
+      channelId: account.channelId ?? account.channelKind,
+      channelKind: account.channelKind,
+      enabled: account.enabled,
+      customConfig: Object.fromEntries(Object.entries(config).map(([key, value]) => [key, String(value ?? "")])),
+      webhookUrl: String(config.url ?? ""),
+      webhookMethod: String(config.method ?? "POST"),
+      webhookHeaders: config.headers && typeof config.headers === "object"
+        ? Object.entries(config.headers as Record<string, unknown>).map(([key, value]) => `${key}: ${String(value ?? "")}`).join("\n")
+        : "",
+      webhookBodyTemplate: String(config.bodyTemplate ?? ""),
+      barkServerUrl: String(config.serverUrl ?? "https://api.day.app"),
+      barkDeviceKey: String(config.deviceKey ?? ""),
+      barkGroup: String(config.group ?? "Codex Web"),
+      barkSound: String(config.sound ?? ""),
+      barkIcon: String(config.icon ?? ""),
+      barkUrl: String(config.url ?? ""),
+      emailHost: String(config.host ?? ""),
+      emailPort: String(config.port ?? "587"),
+      emailSecure: config.secure === true,
+      emailUsername: String(config.username ?? ""),
+      emailPassword: String(config.password ?? ""),
+      emailFromName: String(config.fromName ?? "Codex Web"),
+      emailFromEmail: String(config.fromEmail ?? ""),
+      emailCreateRecipient: false,
+      testEmailTo: configListToCsv(config.testEmailTo),
+      telegramBotToken: String(config.botToken ?? ""),
+      telegramProxyUrl: String(config.proxyUrl ?? ""),
+      telegramTestChatId: String(config.testChatId ?? ""),
+      telegramInboundEnabled: config.inboundEnabled === true,
+      telegramAllowedChatIds: configListToCsv(config.allowedChatIds),
+      telegramAllowedUserIds: configListToCsv(config.allowedUserIds),
+      telegramDefaultSessionId: String(config.defaultSessionId ?? ""),
+      ...notificationPermissionsToForm(account.permissions),
+    });
+  }
+
+  function toggleNotificationEvent(type: NotificationEventType) {
+    setNotificationRuleForm((current) => ({
+      ...current,
+      eventTypes: current.eventTypes.includes(type)
+        ? current.eventTypes.filter((item) => item !== type)
+        : [...current.eventTypes, type],
+    }));
+  }
+
+  function toggleNotificationTarget(recipientId: string) {
+    setNotificationRuleForm((current) => ({
+      ...current,
+      recipientIds: current.recipientIds.includes(recipientId)
+        ? current.recipientIds.filter((item) => item !== recipientId)
+        : [...current.recipientIds, recipientId],
+    }));
+  }
+
+  function resetNotificationRuleForm() {
+    setNotificationEditingRuleId("");
+    setNotificationRuleForm({
+      name: "",
+      enabled: true,
+      eventTypes: ["task_completed", "task_failed", "needs_approval"],
+      minSeverity: "info",
+      recipientIds: [],
+      senderAccountId: "",
+      telegramSenderAccountId: "",
+      emailTo: "",
+      dedupeMinutes: "5",
+    });
+  }
+
+  function editNotificationRule(rule: NotificationRuleSummary) {
+    const targetRecipientIds = rule.targets.map((target) => target.recipientId).filter(Boolean) as string[];
+    const emailSenderAccountId = rule.targets.find((target) => {
+      const recipient = notificationSettings?.recipients.find((item) => item.id === target.recipientId);
+      return recipient?.kind === "email" && target.senderAccountId;
+    })?.senderAccountId ?? "";
+    const telegramSenderAccountId = rule.targets.find((target) => {
+      const recipient = notificationSettings?.recipients.find((item) => item.id === target.recipientId);
+      return recipient?.kind === "telegram" && target.senderAccountId;
+    })?.senderAccountId ?? "";
+    setNotificationEditingRuleId(rule.id);
+    setNotificationRuleForm({
+      name: rule.name,
+      enabled: rule.enabled,
+      eventTypes: rule.eventTypes,
+      minSeverity: rule.minSeverity,
+      recipientIds: targetRecipientIds,
+      senderAccountId: emailSenderAccountId,
+      telegramSenderAccountId,
+      emailTo: "",
+      dedupeMinutes: String(rule.dedupeMinutes),
+    });
+  }
+
+  function resetNotificationChannelForm() {
+    setNotificationEditingChannelId("");
+    setNotificationChannelForm({
+      name: "",
+      description: "",
+      adapter: "webhook",
+      authType: "none",
+      method: "POST",
+      urlTemplate: "",
+      headersTemplate: "",
+      bodyTemplate: "{\n  \"title\": \"{{title}}\",\n  \"message\": \"{{message}}\"\n}",
+      accountFields: "",
+    });
+  }
+
+  function editNotificationChannel(channel: NotificationChannelDefinition) {
+    if (channel.kind !== "webhook") return;
+    setNotificationEditingChannelId(channel.id);
+    setNotificationChannelForm({
+      name: channel.name,
+      description: channel.description,
+      adapter: channel.adapter ?? "webhook",
+      authType: channel.authType ?? "none",
+      method: channel.method ?? "POST",
+      urlTemplate: channel.urlTemplate ?? "",
+      headersTemplate: channel.headersTemplate ?? "",
+      bodyTemplate: channel.bodyTemplate ?? "",
+      accountFields: (channel.accountFields ?? []).join(","),
+    });
+  }
+
+  async function createNotificationChannel(event: React.FormEvent) {
+    event.preventDefault();
+    const editingChannel = notificationSettings?.channels.find((channel) => channel.id === notificationEditingChannelId);
+    if (editingChannel?.builtin) return;
+    setBusy("notification-channel");
+    try {
+      const response = await fetch(notificationEditingChannelId ? `/api/notifications/channels/${notificationEditingChannelId}` : "/api/notifications/channels", {
+        method: notificationEditingChannelId ? "PATCH" : "POST",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          name: notificationChannelForm.name,
+          description: notificationChannelForm.description,
+          adapter: notificationChannelForm.adapter,
+          authType: notificationChannelForm.authType,
+          method: notificationChannelForm.method,
+          urlTemplate: notificationChannelForm.urlTemplate,
+          headersTemplate: notificationChannelForm.headersTemplate,
+          bodyTemplate: notificationChannelForm.bodyTemplate,
+          accountFields: notificationChannelForm.accountFields.split(",").map((item) => item.trim()).filter(Boolean),
+        }),
+      });
+      if (!response.ok) throw new Error("notification_channel_failed");
+      resetNotificationChannelForm();
+      await loadNotifications();
+      notify(t("settings.notificationChannelSaved"), "success");
+    } catch {
+      notify(t("settings.notificationChannelSaveFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function deleteNotificationChannel(channel: NotificationChannelDefinition) {
+    if (channel.builtin) return;
+    const confirmed = await dialog.confirm({
+      title: t("settings.notificationDeleteChannelConfirm"),
+      message: channel.name,
+      confirmLabel: t("action.delete"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy(`notification-channel-delete:${channel.id}`);
+    try {
+      const response = await fetch(`/api/notifications/channels/${channel.id}`, { method: "DELETE", headers: { authorization: `Bearer ${sessionToken}` } });
+      if (!response.ok) notify(t("settings.notificationChannelDeleteFailed"), "error");
+      await loadNotifications();
+    } finally {
+      setBusy("");
+    }
+  }
+
+  function notificationRecipientConfig() {
+    if (notificationRecipientForm.kind === "email") return { email: notificationRecipientForm.email };
+    if (notificationRecipientForm.kind === "telegram") return { chatId: notificationRecipientForm.telegramChatId };
+    const channel = notificationSettings?.channels.find((item) => item.id === notificationRecipientForm.channelId);
+    if (channel?.id && channel.id !== "webhook") return notificationRecipientForm.customConfig;
+    return { url: notificationRecipientForm.webhookUrl, method: "POST", headers: {} };
+  }
+
+  function resetNotificationRecipientForm() {
+    setNotificationEditingRecipientId("");
+    setNotificationRecipientForm({
+      name: "",
+      kind: "email",
+      enabled: true,
+      senderAccountId: "",
+      channelId: "webhook",
+      email: "",
+      webhookUrl: "",
+      barkServerUrl: "https://api.day.app",
+      barkDeviceKey: "",
+      barkGroup: "Codex Web",
+      telegramChatId: "",
+      telegramSenderAccountId: "",
+      customConfig: {},
+      permissionAgentIds: "",
+      permissionRoomIds: "",
+      permissionProjectIds: "",
+    });
+  }
+
+  function editNotificationRecipient(recipient: NotificationRecipientSummary) {
+    const config = recipient.config as Record<string, unknown>;
+    setNotificationEditingRecipientId(recipient.id);
+    setNotificationRecipientForm({
+      name: recipient.name,
+      kind: recipient.kind,
+      enabled: recipient.enabled,
+      senderAccountId: recipient.senderAccountId ?? "",
+      channelId: recipient.channelId ?? "webhook",
+      email: String(config.email ?? ""),
+      webhookUrl: String(config.url ?? ""),
+      barkServerUrl: String(config.serverUrl ?? "https://api.day.app"),
+      barkDeviceKey: String(config.deviceKey ?? ""),
+      barkGroup: String(config.group ?? "Codex Web"),
+      telegramChatId: String(config.chatId ?? ""),
+      telegramSenderAccountId: recipient.senderAccountId ?? "",
+      customConfig: Object.fromEntries(Object.entries(config).map(([key, value]) => [key, String(value ?? "")])),
+      ...notificationPermissionsToForm(recipient.permissions),
+    });
+  }
+
+  async function createNotificationRecipient(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy("notification-recipient");
+    try {
+      const response = await fetch(notificationEditingRecipientId ? `/api/notifications/recipients/${notificationEditingRecipientId}` : "/api/notifications/recipients", {
+        method: notificationEditingRecipientId ? "PATCH" : "POST",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          name: notificationRecipientForm.name,
+          kind: notificationRecipientForm.kind,
+          enabled: notificationRecipientForm.enabled,
+          senderAccountId: notificationRecipientForm.kind === "email"
+            ? notificationRecipientForm.senderAccountId || (emailNotificationSenders().length === 1 ? emailNotificationSenders()[0].id : null)
+            : notificationRecipientForm.kind === "telegram"
+              ? notificationRecipientForm.telegramSenderAccountId || (telegramNotificationSenders().length === 1 ? telegramNotificationSenders()[0].id : null)
+              : null,
+          channelId: notificationRecipientForm.kind === "webhook" ? notificationRecipientForm.channelId : null,
+          config: notificationRecipientConfig(),
+          permissions: notificationPermissionsFromForm(notificationRecipientForm),
+        }),
+      });
+      if (!response.ok) throw new Error("notification_recipient_failed");
+      resetNotificationRecipientForm();
+      await loadNotifications();
+      notify(t("settings.notificationRecipientSaved"), "success");
+    } catch {
+      notify(t("settings.notificationRecipientSaveFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function deleteNotificationRecipient(recipient: NotificationRecipientSummary) {
+    const confirmed = await dialog.confirm({
+      title: t("settings.notificationDeleteRecipientConfirm"),
+      message: recipient.name,
+      confirmLabel: t("action.delete"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy(`notification-recipient-delete:${recipient.id}`);
+    try {
+      await fetch(`/api/notifications/recipients/${recipient.id}`, { method: "DELETE", headers: { authorization: `Bearer ${sessionToken}` } });
+      await loadNotifications();
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function testNotificationRecipient(recipient: NotificationRecipientSummary) {
+    setBusy(`notification-recipient-test:${recipient.id}`);
+    try {
+      const response = await fetch(`/api/notifications/recipients/${recipient.id}/test`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      await loadNotifications();
+      notify(response.ok ? t("settings.notificationTestSent") : t("settings.notificationTestFailed"), response.ok ? "success" : "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function createNotificationAccount(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy("notification-account");
+    try {
+      const response = await fetch(notificationEditingAccountId ? `/api/notifications/accounts/${notificationEditingAccountId}` : "/api/notifications/accounts", {
+        method: notificationEditingAccountId ? "PATCH" : "POST",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          name: notificationAccountForm.name,
+          channelId: notificationAccountForm.channelId,
+          channelKind: notificationAccountForm.channelKind,
+          enabled: notificationAccountForm.enabled,
+          config: notificationAccountConfig(),
+          permissions: notificationPermissionsFromForm(notificationAccountForm),
+        }),
+      });
+      if (!response.ok) throw new Error("notification_account_failed");
+      const account = await response.json() as NotificationAccountSummary;
+      if (!notificationEditingAccountId && notificationAccountForm.channelKind === "email" && notificationAccountForm.emailCreateRecipient && notificationAccountForm.emailFromEmail.trim()) {
+        await fetch("/api/notifications/recipients", {
+          method: "POST",
+          headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+          body: JSON.stringify({
+            name: notificationAccountForm.name || notificationAccountForm.emailFromEmail,
+            kind: "email",
+            enabled: true,
+            senderAccountId: account.id,
+            config: { email: notificationAccountForm.emailFromEmail.trim() },
+          }),
+        });
+      }
+      resetNotificationAccountForm();
+      await loadNotifications();
+      notify(t("settings.notificationAccountSaved"), "success");
+    } catch {
+      notify(t("settings.notificationAccountSaveFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function testNotificationAccount(account: NotificationAccountSummary) {
+    setBusy(`notification-test:${account.id}`);
+    try {
+      const emailTo = notificationAccountForm.testEmailTo.split(",").map((item) => item.trim()).filter(Boolean);
+      const response = await fetch(`/api/notifications/accounts/${account.id}/test`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ emailTo, chatId: notificationAccountForm.telegramTestChatId.trim() || undefined }),
+      });
+      await loadNotifications();
+      notify(response.ok ? t("settings.notificationTestSent") : t("settings.notificationTestFailed"), response.ok ? "success" : "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function deleteNotificationAccount(account: NotificationAccountSummary) {
+    const confirmed = await dialog.confirm({
+      title: t("settings.notificationDeleteAccountConfirm"),
+      message: account.name,
+      confirmLabel: t("action.delete"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy(`notification-account-delete:${account.id}`);
+    try {
+      await fetch(`/api/notifications/accounts/${account.id}`, { method: "DELETE", headers: { authorization: `Bearer ${sessionToken}` } });
+      await loadNotifications();
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function createNotificationRule(event: React.FormEvent) {
+    event.preventDefault();
+    const targets: NotificationRuleTarget[] = notificationRuleForm.recipientIds.map((recipientId) => {
+      const recipient = notificationSettings?.recipients.find((item) => item.id === recipientId);
+      return {
+        recipientId,
+        senderAccountId: recipient?.kind === "telegram" ? notificationRuleForm.telegramSenderAccountId || undefined : notificationRuleForm.senderAccountId || undefined,
+      };
+    });
+    setBusy("notification-rule");
+    try {
+      const response = await fetch(notificationEditingRuleId ? `/api/notifications/rules/${notificationEditingRuleId}` : "/api/notifications/rules", {
+        method: notificationEditingRuleId ? "PATCH" : "POST",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          name: notificationRuleForm.name,
+          enabled: notificationRuleForm.enabled,
+          eventTypes: notificationRuleForm.eventTypes,
+          minSeverity: notificationRuleForm.minSeverity,
+          targets,
+          dedupeMinutes: Number(notificationRuleForm.dedupeMinutes) || 0,
+        }),
+      });
+      if (!response.ok) throw new Error("notification_rule_failed");
+      resetNotificationRuleForm();
+      await loadNotifications();
+      notify(t("settings.notificationRuleSaved"), "success");
+    } catch {
+      notify(t("settings.notificationRuleSaveFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function toggleNotificationRule(rule: NotificationRuleSummary) {
+    setBusy(`notification-rule:${rule.id}`);
+    try {
+      await fetch(`/api/notifications/rules/${rule.id}`, {
+        method: "PATCH",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ enabled: !rule.enabled }),
+      });
+      await loadNotifications();
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function deleteNotificationRule(rule: NotificationRuleSummary) {
+    const confirmed = await dialog.confirm({
+      title: t("settings.notificationDeleteRuleConfirm"),
+      message: rule.name,
+      confirmLabel: t("action.delete"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy(`notification-rule-delete:${rule.id}`);
+    try {
+      await fetch(`/api/notifications/rules/${rule.id}`, { method: "DELETE", headers: { authorization: `Bearer ${sessionToken}` } });
+      if (notificationEditingRuleId === rule.id) resetNotificationRuleForm();
+      await loadNotifications();
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function deleteNotificationEphemeralRule(rule: NotificationEphemeralRuleSummary) {
+    const confirmed = await dialog.confirm({
+      title: t("settings.notificationDeleteEphemeralRuleConfirm"),
+      message: `${rule.scopeType} · ${rule.eventTypes.join(", ")}`,
+      confirmLabel: t("action.delete"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy(`notification-ephemeral-rule-delete:${rule.id}`);
+    try {
+      await fetch(`/api/notifications/ephemeral-rules/${rule.id}`, { method: "DELETE", headers: { authorization: `Bearer ${sessionToken}` } });
+      await loadNotifications();
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function clearNotificationRules() {
+    const confirmed = await dialog.confirm({
+      title: t("settings.notificationClearRulesConfirm"),
+      message: t("settings.notificationClearRulesMessage"),
+      confirmLabel: t("settings.notificationClearRules"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy("notification-rules-clear");
+    try {
+      await fetch("/api/notifications/rules", { method: "DELETE", headers: { authorization: `Bearer ${sessionToken}` } });
+      await loadNotifications();
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function deleteNotificationDelivery(delivery: NotificationDeliverySummary) {
+    const confirmed = await dialog.confirm({
+      title: t("settings.notificationDeleteDeliveryConfirm"),
+      message: delivery.title,
+      confirmLabel: t("action.delete"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy(`notification-delivery-delete:${delivery.id}`);
+    try {
+      await fetch(`/api/notifications/deliveries/${delivery.id}`, { method: "DELETE", headers: { authorization: `Bearer ${sessionToken}` } });
+      await loadNotifications();
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function retryNotificationDelivery(delivery: NotificationDeliverySummary) {
+    setBusy(`notification-delivery-retry:${delivery.id}`);
+    try {
+      const response = await fetch(`/api/notifications/deliveries/${delivery.id}/retry`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      notify(response.ok ? t("settings.notificationRetryStarted") : t("settings.notificationRetryFailed"), response.ok ? "success" : "error");
+      await loadNotifications();
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function clearNotificationDeliveries() {
+    const confirmed = await dialog.confirm({
+      title: t("settings.notificationClearDeliveriesConfirm"),
+      message: t("settings.notificationClearDeliveriesMessage"),
+      confirmLabel: t("settings.notificationClearDeliveries"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy("notification-deliveries-clear");
+    try {
+      await fetch("/api/notifications/deliveries", { method: "DELETE", headers: { authorization: `Bearer ${sessionToken}` } });
+      await loadNotifications();
+    } finally {
+      setBusy("");
+    }
+  }
+
+  function notificationDeliveryMetadata(delivery: NotificationDeliverySummary) {
+    const metadata = delivery.metadata ?? {};
+    const account = metadata.account && typeof metadata.account === "object" ? metadata.account as Record<string, unknown> : {};
+    const recipient = metadata.recipient && typeof metadata.recipient === "object" ? metadata.recipient as Record<string, unknown> : {};
+    const target = metadata.target && typeof metadata.target === "object" ? metadata.target as Record<string, unknown> : {};
+    return {
+      targetName: recipient.name ? String(recipient.name) : account.name ? String(account.name) : delivery.accountId ?? "-",
+      targetKind: recipient.kind ? String(recipient.kind) : account.kind ? String(account.kind) : "-",
+      accountName: account.name ? String(account.name) : delivery.accountId ?? "-",
+      responseStatus: delivery.responseStatus ?? "-",
+      attempts: delivery.attempts,
+      sentAt: delivery.sentAt ? formatShortDate(delivery.sentAt) : "-",
+      emailToCount: Number(target.emailToCount ?? 0),
+      chatConfigured: Boolean(target.chatId),
+    };
+  }
 
   async function updateAccessToken(event: React.FormEvent) {
     event.preventDefault();
@@ -9012,6 +11684,48 @@ function SettingsPage({
     }
   }
 
+  async function loadTaskHealth() {
+    setBusy("task-health");
+    try {
+      const response = await fetch("/api/settings/task-health", {
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) throw new Error("task_health_failed");
+      const result = (await response.json()) as TaskHealthResponse;
+      setTaskHealth(result);
+      notify(result.ok ? t("settings.taskHealthOk") : t("settings.taskHealthIssues"), result.ok ? "success" : "info");
+    } catch {
+      notify(t("settings.taskHealthFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function repairTaskHealth() {
+    const confirmed = await dialog.confirm({
+      title: t("settings.repairTaskHealth"),
+      message: t("settings.repairTaskHealthConfirm"),
+      confirmLabel: t("settings.repairTaskHealth"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy("task-health-repair");
+    try {
+      const response = await fetch("/api/settings/task-health/repair", {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) throw new Error("task_health_repair_failed");
+      const result = (await response.json()) as TaskHealthRepairResponse;
+      setTaskHealth(result.health);
+      notify(t("settings.taskHealthRepaired").replace("{count}", String(result.repaired.length)), "success");
+    } catch {
+      notify(t("settings.taskHealthRepairFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function resetApprovals() {
     if (!window.confirm(t("settings.resetApprovalsConfirm"))) return;
     setCleanupMessage("");
@@ -9076,6 +11790,11 @@ function SettingsPage({
     } finally {
       setBusy("");
     }
+  }
+
+  async function copyStoragePath(item: StorageItemSummary) {
+    const copied = await copyText(item.path);
+    notify(copied ? t("action.copied") : t("settings.copyFailed"), copied ? "success" : "error");
   }
 
   async function deleteSelectedStorageItems() {
@@ -9315,6 +12034,43 @@ function SettingsPage({
     }
   }
 
+  async function saveSessionCompactionSettings(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy("session-compaction");
+    const body: UpdateSessionCompactionSettingsRequest = {
+      enabled: sessionCompactionEnabled,
+      autoCompactMessages: Number(sessionCompactionForm.autoCompactMessages),
+      autoCompactChars: Number(sessionCompactionForm.autoCompactChars),
+      minNewMessages: Number(sessionCompactionForm.minNewMessages),
+      minNewChars: Number(sessionCompactionForm.minNewChars),
+    };
+    try {
+      const response = await fetch("/api/settings/session-compaction", {
+        method: "PATCH",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) {
+        notify(t("settings.sessionCompactionSaveFailed"), "error");
+        return;
+      }
+      const settings = (await response.json()) as SessionCompactionSettings;
+      setSessionCompactionSettings(settings);
+      setSessionCompactionEnabled(settings.enabled);
+      setSessionCompactionForm({
+        autoCompactMessages: String(settings.autoCompactMessages),
+        autoCompactChars: String(settings.autoCompactChars),
+        minNewMessages: String(settings.minNewMessages),
+        minNewChars: String(settings.minNewChars),
+      });
+      notify(t("settings.sessionCompactionSaved"), "success");
+    } catch {
+      notify(t("settings.sessionCompactionSaveFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function saveRateLimitSettings(event: React.FormEvent) {
     event.preventDefault();
     setBusy("rate-limit");
@@ -9381,6 +12137,7 @@ function SettingsPage({
           <TabsTrigger className="settings-tab" value="account">{t("settings.tabAccount")}</TabsTrigger>
           <TabsTrigger className="settings-tab" value="runtime">{t("settings.tabRuntime")}</TabsTrigger>
           <TabsTrigger className="settings-tab" value="network">{t("settings.tabNetwork")}</TabsTrigger>
+          <TabsTrigger className="settings-tab" value="notifications">{t("settings.tabNotifications")}</TabsTrigger>
           <TabsTrigger className="settings-tab" value="maintenance">{t("settings.tabMaintenance")}</TabsTrigger>
           <TabsTrigger className="settings-tab" value="storage">{t("settings.tabStorage")}</TabsTrigger>
           <TabsTrigger className="settings-tab" value="backup">{t("settings.tabBackup")}</TabsTrigger>
@@ -9458,6 +12215,29 @@ function SettingsPage({
             <button className="ghost-button" type="submit" disabled={busy === "runtime"}><IconText icon={Save}>{t("action.save")}</IconText></button>
           </div>
           </form>
+          <form className="provider-card" onSubmit={saveSessionCompactionSettings}>
+          <strong>{t("settings.sessionCompactionTitle")}</strong>
+          <span>{t("settings.sessionCompactionHelp")}</span>
+          <label className="checkbox-row">
+            <input name="sessioncompactionenabled" type="checkbox" checked={sessionCompactionEnabled} onChange={(event) => setSessionCompactionEnabled(event.target.checked)} />
+            <span>{t("settings.sessionCompactionEnabled")}</span>
+          </label>
+          {([
+            ["autoCompactMessages", "sessionCompactionAutoMessages"],
+            ["autoCompactChars", "sessionCompactionAutoChars"],
+            ["minNewMessages", "sessionCompactionMinNewMessages"],
+            ["minNewChars", "sessionCompactionMinNewChars"],
+          ] as const).map(([key, labelKey]) => (
+            <label key={key}>
+              <span>{t(`settings.${labelKey}`)}</span>
+              <input name={key} className="search-input" type="number" min="1" value={sessionCompactionForm[key]} onChange={(event) => setSessionCompactionForm((current) => ({ ...current, [key]: event.target.value }))} />
+            </label>
+          ))}
+          {sessionCompactionSettings && <code>{sessionCompactionSettings.enabled ? "enabled" : "disabled"} · {sessionCompactionSettings.autoCompactMessages} messages / {sessionCompactionSettings.autoCompactChars} chars</code>}
+          <div className="settings-actions">
+            <button className="ghost-button" type="submit" disabled={busy === "session-compaction"}><IconText icon={Save}>{t("action.save")}</IconText></button>
+          </div>
+          </form>
         </TabsContent>
         <TabsContent className="settings-list" value="network">
           <form className="provider-card" onSubmit={savePreviewAccessSettings}>
@@ -9499,6 +12279,464 @@ function SettingsPage({
             </div>
           </form>
         </TabsContent>
+        <TabsContent className="settings-list" value="notifications">
+          <div className="settings-tabs notification-inner-tabs">
+            {(["senders", "recipients", "rules", "logs"] as const).map((view) => (
+              <button className={`settings-tab ${notificationView === view ? "active" : ""}`} type="button" key={view} onClick={() => setNotificationView(view)}>
+                {t(`settings.notificationTab${view === "senders" ? "Senders" : view === "recipients" ? "Recipients" : view === "rules" ? "Rules" : "Logs"}`)}
+              </button>
+            ))}
+          </div>
+          {notificationView === "senders" && (
+            <>
+          <form className="notification-card" onSubmit={createNotificationAccount}>
+            <strong>{t("settings.notificationAccountsTitle")}</strong>
+            <span>{t("settings.notificationAccountsHelp")}</span>
+            <label>
+              <span>{t("settings.notificationAccountName")}</span>
+              <input name="notification-account-name" className="search-input" value={notificationAccountForm.name} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, name: event.target.value }))} required />
+            </label>
+            <label>
+              <span>{t("settings.notificationSenderType")}</span>
+              <select name="notification-account-channel-kind" className="search-input" value={notificationAccountForm.channelKind} disabled={Boolean(notificationEditingAccountId)} onChange={(event) => {
+                const channelKind = event.target.value as NotificationAccountSummary["channelKind"];
+                setNotificationAccountForm((current) => ({ ...current, channelKind, channelId: channelKind }));
+              }}>
+                <option value="email">Email SMTP</option>
+                <option value="telegram">Telegram Bot</option>
+              </select>
+            </label>
+            <label className="checkbox-row">
+              <input name="notification-account-enabled" type="checkbox" checked={notificationAccountForm.enabled} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, enabled: event.target.checked }))} />
+              <span>{t("settings.notificationEnabled")}</span>
+            </label>
+            <label>
+              <span>{t("settings.notificationAllowedAgents")}</span>
+              <input name="notification-account-allowed-agents" className="search-input" value={notificationAccountForm.permissionAgentIds} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, permissionAgentIds: event.target.value }))} placeholder="agent-id-1, agent-id-2" />
+            </label>
+            <label>
+              <span>{t("settings.notificationAllowedRooms")}</span>
+              <input name="notification-account-allowed-rooms" className="search-input" value={notificationAccountForm.permissionRoomIds} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, permissionRoomIds: event.target.value }))} placeholder="room-id-1, room-id-2" />
+            </label>
+            <label>
+              <span>{t("settings.notificationAllowedProjects")}</span>
+              <input name="notification-account-allowed-projects" className="search-input" value={notificationAccountForm.permissionProjectIds} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, permissionProjectIds: event.target.value }))} placeholder="project-id-1, project-id-2" />
+            </label>
+            {notificationAccountForm.channelKind === "email" && (
+              <>
+                <label>
+                  <span>{t("settings.notificationEmailHost")}</span>
+                  <input name="notification-email-host" className="search-input" value={notificationAccountForm.emailHost} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, emailHost: event.target.value }))} />
+                </label>
+                <label>
+                  <span>{t("settings.notificationEmailPort")}</span>
+                  <input name="notification-email-port" className="search-input" type="number" min="1" value={notificationAccountForm.emailPort} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, emailPort: event.target.value }))} />
+                </label>
+                <label className="checkbox-row">
+                  <input name="notification-email-secure" type="checkbox" checked={notificationAccountForm.emailSecure} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, emailSecure: event.target.checked }))} />
+                  <span>{t("settings.notificationEmailSecure")}</span>
+                </label>
+                <label>
+                  <span>{t("settings.notificationEmailUsername")}</span>
+                  <input name="notification-email-username" className="search-input" value={notificationAccountForm.emailUsername} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, emailUsername: event.target.value }))} />
+                </label>
+                <label>
+                  <span>{t("settings.notificationEmailPassword")}</span>
+                  <input name="notification-email-password" className="search-input" type="password" value={notificationAccountForm.emailPassword} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, emailPassword: event.target.value }))} />
+                </label>
+                <label>
+                  <span>{t("settings.notificationEmailFromName")}</span>
+                  <input name="notification-email-from-name" className="search-input" value={notificationAccountForm.emailFromName} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, emailFromName: event.target.value }))} />
+                </label>
+                <label>
+                  <span>{t("settings.notificationEmailFromEmail")}</span>
+                  <input name="notification-email-from-email" className="search-input" value={notificationAccountForm.emailFromEmail} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, emailFromEmail: event.target.value }))} />
+                </label>
+                {!notificationEditingAccountId && <label className="checkbox-row">
+                  <input name="notification-email-create-recipient" type="checkbox" checked={notificationAccountForm.emailCreateRecipient} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, emailCreateRecipient: event.target.checked }))} />
+                  <span>{t("settings.notificationEmailCreateRecipient")}</span>
+                </label>}
+              </>
+            )}
+            {notificationAccountForm.channelKind === "telegram" && (
+              <>
+                <label>
+                  <span>{t("settings.notificationTelegramBotToken")}</span>
+                  <input name="notification-telegram-bot-token" className="search-input" type="password" value={notificationAccountForm.telegramBotToken} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, telegramBotToken: event.target.value }))} />
+                </label>
+                <label>
+                  <span>{t("settings.notificationTelegramProxyUrl")}</span>
+                  <input name="notification-telegram-proxy-url" className="search-input" value={notificationAccountForm.telegramProxyUrl} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, telegramProxyUrl: event.target.value }))} placeholder="https://proxy.example.com/" />
+                </label>
+                <label className="dialog-checkbox">
+                  <input name="notification-telegram-inbound-enabled" type="checkbox" checked={notificationAccountForm.telegramInboundEnabled} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, telegramInboundEnabled: event.target.checked }))} />
+                  <span>{t("settings.notificationTelegramInboundEnabled")}</span>
+                </label>
+                <label>
+                  <span>{t("settings.notificationTelegramAllowedChatIds")}</span>
+                  <input name="notification-telegram-allowed-chat-ids" className="search-input" value={notificationAccountForm.telegramAllowedChatIds} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, telegramAllowedChatIds: event.target.value }))} placeholder="-100123,123456" />
+                </label>
+                <label>
+                  <span>{t("settings.notificationTelegramAllowedUserIds")}</span>
+                  <input name="notification-telegram-allowed-user-ids" className="search-input" value={notificationAccountForm.telegramAllowedUserIds} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, telegramAllowedUserIds: event.target.value }))} placeholder="123456,789012" />
+                </label>
+                <label>
+                  <span>{t("settings.notificationTelegramDefaultSessionId")}</span>
+                  <input name="notification-telegram-default-session-id" className="search-input" value={notificationAccountForm.telegramDefaultSessionId} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, telegramDefaultSessionId: event.target.value }))} placeholder="task-..." />
+                </label>
+                <label>
+                  <span>{t("settings.notificationTelegramTestChatId")}</span>
+                  <input name="notification-telegram-test-chat-id" className="search-input" value={notificationAccountForm.telegramTestChatId} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, telegramTestChatId: event.target.value }))} />
+                </label>
+              </>
+            )}
+            {notificationAccountForm.channelKind === "email" && (
+              <label>
+                <span>{t("settings.notificationTestEmailTo")}</span>
+                <input name="notification-test-email" className="search-input" value={notificationAccountForm.testEmailTo} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, testEmailTo: event.target.value }))} placeholder="a@example.com,b@example.com" />
+              </label>
+            )}
+            <div className="settings-actions">
+              <button className="ghost-button" type="submit" disabled={busy === "notification-account"}><IconText icon={notificationEditingAccountId ? Save : Plus}>{notificationEditingAccountId ? t("action.saveChanges") : t("settings.notificationAddAccount")}</IconText></button>
+              {notificationEditingAccountId && <button className="ghost-button" type="button" onClick={resetNotificationAccountForm}>{t("action.cancel")}</button>}
+              <button className="ghost-button" type="button" onClick={() => void loadNotifications()}><IconText icon={RefreshCw}>{t("action.refresh")}</IconText></button>
+            </div>
+          </form>
+          <div className="notification-card">
+            <div className="filter-toolbar compact-filter-toolbar">
+              <select name="notification-rule-enabled-filter" className="filter-select" value={notificationRuleEnabledFilter} onChange={(event) => setNotificationRuleEnabledFilter(event.target.value)}>
+                <option value="">{t("session.allStatuses")}</option>
+                <option value="true">{t("contacts.enabled")}</option>
+                <option value="false">{t("contacts.disabled")}</option>
+              </select>
+            </div>
+          </div>
+          <section className="notification-card">
+            <strong>{t("settings.notificationAccountList")}</strong>
+            {(notificationSettings?.accounts ?? []).map((account) => (
+              <div className="storage-item" key={account.id}>
+                <div>
+                  <strong>{account.name}</strong>
+                  <span>{account.channelKind} · {account.enabled ? "enabled" : "disabled"} · {account.lastTestStatus ?? "untested"} · {notificationPermissionSummary(account.permissions)}</span>
+                  {account.lastError && <span className="result-error">{account.lastError}</span>}
+                </div>
+                <div className="storage-actions">
+                  <button className="ghost-button" type="button" onClick={() => editNotificationAccount(account)}>{t("action.edit")}</button>
+                  <button className="ghost-button" type="button" disabled={busy === `notification-test:${account.id}`} onClick={() => void testNotificationAccount(account)}>{t("settings.notificationTest")}</button>
+                  <button className="ghost-button danger-button" type="button" onClick={() => void deleteNotificationAccount(account)}>{t("action.delete")}</button>
+                </div>
+              </div>
+            ))}
+            {notificationSettings && !notificationSettings.accounts.length && <div className="empty-state">{t("settings.notificationNoAccounts")}</div>}
+          </section>
+            </>
+          )}
+          {notificationView === "recipients" && (
+            <>
+          <form className="notification-card" onSubmit={createNotificationRecipient}>
+            <strong>{t("settings.notificationRecipientsTitle")}</strong>
+            <span>{t("settings.notificationRecipientsHelp")}</span>
+            <label>
+              <span>{t("settings.notificationRecipientName")}</span>
+              <input name="notification-recipient-name" className="search-input" value={notificationRecipientForm.name} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, name: event.target.value }))} required />
+            </label>
+            <label>
+              <span>{t("settings.notificationRecipientKind")}</span>
+              <select name="notification-recipient-kind" className="search-input" value={notificationRecipientForm.kind} disabled={Boolean(notificationEditingRecipientId)} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, kind: event.target.value as NotificationRecipientSummary["kind"] }))}>
+                <option value="email">Email</option>
+                <option value="telegram">Telegram</option>
+                <option value="webhook">Webhook</option>
+              </select>
+            </label>
+            <label className="checkbox-row">
+              <input name="notification-recipient-enabled" type="checkbox" checked={notificationRecipientForm.enabled} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, enabled: event.target.checked }))} />
+              <span>{t("settings.notificationEnabled")}</span>
+            </label>
+            <label>
+              <span>{t("settings.notificationAllowedAgents")}</span>
+              <input name="notification-recipient-allowed-agents" className="search-input" value={notificationRecipientForm.permissionAgentIds} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, permissionAgentIds: event.target.value }))} placeholder="agent-id-1, agent-id-2" />
+            </label>
+            <label>
+              <span>{t("settings.notificationAllowedRooms")}</span>
+              <input name="notification-recipient-allowed-rooms" className="search-input" value={notificationRecipientForm.permissionRoomIds} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, permissionRoomIds: event.target.value }))} placeholder="room-id-1, room-id-2" />
+            </label>
+            <label>
+              <span>{t("settings.notificationAllowedProjects")}</span>
+              <input name="notification-recipient-allowed-projects" className="search-input" value={notificationRecipientForm.permissionProjectIds} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, permissionProjectIds: event.target.value }))} placeholder="project-id-1, project-id-2" />
+            </label>
+            {notificationRecipientForm.kind === "email" && (
+              <>
+                <label>
+                  <span>{t("settings.notificationEmailTo")}</span>
+                  <input name="notification-recipient-email" className="search-input" value={notificationRecipientForm.email} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, email: event.target.value }))} />
+                </label>
+                {emailNotificationSenders().length > 1 ? (
+                  <label>
+                    <span>{t("settings.notificationDefaultEmailSender")}</span>
+                    <select name="notification-recipient-email-sender" className="search-input" value={notificationRecipientForm.senderAccountId} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, senderAccountId: event.target.value }))}>
+                      <option value="">{t("settings.notificationChooseSender")}</option>
+                      {emailNotificationSenders().map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
+                    </select>
+                  </label>
+                ) : (
+                  <span className="subtle">{emailNotificationSenders().length === 1 ? t("settings.notificationEmailSenderAuto") : t("settings.notificationEmailSenderMissing")}</span>
+                )}
+              </>
+            )}
+            {notificationRecipientForm.kind === "webhook" && (
+              <>
+                <label>
+                  <span>{t("settings.notificationChannel")}</span>
+                  <div className="notification-channel-select">
+                    <select name="notification-recipient-channel-id" className="search-input" value={notificationRecipientForm.channelId} onChange={(event) => {
+                      const channelId = event.target.value;
+                      setNotificationRecipientForm((current) => ({
+                        ...current,
+                        channelId,
+                        customConfig: channelId === "bark" ? { serverUrl: "https://api.day.app", group: "Codex Web" } : {} as Record<string, string>,
+                      }));
+                    }}>
+                      {(notificationSettings?.channels ?? []).filter((channel) => channel.kind === "webhook").map((channel) => <option key={channel.id} value={channel.id}>{channel.name}</option>)}
+                    </select>
+                    <button className="ghost-button icon-only" type="button" title={t("settings.notificationManageChannels")} aria-label={t("settings.notificationManageChannels")} onClick={() => setNotificationChannelManagerOpen(true)}><IconText icon={Plus}>{t("settings.notificationManageChannels")}</IconText></button>
+                  </div>
+                </label>
+                {(notificationSettings?.channels.find((channel) => channel.id === notificationRecipientForm.channelId)?.id !== "webhook")
+                  ? (notificationSettings?.channels.find((channel) => channel.id === notificationRecipientForm.channelId)?.accountFields ?? []).map((field) => (
+                    <label key={field}>
+                      <span>{field}</span>
+                      <input name={`notification-recipient-field-${field}`} className="search-input" type={/key|token|secret|password/i.test(field) ? "password" : "text"} value={notificationRecipientForm.customConfig[field] ?? ""} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, customConfig: { ...current.customConfig, [field]: event.target.value } }))} />
+                    </label>
+                  ))
+                  : (
+                    <label>
+                      <span>{t("settings.notificationWebhookUrl")}</span>
+                      <input name="notification-recipient-webhook-url" className="search-input" value={notificationRecipientForm.webhookUrl} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, webhookUrl: event.target.value }))} />
+                    </label>
+                  )}
+              </>
+            )}
+            {notificationRecipientForm.kind === "telegram" && (
+              <>
+                <label>
+                  <span>{t("settings.notificationTelegramChatId")}</span>
+                  <input name="notification-recipient-telegram-chat-id" className="search-input" value={notificationRecipientForm.telegramChatId} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, telegramChatId: event.target.value }))} />
+                </label>
+                {telegramNotificationSenders().length > 1 ? (
+                  <label>
+                    <span>{t("settings.notificationDefaultTelegramSender")}</span>
+                    <select name="notification-recipient-telegram-sender" className="search-input" value={notificationRecipientForm.telegramSenderAccountId} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, telegramSenderAccountId: event.target.value }))}>
+                      <option value="">{t("settings.notificationChooseSender")}</option>
+                      {telegramNotificationSenders().map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
+                    </select>
+                  </label>
+                ) : (
+                  <span className="subtle">{telegramNotificationSenders().length === 1 ? t("settings.notificationTelegramSenderAuto") : t("settings.notificationTelegramSenderMissing")}</span>
+                )}
+              </>
+            )}
+            <div className="settings-actions">
+              <button className="ghost-button" type="submit" disabled={busy === "notification-recipient"}><IconText icon={notificationEditingRecipientId ? Save : Plus}>{notificationEditingRecipientId ? t("action.saveChanges") : t("settings.notificationAddRecipient")}</IconText></button>
+              {notificationEditingRecipientId && <button className="ghost-button" type="button" onClick={resetNotificationRecipientForm}>{t("action.cancel")}</button>}
+            </div>
+          </form>
+          <section className="notification-card">
+            <strong>{t("settings.notificationRecipientList")}</strong>
+            {(notificationSettings?.recipients ?? []).map((recipient) => (
+              <div className="storage-item" key={recipient.id}>
+                <div>
+                  <strong>{recipient.name}</strong>
+                  <span>{recipient.kind} · {recipient.enabled ? "enabled" : "disabled"} · {notificationPermissionSummary(recipient.permissions)}</span>
+                </div>
+                <div className="storage-actions">
+                  <button className="ghost-button" type="button" onClick={() => editNotificationRecipient(recipient)}>{t("action.edit")}</button>
+                  <button className="ghost-button" type="button" disabled={busy === `notification-recipient-test:${recipient.id}`} onClick={() => void testNotificationRecipient(recipient)}>{t("settings.notificationTest")}</button>
+                  <button className="ghost-button danger-button" type="button" onClick={() => void deleteNotificationRecipient(recipient)}>{t("action.delete")}</button>
+                </div>
+              </div>
+            ))}
+            {notificationSettings && !notificationSettings.recipients.length && <div className="empty-state">{t("settings.notificationNoRecipients")}</div>}
+          </section>
+            </>
+          )}
+          {notificationView === "rules" && (
+            <>
+          <form className="notification-card" onSubmit={createNotificationRule}>
+            <strong>{t("settings.notificationRulesTitle")}</strong>
+            <span>{t("settings.notificationRulesHelp")}</span>
+            <label>
+              <span>{t("settings.notificationRuleName")}</span>
+              <input name="notification-rule-name" className="search-input" value={notificationRuleForm.name} onChange={(event) => setNotificationRuleForm((current) => ({ ...current, name: event.target.value }))} required />
+            </label>
+            <label className="checkbox-row">
+              <input name="notification-rule-enabled" type="checkbox" checked={notificationRuleForm.enabled} onChange={(event) => setNotificationRuleForm((current) => ({ ...current, enabled: event.target.checked }))} />
+              <span>{t("settings.notificationEnabled")}</span>
+            </label>
+            <label>
+              <span>{t("settings.notificationEvents")}</span>
+              <div className="notification-check-grid">
+                {(["task_completed", "task_failed", "task_interrupted", "needs_approval", "task_health_issue", "provider_check_failed", "backup_failed", "restore_failed", "auth_login"] as NotificationEventType[]).map((type) => (
+                  <label className="checkbox-row" key={type}>
+                    <input name={`notification-rule-event-${type}`} type="checkbox" checked={notificationRuleForm.eventTypes.includes(type)} onChange={() => toggleNotificationEvent(type)} />
+                    <span>{readableNotificationEvent(type, t)}</span>
+                  </label>
+                ))}
+              </div>
+            </label>
+            <label>
+              <span>{t("settings.notificationMinSeverity")}</span>
+              <select name="notification-rule-min-severity" className="search-input" value={notificationRuleForm.minSeverity} onChange={(event) => setNotificationRuleForm((current) => ({ ...current, minSeverity: event.target.value as NotificationSeverity }))}>
+                {(["info", "success", "warning", "error"] as NotificationSeverity[]).map((severity) => <option key={severity} value={severity}>{severity}</option>)}
+              </select>
+            </label>
+            {emailNotificationSenders().length > 1 && (
+              <label>
+                <span>{t("settings.notificationEmailSenderOverride")}</span>
+                <select name="notification-rule-email-sender-override" className="search-input" value={notificationRuleForm.senderAccountId} onChange={(event) => setNotificationRuleForm((current) => ({ ...current, senderAccountId: event.target.value }))}>
+                  <option value="">{t("settings.notificationUseRecipientDefaultSender")}</option>
+                  {emailNotificationSenders().map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
+                </select>
+              </label>
+            )}
+            {telegramNotificationSenders().length > 1 && (
+              <label>
+                <span>{t("settings.notificationTelegramSenderOverride")}</span>
+                <select name="notification-rule-telegram-sender-override" className="search-input" value={notificationRuleForm.telegramSenderAccountId} onChange={(event) => setNotificationRuleForm((current) => ({ ...current, telegramSenderAccountId: event.target.value }))}>
+                  <option value="">{t("settings.notificationUseRecipientDefaultSender")}</option>
+                  {telegramNotificationSenders().map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
+                </select>
+              </label>
+            )}
+            <label>
+              <span>{t("settings.notificationTargets")}</span>
+              <div className="notification-check-grid">
+                {(notificationSettings?.recipients ?? []).map((recipient) => (
+                  <label className="checkbox-row" key={recipient.id}>
+                    <input name={`notification-rule-recipient-${recipient.id}`} type="checkbox" checked={notificationRuleForm.recipientIds.includes(recipient.id)} onChange={() => toggleNotificationTarget(recipient.id)} />
+                    <span>{recipient.name} · {recipient.kind}</span>
+                  </label>
+                ))}
+              </div>
+              {notificationSettings && !notificationSettings.recipients.length && <span className="subtle">{t("settings.notificationNoRecipients")}</span>}
+            </label>
+            <label>
+              <span>{t("settings.notificationDedupeMinutes")}</span>
+              <input name="notification-dedupe" className="search-input" type="number" min="0" value={notificationRuleForm.dedupeMinutes} onChange={(event) => setNotificationRuleForm((current) => ({ ...current, dedupeMinutes: event.target.value }))} />
+            </label>
+            <div className="settings-actions">
+              <button className="ghost-button" type="submit" disabled={busy === "notification-rule"}><IconText icon={notificationEditingRuleId ? Save : Plus}>{notificationEditingRuleId ? t("action.saveChanges") : t("settings.notificationAddRule")}</IconText></button>
+              {notificationEditingRuleId && <button className="ghost-button" type="button" onClick={resetNotificationRuleForm}>{t("action.cancel")}</button>}
+            </div>
+          </form>
+          <section className="notification-card">
+            <div className="item-row">
+              <strong>{t("settings.notificationRuleList")}</strong>
+              <button className="ghost-button danger-button" type="button" disabled={busy === "notification-rules-clear" || !((notificationSettings?.rules.length ?? 0) + (notificationSettings?.ephemeralRules.length ?? 0))} onClick={() => void clearNotificationRules()}><IconText icon={Trash2}>{t("settings.notificationClearRules")}</IconText></button>
+            </div>
+            {(notificationSettings?.rules ?? []).map((rule) => (
+              <div className="storage-item" key={rule.id}>
+                <div>
+                  <strong>{rule.name}</strong>
+                  <span>{rule.enabled ? "enabled" : "disabled"} · {rule.eventTypes.join(", ")} · {rule.targets.length} targets</span>
+                </div>
+                <div className="storage-actions">
+                  <button className="ghost-button" type="button" onClick={() => editNotificationRule(rule)}>{t("action.edit")}</button>
+                  <button className="ghost-button" type="button" onClick={() => void toggleNotificationRule(rule)}>{rule.enabled ? t("automation.pause") : t("automation.resume")}</button>
+                  <button className="ghost-button danger-button" type="button" onClick={() => void deleteNotificationRule(rule)}>{t("action.delete")}</button>
+                </div>
+              </div>
+            ))}
+            {notificationSettings && !notificationSettings.rules.length && <div className="empty-state">{t("settings.notificationNoRules")}</div>}
+            {notificationRuleCursor && (
+              <div className="settings-actions">
+                <button className="ghost-button" type="button" disabled={notificationRuleLoading} onClick={() => void loadMoreNotificationRules()}>{t("session.loadMore")}</button>
+              </div>
+            )}
+          </section>
+          <section className="notification-card">
+            <strong>{t("settings.notificationEphemeralRuleList")}</strong>
+            {(notificationSettings?.ephemeralRules ?? []).map((rule: NotificationEphemeralRuleSummary) => (
+              <div className="storage-item" key={rule.id}>
+                <div>
+                  <strong>{rule.scopeType} · {rule.scopeId}</strong>
+                  <span>{rule.enabled ? "enabled" : "disabled"} · {rule.eventTypes.join(", ")} · {rule.targets.map((target) => notificationSettings?.recipients.find((recipient) => recipient.id === target.recipientId)?.name ?? target.recipientId ?? target.accountId).filter(Boolean).join(", ")}</span>
+                  <span>{rule.expireMode} · {formatShortDate(rule.createdAt)}{rule.triggeredAt ? ` · triggered ${formatShortDate(rule.triggeredAt)}` : ""}</span>
+                </div>
+                <div className="storage-actions">
+                  <button className="ghost-button danger-button" type="button" disabled={busy === `notification-ephemeral-rule-delete:${rule.id}`} onClick={() => void deleteNotificationEphemeralRule(rule)}>{t("action.delete")}</button>
+                </div>
+              </div>
+            ))}
+            {notificationSettings && !notificationSettings.ephemeralRules.length && <div className="empty-state">{t("settings.notificationNoEphemeralRules")}</div>}
+            {notificationEphemeralRuleCursor && (
+              <div className="settings-actions">
+                <button className="ghost-button" type="button" disabled={notificationEphemeralRuleLoading} onClick={() => void loadMoreNotificationEphemeralRules()}>{t("session.loadMore")}</button>
+              </div>
+            )}
+          </section>
+            </>
+          )}
+          {notificationView === "logs" && (
+          <section className="notification-card">
+            <div className="item-row">
+              <strong>{t("settings.notificationDeliveriesTitle")}</strong>
+              <button className="ghost-button danger-button" type="button" disabled={busy === "notification-deliveries-clear" || !(notificationSettings?.recentDeliveries.length ?? 0)} onClick={() => void clearNotificationDeliveries()}><IconText icon={Trash2}>{t("settings.notificationClearDeliveries")}</IconText></button>
+            </div>
+            <div className="filter-toolbar compact-filter-toolbar">
+              <select name="notification-delivery-event-filter" className="filter-select" value={notificationDeliveryEventFilter} onChange={(event) => setNotificationDeliveryEventFilter(event.target.value)}>
+                <option value="">{t("settings.notificationEvents")}</option>
+                {(["task_completed", "task_failed", "task_interrupted", "needs_approval", "task_health_issue", "provider_check_failed", "backup_failed", "restore_failed", "auth_login"] as NotificationEventType[]).map((type) => (
+                  <option key={type} value={type}>{readableNotificationEvent(type, t)}</option>
+                ))}
+              </select>
+              <select name="notification-delivery-status-filter" className="filter-select" value={notificationDeliveryStatusFilter} onChange={(event) => setNotificationDeliveryStatusFilter(event.target.value)}>
+                <option value="">{t("session.allStatuses")}</option>
+                {(["pending", "sent", "failed", "skipped"] as NotificationDeliverySummary["status"][]).map((status) => <option key={status} value={status}>{status}</option>)}
+              </select>
+              <select name="notification-delivery-severity-filter" className="filter-select" value={notificationDeliverySeverityFilter} onChange={(event) => setNotificationDeliverySeverityFilter(event.target.value)}>
+                <option value="">{t("settings.notificationMinSeverity")}</option>
+                {(["info", "success", "warning", "error"] as NotificationSeverity[]).map((severity) => <option key={severity} value={severity}>{severity}</option>)}
+              </select>
+            </div>
+            {(notificationSettings?.recentDeliveries ?? []).map((delivery: NotificationDeliverySummary) => {
+              const detail = notificationDeliveryMetadata(delivery);
+              return (
+              <div className="storage-item notification-delivery-item" key={delivery.id}>
+                <div>
+                  <strong>{delivery.title}</strong>
+                  <span>{delivery.eventType} · {delivery.severity} · {delivery.status} · {formatShortDate(delivery.createdAt)}</span>
+                  <span>{delivery.message}</span>
+                  <div className="notification-delivery-details">
+                    <span>{t("settings.notificationDeliveryTarget")}：{detail.targetName} · {detail.targetKind}</span>
+                    <span>{t("settings.notificationDeliverySender")}：{detail.accountName}</span>
+                    <span>{t("settings.notificationDeliveryAttempts")}：{detail.attempts}</span>
+                    <span>{t("settings.notificationDeliveryResponse")}：{detail.responseStatus}</span>
+                    <span>{t("settings.notificationDeliverySentAt")}：{detail.sentAt}</span>
+                    {detail.emailToCount > 0 && <span>{t("settings.notificationDeliveryEmailCount")}：{detail.emailToCount}</span>}
+                    {detail.chatConfigured && <span>{t("settings.notificationDeliveryChatConfigured")}</span>}
+                  </div>
+                  {delivery.lastError && <span className="result-error">{delivery.lastError}</span>}
+                </div>
+                <div className="storage-actions">
+                  {delivery.status === "failed" && (
+                    <button className="ghost-button" type="button" disabled={busy === `notification-delivery-retry:${delivery.id}`} onClick={() => void retryNotificationDelivery(delivery)}>
+                      <IconText icon={RefreshCw}>{t("settings.notificationRetry")}</IconText>
+                    </button>
+                  )}
+                  <button className="ghost-button danger-button" type="button" onClick={() => void deleteNotificationDelivery(delivery)}>{t("action.delete")}</button>
+                </div>
+              </div>
+              );
+            })}
+            {notificationSettings && !notificationSettings.recentDeliveries.length && <div className="empty-state">{t("settings.notificationNoDeliveries")}</div>}
+            {notificationDeliveryCursor && (
+              <div className="settings-actions">
+                <button className="ghost-button" type="button" disabled={notificationDeliveryLoading} onClick={() => void loadMoreNotificationDeliveries()}>{t("session.loadMore")}</button>
+              </div>
+            )}
+          </section>
+          )}
+        </TabsContent>
         <TabsContent className="settings-list" value="maintenance">
           <section className="provider-card">
           <strong>{t("settings.maintenanceTitle")}</strong>
@@ -9521,6 +12759,34 @@ function SettingsPage({
             <button className="ghost-button" type="button" disabled={busy === "approval-reset"} onClick={() => void resetApprovals()}><IconText icon={ShieldCheck}>{t("settings.resetApprovals")}</IconText></button>
           </div>
           {cleanupMessage && <span className={cleanupMessage === t("settings.cleanupFailed") || cleanupMessage === t("settings.resetApprovalsFailed") ? "result-error" : "result-ok"}>{cleanupMessage}</span>}
+          </section>
+          <section className="provider-card">
+          <strong>{t("settings.taskHealthTitle")}</strong>
+          <span>{t("settings.taskHealthHelp")}</span>
+          <div className="settings-actions">
+            <button className="ghost-button" type="button" disabled={busy === "task-health"} onClick={() => void loadTaskHealth()}><IconText icon={Activity}>{t("settings.checkTaskHealth")}</IconText></button>
+            <button className="ghost-button danger-button" type="button" disabled={busy === "task-health-repair" || !taskHealth?.items.some((item) => item.issue)} onClick={() => void repairTaskHealth()}><IconText icon={RefreshCw}>{t("settings.repairTaskHealth")}</IconText></button>
+            {taskHealth && <span className={taskHealth.ok ? "result-ok" : "result-error"}>{taskHealth.ok ? t("settings.taskHealthOk") : t("settings.taskHealthIssues")}</span>}
+          </div>
+          {taskHealth && !taskHealth.items.length && <div className="empty-state">{t("settings.taskHealthEmpty")}</div>}
+          {taskHealth && taskHealth.items.length > 0 && (
+            <div className="storage-list">
+              {taskHealth.items.map((item) => (
+                <div className="storage-item" key={`${item.sessionId}:${item.runId ?? ""}`}>
+                  <div>
+                    <strong>{item.title}</strong>
+                    <span>{item.sessionId}</span>
+                    <span>runner {item.pid ?? "-"} · {item.pidAlive ? t("settings.taskHealthAlive") : t("settings.taskHealthMissing")} · log {formatBytes(item.logBytes)}</span>
+                    {item.childPid && <span>codex {item.childPid} · {item.childPidAlive ? t("settings.taskHealthAlive") : t("settings.taskHealthMissing")}</span>}
+                  </div>
+                  <div className="storage-actions">
+                    <span className={`pill ${item.issue ? "warm" : ""}`}>{item.issue ?? t("settings.taskHealthHealthy")}</span>
+                    <button className="ghost-button" type="button" onClick={() => onOpenSession(item.sessionId)}>{t("nav.sessions")}</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
           </section>
         </TabsContent>
         <TabsContent className="settings-list" value="storage">
@@ -9569,6 +12835,7 @@ function SettingsPage({
                   </div>
                   <div className="storage-actions">
                     <span className={`pill ${item.status === "orphan" ? "warm" : ""}`}>{item.status === "orphan" ? t("settings.storageOrphan") : t("settings.storageActive")}</span>
+                    <button className="ghost-button icon-only" type="button" title={t("action.copy")} aria-label={t("action.copy")} onClick={() => void copyStoragePath(item)}><IconText icon={Copy}>{t("action.copy")}</IconText></button>
                     <button className="ghost-button danger-button icon-only" type="button" disabled={busy === `storage-delete:${item.id}`} title={t("settings.storageDelete")} aria-label={t("settings.storageDelete")} onClick={() => void deleteStorageItem(item)}><IconText icon={Trash2}>{t("settings.storageDelete")}</IconText></button>
                   </div>
                 </div>
@@ -9659,6 +12926,100 @@ function SettingsPage({
           </section>
         </TabsContent>
       </Tabs>
+      {notificationChannelManagerOpen && (
+        <div className="dialog-layer" role="presentation">
+          <div className="dialog-backdrop" onClick={() => { resetNotificationChannelForm(); setNotificationChannelManagerOpen(false); }} />
+          <section className="dialog-card notification-channel-dialog" role="dialog" aria-modal="true" aria-label={t("settings.notificationManageChannels")}>
+            <div className="dialog-head">
+              <div>
+                <strong>{t("settings.notificationManageChannels")}</strong>
+                <p>{t("settings.notificationChannelsHelp")}</p>
+              </div>
+              <button className="drawer-close" type="button" onClick={() => { resetNotificationChannelForm(); setNotificationChannelManagerOpen(false); }} aria-label={t("action.close")}><X size={18} /></button>
+            </div>
+            <form className="settings-list" onSubmit={createNotificationChannel}>
+              {notificationEditingChannelId && (
+                <span className="subtle">
+                  {(notificationSettings?.channels.find((channel) => channel.id === notificationEditingChannelId)?.builtin)
+                    ? t("settings.notificationBuiltinChannelReadonly")
+                    : t("settings.notificationEditingChannel")}
+                </span>
+              )}
+              <label>
+                <span>{t("settings.notificationChannelName")}</span>
+                <input name="notification-channel-name" value={notificationChannelForm.name} onChange={(event) => setNotificationChannelForm((current) => ({ ...current, name: event.target.value }))} required disabled={Boolean(notificationSettings?.channels.find((channel) => channel.id === notificationEditingChannelId)?.builtin)} />
+              </label>
+              <label>
+                <span>{t("settings.notificationChannelDescription")}</span>
+                <input name="notification-channel-description" value={notificationChannelForm.description} onChange={(event) => setNotificationChannelForm((current) => ({ ...current, description: event.target.value }))} />
+              </label>
+              <label>
+                <span>{t("settings.notificationChannelAdapter")}</span>
+                <select name="notification-channel-adapter" value={notificationChannelForm.adapter} onChange={(event) => setNotificationChannelForm((current) => ({ ...current, adapter: event.target.value }))}>
+                  <option value="webhook">{t("settings.notificationChannelAdapterWebhook")}</option>
+                  <option value="authenticated_webhook">{t("settings.notificationChannelAdapterAuthenticatedWebhook")}</option>
+                </select>
+              </label>
+              <label>
+                <span>{t("settings.notificationChannelAuthType")}</span>
+                <select name="notification-channel-auth-type" value={notificationChannelForm.authType} onChange={(event) => setNotificationChannelForm((current) => ({ ...current, authType: event.target.value }))}>
+                  <option value="none">{t("settings.notificationChannelAuthNone")}</option>
+                  <option value="bearer">{t("settings.notificationChannelAuthBearer")}</option>
+                  <option value="query_token">{t("settings.notificationChannelAuthQueryToken")}</option>
+                  <option value="token_request">{t("settings.notificationChannelAuthTokenRequest")}</option>
+                </select>
+              </label>
+              <label>
+                <span>{t("settings.notificationWebhookMethod")}</span>
+                <select name="notification-channel-method" value={notificationChannelForm.method} onChange={(event) => setNotificationChannelForm((current) => ({ ...current, method: event.target.value }))}>
+                  <option value="GET">GET</option>
+                  <option value="POST">POST</option>
+                  <option value="PUT">PUT</option>
+                  <option value="PATCH">PATCH</option>
+                </select>
+              </label>
+              <label>
+                <span>{t("settings.notificationChannelUrlTemplate")}</span>
+                <input name="notification-channel-url-template" value={notificationChannelForm.urlTemplate} onChange={(event) => setNotificationChannelForm((current) => ({ ...current, urlTemplate: event.target.value }))} placeholder="https://example.com/{{token}}" required />
+              </label>
+              <label>
+                <span>{t("settings.notificationChannelFields")}</span>
+                <input name="notification-channel-account-fields" value={notificationChannelForm.accountFields} onChange={(event) => setNotificationChannelForm((current) => ({ ...current, accountFields: event.target.value }))} placeholder="serverUrl,deviceKey,group" />
+              </label>
+              <label>
+                <span>{t("settings.notificationWebhookHeaders")}</span>
+                <textarea name="notification-channel-headers-template" rows={3} value={notificationChannelForm.headersTemplate} onChange={(event) => setNotificationChannelForm((current) => ({ ...current, headersTemplate: event.target.value }))} />
+              </label>
+              <label>
+                <span>{t("settings.notificationWebhookTemplate")}</span>
+                <textarea name="notification-channel-body-template" rows={5} value={notificationChannelForm.bodyTemplate} onChange={(event) => setNotificationChannelForm((current) => ({ ...current, bodyTemplate: event.target.value }))} />
+              </label>
+              <div className="dialog-actions">
+                <button className="ghost-button" type="button" onClick={notificationEditingChannelId ? resetNotificationChannelForm : () => { resetNotificationChannelForm(); setNotificationChannelManagerOpen(false); }}>{t("action.cancel")}</button>
+                <button className="dark-button" type="submit" disabled={busy === "notification-channel" || Boolean(notificationSettings?.channels.find((channel) => channel.id === notificationEditingChannelId)?.builtin)}>
+                  {notificationEditingChannelId ? t("action.saveChanges") : t("settings.notificationAddChannel")}
+                </button>
+              </div>
+            </form>
+            <div className="storage-list">
+              {(notificationSettings?.channels ?? []).filter((channel) => channel.kind === "webhook").map((channel) => (
+                <div className="storage-item" key={channel.id}>
+                  <div>
+                    <strong>{channel.name}</strong>
+                    <span>{channel.builtin ? t("settings.notificationBuiltinChannel") : t("settings.notificationCustomChannel")} · {channel.adapter ?? "webhook"} · {channel.authType ?? "none"} · {channel.accountFields?.join(", ") || "-"}</span>
+                  </div>
+                  <div className="storage-actions">
+                    <button className="ghost-button" type="button" onClick={() => editNotificationChannel(channel)}>{t("action.edit")}</button>
+                    {!channel.builtin && (
+                      <button className="ghost-button danger-button" type="button" onClick={() => void deleteNotificationChannel(channel)}>{t("action.delete")}</button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        </div>
+      )}
       {dialog.node}
     </main>
   );
@@ -9790,6 +13151,7 @@ function PageHeader({
   onOpenMainNav?: () => void;
   menuLabel?: string;
 }) {
+  const notificationCenter = React.useContext(NotificationCenterContext);
   return (
     <header className="page-header">
       <div className="header-title-row">
@@ -9799,7 +13161,10 @@ function PageHeader({
           <h1>{title}</h1>
         </div>
       </div>
-      {action && <button className="dark-button icon-only" title={action} aria-label={action} onClick={onAction}><IconText icon={RefreshCw}>{action}</IconText></button>}
+      <div className="header-actions page-header-actions">
+        {notificationCenter}
+        {action && <button className="dark-button icon-only" title={action} aria-label={action} onClick={onAction}><IconText icon={RefreshCw}>{action}</IconText></button>}
+      </div>
     </header>
   );
 }
