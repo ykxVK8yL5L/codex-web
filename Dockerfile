@@ -40,6 +40,8 @@ RUN apt-get update \
   && corepack enable \
   && corepack prepare pnpm@9.15.0 --activate \
   && bash -lc 'set -euo pipefail; tmp="$(mktemp)"; trap "rm -f \"$tmp\"" EXIT; curl -fsSL https://mise.run -o "$tmp"; MISE_INSTALL_PATH=/usr/local/bin/mise sh "$tmp"; /usr/local/bin/mise --version' \
+  && printf '%s\n' 'export MISE_SHIMS_DIR="${MISE_SHIMS_DIR:-$HOME/.local/share/mise/shims}"' 'case ":$PATH:" in *":$MISE_SHIMS_DIR:"*) ;; *) export PATH="$MISE_SHIMS_DIR:$HOME/.local/bin:$PATH" ;; esac' > /etc/profile.d/codex-web-mise.sh \
+  && printf '%s\n' 'export MISE_SHIMS_DIR="${MISE_SHIMS_DIR:-$HOME/.local/share/mise/shims}"' 'case ":$PATH:" in *":$MISE_SHIMS_DIR:"*) ;; *) export PATH="$MISE_SHIMS_DIR:$HOME/.local/bin:$PATH" ;; esac' >> /etc/bash.bashrc \
   && npm install -g @openai/codex pm2
 
 COPY --from=build /app /app
