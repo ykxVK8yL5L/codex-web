@@ -27,7 +27,8 @@ FROM node:24-bookworm-slim AS runtime
 
 ENV NODE_ENV=production
 ENV PNPM_HOME="/pnpm"
-ENV PATH="$PNPM_HOME:$PATH"
+ENV MISE_SHIMS_DIR="/root/.local/share/mise/shims"
+ENV PATH="$MISE_SHIMS_DIR:/root/.local/bin:$PNPM_HOME:$PATH"
 ENV HOST=0.0.0.0
 ENV PORT=8787
 

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export MISE_SHIMS_DIR="${MISE_SHIMS_DIR:-$HOME/.local/share/mise/shims}"
+export PATH="$MISE_SHIMS_DIR:$HOME/.local/bin:$PATH"
+
 mkdir -p /app/apps/api/data /app/apps/api/restore-backups
 
 
