@@ -1,5 +1,5 @@
 export type SessionKind = "project" | "scratch";
-export type ConversationType = "codex" | "agent" | "room";
+export type ConversationType = "codex" | "agent" | "room" | "automation";
 export type GoalOwnerType = "session" | "agent_session" | "room";
 export type GoalMode = "reference" | "tracked" | "managed" | "orchestrated";
 export type GoalStatus = "active" | "paused" | "completed" | "cancelled" | "archived";
@@ -1327,6 +1327,7 @@ export interface RenameFileRequest {
 export interface TerminalCommandRequest {
   command: string;
   cwd?: string;
+  sessionId?: string;
 }
 
 export interface TerminalCommandResponse {
@@ -1367,7 +1368,19 @@ export interface AutomationSummary {
   projectId: string | null;
   providerId?: string | null;
   model?: string | null;
+  actionType?: "agent" | "command";
   prompt: string;
+  command?: string | null;
+  cwd?: string | null;
+  commandTimeoutSeconds?: number | null;
+  retryMax?: number | null;
+  retryDelayMinutes?: number | null;
+  overlapPolicy?: "queue" | "skip";
+  runningRuns?: number;
+  queuedRuns?: number;
+  lastRunStatus?: AutomationRunSummary["status"] | null;
+  lastRunAt?: string | null;
+  nextRunAt?: string | null;
   schedule: string;
   status: "active" | "paused";
   createdAt: string;
@@ -1378,7 +1391,7 @@ export interface AutomationRunSummary {
   id: string;
   automationId: string;
   sessionId: string;
-  status: "running" | "done" | "failed" | "stopped";
+  status: "queued" | "running" | "done" | "failed" | "stopped" | "skipped" | "canceled";
   exitCode: number | null;
   startedAt: string;
   finishedAt?: string;
@@ -1389,7 +1402,14 @@ export interface CreateAutomationRequest {
   projectId: string | null;
   providerId?: string | null;
   model?: string | null;
+  actionType?: AutomationSummary["actionType"];
   prompt: string;
+  command?: string | null;
+  cwd?: string | null;
+  commandTimeoutSeconds?: number | null;
+  retryMax?: number | null;
+  retryDelayMinutes?: number | null;
+  overlapPolicy?: AutomationSummary["overlapPolicy"];
   schedule: string;
 }
 
@@ -1398,7 +1418,14 @@ export interface UpdateAutomationRequest {
   projectId?: string | null;
   providerId?: string | null;
   model?: string | null;
+  actionType?: AutomationSummary["actionType"];
   prompt?: string;
+  command?: string | null;
+  cwd?: string | null;
+  commandTimeoutSeconds?: number | null;
+  retryMax?: number | null;
+  retryDelayMinutes?: number | null;
+  overlapPolicy?: AutomationSummary["overlapPolicy"];
   schedule?: string;
   status?: AutomationSummary["status"];
 }

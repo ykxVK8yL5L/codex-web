@@ -346,12 +346,24 @@ button:disabled {
   min-width: 0;
 }
 
+.session-title-line {
+  max-width: 100%;
+  overflow: hidden;
+}
+
 .thread-title-row .thread-title {
   min-width: 0;
 }
 
 .session-title-line h1 {
+  display: block;
+  flex: 1 1 auto;
   min-width: 0;
+  max-width: 100%;
+}
+
+.session-title-line .session-type-badge {
+  flex: 0 0 auto;
 }
 
 .session-title-action {
@@ -493,6 +505,23 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.task-header > .header-title-row {
+  flex: 1 1 0;
+  overflow: hidden;
+}
+
+.task-header > .session-actions {
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  min-width: max-content;
+}
+
+.session-heading-block {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .task-header h1 {
@@ -2902,6 +2931,27 @@ button:disabled {
   gap: 8px;
 }
 
+.inline-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.inline-field-grid label {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+}
+
+.inline-field-grid label > span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 760;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .template-preview {
   display: grid;
   gap: 6px;
@@ -4115,6 +4165,13 @@ button:disabled {
 .environment-package-form label {
   display: grid;
   gap: 6px;
+  min-width: 0;
+}
+
+.environment-package-form input,
+.environment-package-form select {
+  max-width: 100%;
+  min-width: 0;
 }
 
 .environment-package-name-row {
@@ -4795,6 +4852,15 @@ button:disabled {
   color: #33413a;
   font-family: "SFMono-Regular", Consolas, monospace;
   font-size: 12px;
+}
+
+.project-list-card code.project-list-code-preview {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-height: 1.45;
+  white-space: normal;
 }
 
 .project-changes-layout {
@@ -5782,6 +5848,15 @@ button:disabled {
   flex-shrink: 0;
 }
 
+.dialog-head-actions select {
+  max-width: 180px;
+  min-width: 0;
+}
+
+.automation-filter-toolbar {
+  flex-wrap: wrap;
+}
+
 .dialog-card .drawer-close {
   display: grid;
   place-items: center;
@@ -6207,14 +6282,16 @@ button:disabled {
   }
 
   .task-header {
-    align-items: flex-start;
-    flex-direction: column;
-    gap: 12px;
+    align-items: center;
+    flex-direction: row;
+    gap: 10px;
     padding: 14px 16px;
   }
 
   .task-header .header-title-row {
-    width: 100%;
+    flex: 1 1 0;
+    min-width: 0;
+    width: auto;
   }
 
   .task-header h1,
@@ -6237,11 +6314,17 @@ button:disabled {
     flex: 1 1 auto;
   }
 
+  .task-header .session-actions .ghost-button {
+    flex: 0 0 40px;
+  }
+
   .session-actions {
-    align-self: stretch;
+    align-self: auto;
+    flex: 0 0 auto;
     gap: 8px;
-    justify-content: flex-start;
-    width: 100%;
+    justify-content: flex-end;
+    min-width: max-content;
+    width: auto;
   }
 
   .session-actions .session-secondary-action {
@@ -6682,9 +6765,12 @@ button:disabled {
   }
 
   .extension-filter-toolbar,
-  .automation-filter-toolbar,
   .provider-filter-toolbar {
     flex-wrap: nowrap;
+  }
+
+  .automation-filter-toolbar {
+    flex-wrap: wrap;
   }
 
   .extension-filter-toolbar .filter-search-field,

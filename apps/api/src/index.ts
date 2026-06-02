@@ -368,6 +368,8 @@ const deletedTerminalSessionIds = new Set<string>();
 const codexTaskOutputs = new Map<string, { output: string; exitCode: number | null }>();
 const codexTaskProcesses = new Map<string, ChildProcess>();
 const codexTaskStopRequested = new Set<string>();
+const shellTaskProcesses = new Map<string, ChildProcess>();
+const shellTaskStopRequested = new Set<string>();
 const codexTaskStdoutBuffers = new Map<string, string>();
 const codexTaskLogOffsets = new Map<string, number>();
 const codexTaskTailers = new Map<string, NodeJS.Timeout>();
@@ -512,9 +514,17 @@ function openDatabase() {
       id text primary key,
       name text not null,
       project_id text,
+      session_id text,
       provider_id text,
       model text,
+      action_type text not null default 'agent',
       prompt text not null,
+      command text,
+      cwd text,
+      command_timeout_seconds integer,
+      retry_max integer not null default 0,
+      retry_delay_minutes integer not null default 5,
+      overlap_policy text not null default 'queue',
       schedule text not null,
       status text not null,
       created_at text not null,
@@ -1138,8 +1148,32 @@ function openDatabase() {
   if (!previewLogColumns.some((column) => column.name === "label")) database.prepare("alter table preview_logs add column label text").run();
   database.prepare("update previews set updated_at = created_at where updated_at is null").run();
   const automationColumns = database.prepare("pragma table_info(automations)").all() as Array<{ name: string }>;
+  if (!automationColumns.some((column) => column.name === "session_id")) database.prepare("alter table automations add column session_id text").run();
   if (!automationColumns.some((column) => column.name === "provider_id")) database.prepare("alter table automations add column provider_id text").run();
   if (!automationColumns.some((column) => column.name === "model")) database.prepare("alter table automations add column model text").run();
+  if (!automationColumns.some((column) => column.name === "action_type")) database.prepare("alter table automations add column action_type text not null default 'agent'").run();
+  if (!automationColumns.some((column) => column.name === "command")) database.prepare("alter table automations add column command text").run();
+  if (!automationColumns.some((column) => column.name === "cwd")) database.prepare("alter table automations add column cwd text").run();
+  if (!automationColumns.some((column) => column.name === "command_timeout_seconds")) database.prepare("alter table automations add column command_timeout_seconds integer").run();
+  if (!automationColumns.some((column) => column.name === "retry_max")) database.prepare("alter table automations add column retry_max integer not null default 0").run();
+  if (!automationColumns.some((column) => column.name === "retry_delay_minutes")) database.prepare("alter table automations add column retry_delay_minutes integer not null default 5").run();
+  if (!automationColumns.some((column) => column.name === "overlap_policy")) database.prepare("alter table automations add column overlap_policy text not null default 'queue'").run();
+  database.prepare(`
+    update automations
+    set session_id = (
+      select session_id
+      from automation_runs
+      where automation_runs.automation_id = automations.id
+      order by started_at desc, id desc
+      limit 1
+    )
+    where (session_id is null or session_id = '')
+      and exists (
+        select 1
+        from automation_runs
+        where automation_runs.automation_id = automations.id
+      )
+  `).run();
   const messageColumns = database.prepare("pragma table_info(messages)").all() as Array<{ name: string }>;
   if (!messageColumns.some((column) => column.name === "reply_to_message_id")) database.prepare("alter table messages add column reply_to_message_id text").run();
   const queueColumns = database.prepare("pragma table_info(message_queue)").all() as Array<{ name: string }>;
@@ -1613,9 +1647,14 @@ function createProjectGitApproval(project: ProjectSummary, operation: ProjectGit
 
 function loadAppData(): AppData {
   const projects = (db.prepare("select * from projects order by name asc").all() as Array<Record<string, unknown>>).map(projectFromRow);
+  const automationSessionIds = new Set([
+    ...(db.prepare("select distinct session_id from automation_runs").all() as Array<{ session_id?: string }>).map((row) => String(row.session_id)).filter(Boolean),
+    ...(db.prepare("select session_id from automations where session_id is not null and session_id != ''").all() as Array<{ session_id?: string }>).map((row) => String(row.session_id)).filter(Boolean),
+  ]);
   const sessions = (db.prepare("select * from sessions order by updated_at desc").all() as Array<Record<string, unknown>>)
     .map((row) => sessionFromRow(row, projects));
   for (const session of sessions) {
+    if (automationSessionIds.has(session.id)) session.conversationType = "automation";
     const project = session.projectId ? projects.find((item) => item.id === session.projectId) : null;
     if (session.conversationType === "agent" && session.roomId) {
       const roomRun = db.prepare("select workspace_path from agent_runs where session_id = ? and workspace_path is not null and workspace_path != '' order by started_at desc limit 1").get(session.id) as { workspace_path?: string | null } | undefined;
@@ -1797,6 +1836,20 @@ function sanitizeProviderRpmLimit(value: unknown) {
   return Number.isFinite(parsed) && parsed > 0 ? Math.min(Math.floor(parsed), 100_000) : null;
 }
 
+function sanitizeAutomationRetryMax(value: unknown) {
+  const parsed = Number(value ?? 0);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.min(Math.floor(parsed), 10) : 0;
+}
+
+function sanitizeAutomationRetryDelayMinutes(value: unknown) {
+  const parsed = Number(value ?? 5);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.min(Math.floor(parsed), 24 * 60) : 5;
+}
+
+function sanitizeAutomationOverlapPolicy(value: unknown): NonNullable<AutomationSummary["overlapPolicy"]> {
+  return value === "skip" ? "skip" : "queue";
+}
+
 function providerFromRow(row: Record<string, unknown>): ProviderRecord {
   const kind = row.kind as ProviderRecord["kind"];
   return {
@@ -1813,19 +1866,55 @@ function providerFromRow(row: Record<string, unknown>): ProviderRecord {
   };
 }
 
-function automationFromRow(row: Record<string, unknown>): AutomationSummary {
+function automationRuntimeFields(automation: AutomationSummary): Pick<AutomationSummary, "runningRuns" | "queuedRuns" | "lastRunStatus" | "lastRunAt" | "nextRunAt"> {
+  const counts = db.prepare(`
+    select
+      sum(case when status = 'running' then 1 else 0 end) as running,
+      sum(case when status = 'queued' then 1 else 0 end) as queued
+    from automation_runs
+    where automation_id = ?
+  `).get(automation.id) as { running?: number | null; queued?: number | null } | undefined;
+  const lastRun = db.prepare(`
+    select status, started_at, finished_at
+    from automation_runs
+    where automation_id = ?
+    order by started_at desc, id desc
+    limit 1
+  `).get(automation.id) as { status?: string; started_at?: string; finished_at?: string | null } | undefined;
   return {
+    runningRuns: Number(counts?.running ?? 0),
+    queuedRuns: Number(counts?.queued ?? 0),
+    lastRunStatus: lastRun?.status === "queued" || lastRun?.status === "running" || lastRun?.status === "done" || lastRun?.status === "failed" || lastRun?.status === "stopped" || lastRun?.status === "skipped" || lastRun?.status === "canceled" ? lastRun.status : null,
+    lastRunAt: lastRun?.finished_at || lastRun?.started_at || null,
+    nextRunAt: nextAutomationRunAt(automation),
+  };
+}
+
+function automationWithRuntimeFields(automation: AutomationSummary): AutomationSummary {
+  return { ...automation, ...automationRuntimeFields(automation) };
+}
+
+function automationFromRow(row: Record<string, unknown>): AutomationSummary {
+  const automation: AutomationSummary = {
     id: String(row.id),
     name: String(row.name),
     projectId: row.project_id ? String(row.project_id) : null,
     providerId: row.provider_id ? String(row.provider_id) : null,
     model: row.model ? String(row.model) : null,
+    actionType: row.action_type === "command" ? "command" : "agent",
     prompt: String(row.prompt),
+    command: row.command ? String(row.command) : null,
+    cwd: row.cwd ? String(row.cwd) : null,
+    commandTimeoutSeconds: row.command_timeout_seconds === null || row.command_timeout_seconds === undefined ? null : Number(row.command_timeout_seconds),
+    retryMax: sanitizeAutomationRetryMax(row.retry_max),
+    retryDelayMinutes: sanitizeAutomationRetryDelayMinutes(row.retry_delay_minutes),
+    overlapPolicy: sanitizeAutomationOverlapPolicy(row.overlap_policy),
     schedule: String(row.schedule),
     status: row.status === "paused" ? "paused" : "active",
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   };
+  return automationWithRuntimeFields(automation);
 }
 
 function automationRunFromRow(row: Record<string, unknown>): AutomationRunSummary {
@@ -1833,7 +1922,7 @@ function automationRunFromRow(row: Record<string, unknown>): AutomationRunSummar
     id: String(row.id),
     automationId: String(row.automation_id),
     sessionId: String(row.session_id),
-    status: row.status === "done" || row.status === "failed" || row.status === "stopped" ? row.status : "running",
+    status: row.status === "queued" || row.status === "done" || row.status === "failed" || row.status === "stopped" || row.status === "skipped" || row.status === "canceled" ? row.status : "running",
     exitCode: row.exit_code === null || row.exit_code === undefined ? null : Number(row.exit_code),
     startedAt: String(row.started_at),
     finishedAt: row.finished_at ? String(row.finished_at) : undefined,
@@ -2086,14 +2175,21 @@ function upsertProvider(provider: ProviderRecord) {
 
 function upsertAutomation(automation: AutomationSummary) {
   db.prepare(`
-    insert into automations (id, name, project_id, provider_id, model, prompt, schedule, status, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    insert into automations (id, name, project_id, provider_id, model, action_type, prompt, command, cwd, command_timeout_seconds, retry_max, retry_delay_minutes, overlap_policy, schedule, status, created_at, updated_at)
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     on conflict(id) do update set
       name = excluded.name,
       project_id = excluded.project_id,
       provider_id = excluded.provider_id,
       model = excluded.model,
+      action_type = excluded.action_type,
       prompt = excluded.prompt,
+      command = excluded.command,
+      cwd = excluded.cwd,
+      command_timeout_seconds = excluded.command_timeout_seconds,
+      retry_max = excluded.retry_max,
+      retry_delay_minutes = excluded.retry_delay_minutes,
+      overlap_policy = excluded.overlap_policy,
       schedule = excluded.schedule,
       status = excluded.status,
       updated_at = excluded.updated_at
@@ -2103,7 +2199,14 @@ function upsertAutomation(automation: AutomationSummary) {
     automation.projectId,
     automation.providerId ?? null,
     automation.model ?? null,
+    automation.actionType ?? "agent",
     automation.prompt,
+    automation.command ?? null,
+    automation.cwd ?? null,
+    automation.commandTimeoutSeconds ?? null,
+    sanitizeAutomationRetryMax(automation.retryMax),
+    sanitizeAutomationRetryDelayMinutes(automation.retryDelayMinutes),
+    sanitizeAutomationOverlapPolicy(automation.overlapPolicy),
     automation.schedule,
     automation.status,
     automation.createdAt,
@@ -2111,14 +2214,15 @@ function upsertAutomation(automation: AutomationSummary) {
   );
 }
 
-function createAutomationRun(automationId: string, sessionId: string) {
+function createAutomationRun(automationId: string, sessionId: string, status: AutomationRunSummary["status"] = "running", startedAt = new Date().toISOString(), finishedAt?: string | null) {
   const run: AutomationRunSummary = {
     id: `automation-run-${randomUUID()}`,
     automationId,
     sessionId,
-    status: "running",
+    status,
     exitCode: null,
-    startedAt: new Date().toISOString(),
+    startedAt,
+    finishedAt: finishedAt ?? undefined,
   };
   db.prepare(`
     insert into automation_runs (id, automation_id, session_id, status, exit_code, started_at, finished_at)
@@ -2129,11 +2233,16 @@ function createAutomationRun(automationId: string, sessionId: string) {
 
 function finishAutomationRun(sessionId: string, exitCode: number | null, stopped: boolean) {
   const status: AutomationRunSummary["status"] = stopped ? "stopped" : exitCode === 0 ? "done" : "failed";
+  const run = db.prepare("select id, automation_id from automation_runs where session_id = ? and status = 'running' order by started_at desc, id desc limit 1").get(sessionId) as { id?: string; automation_id?: string } | undefined;
+  if (!run?.id) return;
   db.prepare(`
     update automation_runs
     set status = ?, exit_code = ?, finished_at = ?
-    where session_id = ? and status = 'running'
-  `).run(status, exitCode, new Date().toISOString(), sessionId);
+    where id = ?
+  `).run(status, exitCode, new Date().toISOString(), run.id);
+  const automationId = run.automation_id;
+  if (automationId && status === "failed") scheduleAutomationRetry(automationId, sessionId);
+  if (automationId) setTimeout(() => startNextQueuedAutomationRun(automationId), 0);
 }
 
 function setRoomParentSessionStatus(roomId: string, status: SessionSummary["status"], updatedAt = new Date().toISOString()) {
@@ -3282,6 +3391,81 @@ function automationRanInMinute(automationId: string, minuteKey: string) {
   return Boolean(row);
 }
 
+function automationHasRunningRun(automationId: string) {
+  const row = db.prepare("select id from automation_runs where automation_id = ? and status = 'running' limit 1").get(automationId) as Record<string, unknown> | undefined;
+  return Boolean(row);
+}
+
+function cronFieldMatches(field: string, value: number, min: number, max: number) {
+  return field.split(",").some((part) => {
+    const item = part.trim();
+    if (!item) return false;
+    if (item === "*") return true;
+    const stepMatch = item.match(/^\*\/(\d+)$/);
+    if (stepMatch) {
+      const step = Number(stepMatch[1]);
+      return step > 0 && (value - min) % step === 0;
+    }
+    const rangeMatch = item.match(/^(\d+)-(\d+)$/);
+    if (rangeMatch) {
+      const start = Number(rangeMatch[1]);
+      const end = Number(rangeMatch[2]);
+      return start <= value && value <= end;
+    }
+    const exact = Number(item);
+    return Number.isInteger(exact) && exact >= min && exact <= max && exact === value;
+  });
+}
+
+function cronMatches(expression: string, now: Date) {
+  const fields = expression.trim().split(/\s+/);
+  if (fields.length !== 5) return false;
+  const [minute, hour, dayOfMonth, month, dayOfWeek] = fields;
+  return cronFieldMatches(minute, now.getMinutes(), 0, 59)
+    && cronFieldMatches(hour, now.getHours(), 0, 23)
+    && cronFieldMatches(dayOfMonth, now.getDate(), 1, 31)
+    && cronFieldMatches(month, now.getMonth() + 1, 1, 12)
+    && cronFieldMatches(dayOfWeek, now.getDay(), 0, 7);
+}
+
+function nextAutomationRunAt(automation: AutomationSummary, from = new Date()) {
+  if (automation.status !== "active") return null;
+  const schedule = automation.schedule.trim().toLowerCase();
+  if (schedule === "manual") return null;
+  const next = new Date(from);
+  next.setSeconds(0, 0);
+  next.setMinutes(next.getMinutes() + 1);
+  if (schedule === "hourly") {
+    next.setMinutes(0, 0, 0);
+    if (next <= from) next.setHours(next.getHours() + 1);
+    return next.toISOString();
+  }
+  const daily = schedule.match(/^daily\s+([0-2]\d):([0-5]\d)$/);
+  if (daily) {
+    next.setHours(Number(daily[1]), Number(daily[2]), 0, 0);
+    if (next <= from) next.setDate(next.getDate() + 1);
+    return next.toISOString();
+  }
+  const weekly = schedule.match(/^weekly\s+([0-7])\s+([0-2]\d):([0-5]\d)$/);
+  if (weekly) {
+    const targetDay = Number(weekly[1]) % 7;
+    next.setHours(Number(weekly[2]), Number(weekly[3]), 0, 0);
+    const delta = (targetDay - next.getDay() + 7) % 7;
+    next.setDate(next.getDate() + delta);
+    if (next <= from) next.setDate(next.getDate() + 7);
+    return next.toISOString();
+  }
+  if (schedule.startsWith("cron ")) {
+    const expression = schedule.slice(5);
+    const probe = new Date(next);
+    for (let i = 0; i < 366 * 24 * 60; i++) {
+      if (cronMatches(expression, probe)) return probe.toISOString();
+      probe.setMinutes(probe.getMinutes() + 1);
+    }
+  }
+  return null;
+}
+
 function shouldRunAutomationNow(automation: AutomationSummary, now = new Date()) {
   if (automation.status !== "active") return false;
   const schedule = automation.schedule.trim().toLowerCase();
@@ -3291,43 +3475,239 @@ function shouldRunAutomationNow(automation: AutomationSummary, now = new Date())
   if (schedule === "hourly") return now.getMinutes() === 0;
   const daily = schedule.match(/^daily\s+([0-2]\d):([0-5]\d)$/);
   if (daily) return now.getHours() === Number(daily[1]) && now.getMinutes() === Number(daily[2]);
+  const weekly = schedule.match(/^weekly\s+([0-7])\s+([0-2]\d):([0-5]\d)$/);
+  if (weekly) {
+    const day = Number(weekly[1]) % 7;
+    return now.getDay() === day && now.getHours() === Number(weekly[2]) && now.getMinutes() === Number(weekly[3]);
+  }
+  if (schedule.startsWith("cron ")) return cronMatches(schedule.slice(5), now);
   return false;
 }
 
 function isValidAutomationSchedule(schedule: string) {
   const value = schedule.trim().toLowerCase();
-  return value === "manual" || value === "hourly" || /^daily\s+[0-2]\d:[0-5]\d$/.test(value);
+  return value === "manual"
+    || value === "hourly"
+    || /^daily\s+[0-2]\d:[0-5]\d$/.test(value)
+    || /^weekly\s+[0-7]\s+[0-2]\d:[0-5]\d$/.test(value)
+    || (value.startsWith("cron ") && value.slice(5).trim().split(/\s+/).length === 5);
 }
 
-function runAutomationNow(automation: AutomationSummary) {
+function latestAutomationSession(automationId: string) {
+  const linked = db.prepare("select session_id from automations where id = ?").get(automationId) as { session_id?: string | null } | undefined;
+  if (linked?.session_id) {
+    const session = appData.sessions.find((item) => item.id === linked.session_id);
+    if (session) return session;
+    db.prepare("update automations set session_id = null where id = ?").run(automationId);
+  }
+  const existingRun = db.prepare(`
+    select session_id from automation_runs
+    where automation_id = ?
+    order by started_at desc, id desc
+    limit 1
+  `).get(automationId) as { session_id?: string | null } | undefined;
+  if (!existingRun?.session_id) return null;
+  const session = appData.sessions.find((item) => item.id === existingRun.session_id) ?? null;
+  if (session) linkAutomationSession(automationId, session.id);
+  return session;
+}
+
+function linkAutomationSession(automationId: string, sessionId: string) {
+  db.prepare("update automations set session_id = ? where id = ?").run(sessionId, automationId);
+}
+
+function ensureAutomationSession(automation: AutomationSummary) {
   const project = automation.projectId ? appData.projects.find((item) => item.id === automation.projectId) : null;
   const provider = automation.providerId
     ? appData.providers.find((item) => item.id === automation.providerId) ?? appData.providers[0]
     : appData.providers[0];
   const selectedModel = automation.model ?? provider?.defaultModel ?? null;
-  const id = `task-${randomUUID()}`;
-  const workspacePath = project?.workspacePath ? resolveTerminalCwd(project.workspacePath) : ensureScratchSessionWorkspace(id);
-  const session: SessionSummary = {
+  const existingSession = latestAutomationSession(automation.id);
+  const id = existingSession?.id ?? `task-${randomUUID()}`;
+  const workspacePath = automation.cwd?.trim()
+    ? resolveTerminalCwd(automation.cwd)
+    : project?.workspacePath ? resolveTerminalCwd(project.workspacePath) : ensureScratchSessionWorkspace(id);
+  const now = new Date().toISOString();
+  const session: SessionSummary = existingSession ? {
+    ...existingSession,
+    kind: project ? "project" : "scratch",
+    conversationType: "automation",
+    title: automation.name,
+    projectId: project?.id ?? null,
+    workspacePath,
+    providerId: provider?.id ?? existingSession.providerId ?? null,
+    model: selectedModel ?? existingSession.model ?? null,
+    updatedAt: now,
+  } : {
     id,
     kind: project ? "project" : "scratch",
+    conversationType: "automation",
     title: automation.name,
     projectId: project?.id ?? null,
     workspacePath,
     providerId: provider?.id ?? null,
     model: selectedModel,
-    status: "running",
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    status: "paused",
+    createdAt: now,
+    updatedAt: now,
   };
-  appData.sessions.unshift(session);
-  const userMessage = appendSessionMessage(session.id, "user", automation.prompt);
-  createAutomationRun(automation.id, session.id);
+  appData.sessions = [session, ...appData.sessions.filter((item) => item.id !== session.id)];
+  linkAutomationSession(automation.id, session.id);
+  return { session, project, provider, selectedModel, workspacePath };
+}
+
+type AutomationRunStartResult = {
+  session: SessionSummary;
+  runStatus: AutomationRunSummary["status"];
+};
+
+function queueAutomationRun(automation: AutomationSummary) {
+  const { session } = ensureAutomationSession(automation);
+  appendSessionMessage(session.id, "system", `Automation run queued: ${automation.name} (${new Date().toISOString()})`);
+  createAutomationRun(automation.id, session.id, "queued");
   saveAppData();
-  startCodexTask(session, automation.prompt, workspacePath, provider, selectedModel, true, [], { currentMessageId: userMessage.id });
-  return session;
+  return { session, runStatus: "queued" as const };
+}
+
+function skipAutomationRun(automation: AutomationSummary) {
+  const { session } = ensureAutomationSession(automation);
+  const now = new Date().toISOString();
+  appendSessionMessage(session.id, "system", `Automation run skipped because a previous run is still active: ${automation.name} (${now})`);
+  createAutomationRun(automation.id, session.id, "skipped", now, now);
+  saveAppData();
+  return { session, runStatus: "skipped" as const };
+}
+
+function emitAutomationCommandNotification(automation: AutomationSummary, session: SessionSummary, result: { exitCode: number | null; timedOut?: boolean; stopped?: boolean; command?: string; cwd?: string }) {
+  const stopped = Boolean(result.stopped);
+  const success = result.exitCode === 0 && !result.timedOut && !stopped;
+  emitExternalNotification({
+    eventType: stopped ? "task_interrupted" : success ? "task_completed" : "task_failed",
+    severity: stopped ? "warning" : success ? "success" : "error",
+    title: success ? `自动化完成：${automation.name}` : `自动化异常：${automation.name}`,
+    message: stopped
+      ? "系统命令自动化已被停止。"
+      : result.timedOut
+        ? `系统命令自动化超时，退出码：${result.exitCode ?? "null"}`
+        : `系统命令自动化退出码：${result.exitCode ?? "null"}`,
+    sourceType: "session",
+    sourceId: session.id,
+    metadata: {
+      automationId: automation.id,
+      automationName: automation.name,
+      actionType: automation.actionType ?? "agent",
+      command: result.command ?? automation.command ?? null,
+      cwd: result.cwd ?? session.workspacePath ?? null,
+      exitCode: result.exitCode,
+      timedOut: Boolean(result.timedOut),
+      stopped,
+      workspacePath: session.workspacePath,
+      notificationScopes: [{ scopeType: "session", scopeId: session.id }],
+    },
+  });
+}
+
+function consecutiveAutomationFailures(automationId: string) {
+  const rows = db.prepare(`
+    select status
+    from automation_runs
+    where automation_id = ?
+    order by started_at desc, id desc
+    limit 20
+  `).all(automationId) as Array<{ status?: string }>;
+  let count = 0;
+  for (const row of rows) {
+    if (row.status !== "failed") break;
+    count += 1;
+  }
+  return count;
+}
+
+function scheduleAutomationRetry(automationId: string, sessionId: string) {
+  const automation = appData.automations.find((item) => item.id === automationId);
+  if (!automation || automation.status !== "active") return;
+  const retryMax = sanitizeAutomationRetryMax(automation.retryMax);
+  if (!retryMax) return;
+  const failures = consecutiveAutomationFailures(automationId);
+  if (failures > retryMax) return;
+  const retryAt = new Date(Date.now() + sanitizeAutomationRetryDelayMinutes(automation.retryDelayMinutes) * 60_000).toISOString();
+  createAutomationRun(automationId, sessionId, "queued", retryAt);
+  appendSessionMessage(sessionId, "system", `Automation retry queued: ${automation.name} (${retryAt})`);
+  saveAppData();
+}
+
+function startNextQueuedAutomationRun(automationId: string) {
+  if (automationHasRunningRun(automationId)) return;
+  const queued = db.prepare(`
+    select id from automation_runs
+    where automation_id = ? and status = 'queued' and started_at <= ?
+    order by started_at asc, id asc
+    limit 1
+  `).get(automationId, new Date().toISOString()) as { id?: string } | undefined;
+  if (!queued?.id) return;
+  const automation = appData.automations.find((item) => item.id === automationId);
+  if (!automation || automation.status !== "active") return;
+  runAutomationNow(automation, queued.id);
+}
+
+function startDueQueuedAutomationRuns() {
+  const rows = db.prepare(`
+    select distinct automation_id
+    from automation_runs
+    where status = 'queued' and started_at <= ?
+  `).all(new Date().toISOString()) as Array<{ automation_id?: string }>;
+  for (const row of rows) {
+    if (row.automation_id) startNextQueuedAutomationRun(String(row.automation_id));
+  }
+}
+
+function runAutomationNow(automation: AutomationSummary, queuedRunId?: string): AutomationRunStartResult {
+  if (!queuedRunId && automationHasRunningRun(automation.id)) {
+    return sanitizeAutomationOverlapPolicy(automation.overlapPolicy) === "skip" ? skipAutomationRun(automation) : queueAutomationRun(automation);
+  }
+  const { session, provider, selectedModel, workspacePath } = ensureAutomationSession(automation);
+  const now = new Date().toISOString();
+  session.status = "running";
+  session.updatedAt = now;
+  appData.sessions = [session, ...appData.sessions.filter((item) => item.id !== session.id)];
+  const isCommand = automation.actionType === "command";
+  const command = automation.command?.trim() ?? "";
+  const content = isCommand ? command : automation.prompt;
+  appendSessionMessage(session.id, "system", `Automation run started: ${automation.name} (${now})`);
+  const userMessage = appendSessionMessage(session.id, "user", content);
+  if (queuedRunId) {
+    db.prepare("update automation_runs set status = 'running', session_id = ?, started_at = ?, finished_at = null, exit_code = null where id = ?").run(session.id, now, queuedRunId);
+  } else {
+    createAutomationRun(automation.id, session.id);
+  }
+  saveAppData();
+  if (isCommand) {
+    const timeoutSeconds = automationCommandTimeoutSeconds(automation.commandTimeoutSeconds);
+    void runLoggedShellCommand(session, command, workspacePath, { timeoutMs: timeoutSeconds === null ? null : timeoutSeconds * 1000, source: "automation" }).then((result) => {
+      appendSessionMessage(session.id, "assistant", formatShellCommandOutput(result, timeoutSeconds));
+      session.status = result.exitCode === 0 && !result.timedOut && !result.stopped ? "done" : "interrupted";
+      session.updatedAt = new Date().toISOString();
+      upsertSession(session);
+      finishAutomationRun(session.id, result.exitCode, Boolean(result.stopped));
+      emitAutomationCommandNotification(automation, session, result);
+      publishTaskEvent(session.id, { type: "done", session, exitCode: result.exitCode });
+    }).catch((error) => {
+      appendSessionMessage(session.id, "assistant", error instanceof Error ? error.message : "Command automation failed");
+      session.status = "interrupted";
+      session.updatedAt = new Date().toISOString();
+      upsertSession(session);
+      finishAutomationRun(session.id, 1, false);
+      emitAutomationCommandNotification(automation, session, { exitCode: 1, command, cwd: workspacePath });
+      publishTaskEvent(session.id, { type: "done", session, exitCode: 1 });
+    });
+  } else {
+    startCodexTask(session, automation.prompt, workspacePath, provider, selectedModel, !session.codexSessionId, [], { currentMessageId: userMessage.id, sourceType: "automation" });
+  }
+  return { session, runStatus: "running" };
 }
 
 function checkScheduledAutomations() {
+  startDueQueuedAutomationRuns();
   const now = new Date();
   for (const automation of appData.automations) {
     if (!shouldRunAutomationNow(automation, now)) continue;
@@ -6947,7 +7327,7 @@ function roomOrchestrationSettings(value: unknown, override?: Partial<RoomOrches
 }
 
 function conversationType(value: unknown, fallback: ConversationType = "codex"): ConversationType {
-  return value === "agent" || value === "room" || value === "codex" ? value : fallback;
+  return value === "agent" || value === "room" || value === "codex" || value === "automation" ? value : fallback;
 }
 
 function previewAccess(value: unknown, fallback: PreviewAccess = "private"): PreviewAccess {
@@ -7578,6 +7958,79 @@ async function streamChatCompletionAsResponses(upstream: Response, model: string
         }
         return items;
       };
+      const splitSseEvents = (input: string) => {
+        const events: string[] = [];
+        let rest = input;
+        while (true) {
+          const match = rest.match(/\r?\n\r?\n/);
+          if (!match || match.index === undefined) break;
+          events.push(rest.slice(0, match.index));
+          rest = rest.slice(match.index + match[0].length);
+        }
+        return { events, rest };
+      };
+      const sseDataPayloads = (eventBlock: string) => {
+        const dataLines = eventBlock
+          .split(/\r?\n/)
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).replace(/^ /, ""));
+        if (!dataLines.length) return [];
+        const joined = dataLines.join("\n").trim();
+        if (dataLines.length === 1) return joined ? [joined] : [];
+        try {
+          JSON.parse(joined);
+          return [joined];
+        } catch {
+          return dataLines.map((line) => line.trim()).filter(Boolean);
+        }
+      };
+      const processChatCompletionData = (data: string) => {
+        if (!data || data === "[DONE]") return;
+        try {
+          const chunk = JSON.parse(data) as Record<string, unknown>;
+          const choice = Array.isArray(chunk.choices) ? chunk.choices[0] as Record<string, unknown> | undefined : undefined;
+          const delta = choice?.delta && typeof choice.delta === "object" ? choice.delta as Record<string, unknown> : {};
+          const content = delta.content;
+          const text = typeof content === "string"
+            ? content
+            : Array.isArray(content)
+              ? content.map((part) => {
+                if (typeof part === "string") return part;
+                if (!part || typeof part !== "object") return "";
+                const record = part as Record<string, unknown>;
+                return typeof record.text === "string" ? record.text : "";
+              }).join("")
+              : "";
+          if (text) {
+            startTextItem();
+            textOutput += text;
+            controller.enqueue(encoder.encode(sseEvent("response.output_text.delta", { type: "response.output_text.delta", item_id: itemId, output_index: textOutputIndex, content_index: 0, delta: text })));
+          }
+          const toolCalls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+          for (const toolCall of toolCalls) {
+            if (!toolCall || typeof toolCall !== "object") continue;
+            const record = toolCall as Record<string, unknown>;
+            const index = typeof record.index === "number" ? record.index : functionCalls.size;
+            const call = startFunctionCall(index, record);
+            const fn = record.function && typeof record.function === "object" ? record.function as Record<string, unknown> : {};
+            const argumentsDelta = typeof fn.arguments === "string" ? fn.arguments : "";
+            if (argumentsDelta) {
+              call.arguments += argumentsDelta;
+              controller.enqueue(encoder.encode(sseEvent("response.function_call_arguments.delta", {
+                type: "response.function_call_arguments.delta",
+                item_id: call.id,
+                output_index: call.outputIndex,
+                delta: argumentsDelta,
+              })));
+            }
+          }
+        } catch {
+          // Ignore malformed upstream SSE chunks and continue streaming.
+        }
+      };
+      const processSseEventBlock = (eventBlock: string) => {
+        for (const data of sseDataPayloads(eventBlock)) processChatCompletionData(data);
+      };
       const reader = upstream.body?.getReader();
       if (!reader) {
         const item = finishTextItem() ?? { id: itemId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: "", annotations: [] }] };
@@ -7589,46 +8042,15 @@ async function streamChatCompletionAsResponses(upstream: Response, model: string
         const { value, done } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
-        const parts = buffer.split("\n\n");
-        buffer = parts.pop() ?? "";
-        for (const part of parts) {
-          const dataLine = part.split(/\r?\n/).find((line) => line.startsWith("data:"));
-          if (!dataLine) continue;
-          const data = dataLine.slice(5).trim();
-          if (!data || data === "[DONE]") continue;
-          try {
-            const chunk = JSON.parse(data) as Record<string, unknown>;
-            const choice = Array.isArray(chunk.choices) ? chunk.choices[0] as Record<string, unknown> | undefined : undefined;
-            const delta = choice?.delta && typeof choice.delta === "object" ? choice.delta as Record<string, unknown> : {};
-            const text = typeof delta.content === "string" ? delta.content : "";
-            if (text) {
-              startTextItem();
-              textOutput += text;
-              controller.enqueue(encoder.encode(sseEvent("response.output_text.delta", { type: "response.output_text.delta", item_id: itemId, output_index: textOutputIndex, content_index: 0, delta: text })));
-            }
-            const toolCalls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
-            for (const toolCall of toolCalls) {
-              if (!toolCall || typeof toolCall !== "object") continue;
-              const record = toolCall as Record<string, unknown>;
-              const index = typeof record.index === "number" ? record.index : functionCalls.size;
-              const call = startFunctionCall(index, record);
-              const fn = record.function && typeof record.function === "object" ? record.function as Record<string, unknown> : {};
-              const argumentsDelta = typeof fn.arguments === "string" ? fn.arguments : "";
-              if (argumentsDelta) {
-                call.arguments += argumentsDelta;
-                controller.enqueue(encoder.encode(sseEvent("response.function_call_arguments.delta", {
-                  type: "response.function_call_arguments.delta",
-                  item_id: call.id,
-                  output_index: call.outputIndex,
-                  delta: argumentsDelta,
-                })));
-              }
-            }
-          } catch {
-            // Ignore malformed upstream SSE chunks and continue streaming.
-          }
-        }
+        const split = splitSseEvents(buffer);
+        buffer = split.rest;
+        for (const eventBlock of split.events) processSseEventBlock(eventBlock);
       }
+      buffer += decoder.decode();
+      const split = splitSseEvents(buffer);
+      for (const eventBlock of split.events) processSseEventBlock(eventBlock);
+      if (split.rest.trim()) processSseEventBlock(split.rest);
+      buffer = "";
       const output = [finishTextItem(), ...finishFunctionCalls()].filter(Boolean);
       if (!output.length) output.push({ id: itemId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: "", annotations: [] }] });
       controller.enqueue(encoder.encode(sseEvent("response.completed", { type: "response.completed", response: { id: responseId, status: "completed", model, output } })));
@@ -8250,13 +8672,21 @@ function toFileEntry(absolutePath: string, root = workspaceRoot): FileEntry {
   };
 }
 
-function runShellCommand(command: string, cwd: string): Promise<TerminalCommandResponse> {
+function automationCommandTimeoutSeconds(value: unknown) {
+  if (value === null || value === undefined || value === "") return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.max(1, Math.min(Math.round(parsed), 24 * 60 * 60));
+}
+
+function runShellCommand(command: string, cwd: string, options: { timeoutMs?: number | null; onChild?: (child: ChildProcess) => void } = {}): Promise<TerminalCommandResponse> {
   const startedAt = Date.now();
   return new Promise((resolveCommand) => {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
     const child = spawnProcess("/bin/zsh", ["-lc", command], { cwd, env: managedChildEnv() });
+    options.onChild?.(child);
     const trimOutput = (value: string) => value.slice(-64 * 1024);
     child.stdout?.on("data", (chunk: Buffer) => {
       stdout = trimOutput(stdout + chunk.toString("utf8"));
@@ -8264,15 +8694,68 @@ function runShellCommand(command: string, cwd: string): Promise<TerminalCommandR
     child.stderr?.on("data", (chunk: Buffer) => {
       stderr = trimOutput(stderr + chunk.toString("utf8"));
     });
-    const timeout = setTimeout(() => {
+    const timeoutMs = options.timeoutMs === undefined ? 30_000 : options.timeoutMs;
+    const timeout = timeoutMs === null ? null : setTimeout(() => {
       timedOut = true;
       child.kill("SIGTERM");
-    }, 30_000);
+    }, timeoutMs);
     child.on("close", (exitCode) => {
-      clearTimeout(timeout);
+      if (timeout) clearTimeout(timeout);
       resolveCommand({ command, cwd: toTerminalPath(cwd), exitCode, stdout, stderr, durationMs: Date.now() - startedAt, timedOut });
     });
   });
+}
+
+function formatShellCommandOutput(result: TerminalCommandResponse, timeoutSeconds?: number | null) {
+  return [
+    `Command: ${result.command}`,
+    `CWD: ${result.cwd}`,
+    `Exit code: ${result.exitCode ?? "null"}`,
+    `Duration: ${result.durationMs}ms${result.timedOut && timeoutSeconds ? ` (timed out after ${timeoutSeconds}s)` : ""}`,
+    "",
+    "stdout:",
+    result.stdout || "(empty)",
+    "",
+    "stderr:",
+    result.stderr || "(empty)",
+  ].join("\n");
+}
+
+async function runLoggedShellCommand(session: SessionSummary, command: string, cwd: string, options: { timeoutMs?: number | null; source?: string } = {}) {
+  const promptHash = createHash("sha256").update(command).digest("hex").slice(0, 12);
+  const runId = createTaskRun(session.id, undefined, { promptChars: command.length, promptHash });
+  if (!codexTaskOutputs.has(session.id)) codexTaskOutputs.set(session.id, readCodexOutput(session.id));
+  appendCodexErrorOutput(session, "\n" + [
+    "[codex-web]",
+    "mode=shell",
+    `session=${session.id}`,
+    `promptChars=${command.length}`,
+    `promptHash=${promptHash}`,
+    `cwd=${cwd}`,
+    `source=${options.source ?? "shell"}`,
+  ].join(" ") + "\n");
+  appendCodexErrorOutput(session, `$ /bin/zsh -lc ${JSON.stringify(command)}\n`);
+  try {
+    const result = await runShellCommand(command, cwd, {
+      timeoutMs: options.timeoutMs,
+      onChild: (child) => {
+        shellTaskProcesses.set(session.id, child);
+        updateTaskRunPid(runId, child.pid);
+      },
+    });
+    const stopped = shellTaskStopRequested.has(session.id) || Boolean((db.prepare("select stop_requested from task_runs where id = ?").get(runId) as { stop_requested?: number } | undefined)?.stop_requested);
+    const timeoutSeconds = options.timeoutMs === null || options.timeoutMs === undefined ? null : Math.round(options.timeoutMs / 1000);
+    appendCodexErrorOutput(session, `${formatShellCommandOutput(result, timeoutSeconds)}${stopped ? "\nStopped: true" : ""}\n`);
+    const status: TaskRunSummary["status"] = stopped ? "stopped" : result.exitCode === 0 && !result.timedOut ? "done" : "failed";
+    finishTaskRunById(runId, status, result.exitCode, stopped ? "user_stopped" : result.timedOut ? "shell_command_timed_out" : undefined);
+    const output = codexTaskOutputs.get(session.id);
+    if (output) output.exitCode = result.exitCode;
+    writeTaskExitCode(session.id, result.exitCode);
+    return { ...result, stopped };
+  } finally {
+    shellTaskProcesses.delete(session.id);
+    shellTaskStopRequested.delete(session.id);
+  }
 }
 
 function saveProjectCheckRun(projectId: string, result: TerminalCommandResponse, startedAt: string): ProjectCheckRunSummary {
@@ -9537,6 +10020,11 @@ function createTaskRun(sessionId: string, pid?: number, metadata?: { promptChars
   return id;
 }
 
+function updateTaskRunPid(runId: string, pid?: number | null) {
+  if (!pid || !Number.isFinite(pid) || pid <= 0) return;
+  db.prepare("update task_runs set pid = ? where id = ? and status = 'running'").run(pid, runId);
+}
+
 function isProcessAlive(pid?: number | null) {
   if (!pid || !Number.isFinite(pid) || pid <= 0) return false;
   try {
@@ -9562,6 +10050,14 @@ function finishTaskRun(sessionId: string, status: TaskRunSummary["status"], exit
     set status = ?, ended_at = ?, exit_code = ?, interrupted_reason = coalesce(?, interrupted_reason)
     where session_id = ? and status = 'running'
   `).run(status, new Date().toISOString(), exitCode, reason ?? null, sessionId);
+}
+
+function finishTaskRunById(runId: string, status: TaskRunSummary["status"], exitCode: number | null, reason?: string) {
+  db.prepare(`
+    update task_runs
+    set status = ?, ended_at = ?, exit_code = ?, interrupted_reason = coalesce(?, interrupted_reason)
+    where id = ?
+  `).run(status, new Date().toISOString(), exitCode, reason ?? null, runId);
 }
 
 function markTaskRunStopRequested(sessionId: string) {
@@ -11410,11 +11906,13 @@ function startCodexTask(
     approvalPolicy: effectiveRuntime.approvalPolicy,
     createdBy: contextInput?.createdBy ?? "user",
   });
-  if (resetOutput) codexTaskOutputs.set(session.id, { output: "", exitCode: null });
+  const hasExistingTaskLog = existsSync(taskLogPath(session.id)) || existsSync(legacyTaskLogPath(session.id));
+  const shouldResetTaskLog = resetOutput && !hasExistingTaskLog;
+  if (shouldResetTaskLog) codexTaskOutputs.set(session.id, { output: "", exitCode: null });
   else if (!codexTaskOutputs.has(session.id)) codexTaskOutputs.set(session.id, readCodexOutput(session.id));
   codexTaskStdoutBuffers.set(session.id, "");
   finalizedRecoveredTasks.delete(session.id);
-  if (resetOutput) {
+  if (shouldResetTaskLog) {
     mkdirSync(sessionLogsPath(session.id), { recursive: true });
     writeFileSync(taskLogPath(session.id), "", "utf8");
     rmSync(taskMetaPath(session.id), { force: true });
@@ -13961,7 +14459,12 @@ app.delete("/api/previews/:id", (c) => {
 app.get("/api/sessions", (c) => {
   const limitQuery = c.req.query("limit");
   const includeAgentChildren = c.req.query("includeAgentChildren") === "true" || c.req.query("includeAgentChildren") === "1";
-  const visibleSessions = includeAgentChildren ? appData.sessions : appData.sessions.filter((session) => !(session.conversationType === "agent" && session.roomId));
+  const includeAutomations = c.req.query("includeAutomations") === "true" || c.req.query("includeAutomations") === "1";
+  const visibleSessions = appData.sessions.filter((session) => {
+    if (!includeAgentChildren && session.conversationType === "agent" && session.roomId) return false;
+    if (!includeAutomations && session.conversationType === "automation") return false;
+    return true;
+  });
   if (!limitQuery && !c.req.query("cursor") && !c.req.query("q") && !c.req.query("projectId") && !c.req.query("status")) return c.json(visibleSessions);
   const limit = parsePageLimit(limitQuery, 30);
   const cursor = decodePageCursor(c.req.query("cursor"));
@@ -14649,25 +15152,31 @@ app.delete("/api/projects/:id", async (c) => {
 
 app.get("/api/automations", (c) => {
   const limitQuery = c.req.query("limit");
-  if (!limitQuery && !c.req.query("cursor") && !c.req.query("q") && !c.req.query("status") && !c.req.query("projectId")) {
-    return c.json(appData.automations);
+  if (!limitQuery && !c.req.query("cursor") && !c.req.query("q") && !c.req.query("status") && !c.req.query("projectId") && !c.req.query("actionType")) {
+    return c.json(appData.automations.map(automationWithRuntimeFields));
   }
   const limit = parsePageLimit(limitQuery, 20);
   const cursor = decodePageCursor(c.req.query("cursor"));
   const q = c.req.query("q")?.trim().toLowerCase() ?? "";
   const status = c.req.query("status");
   const projectId = c.req.query("projectId");
+  const actionType = c.req.query("actionType");
   const filtered = appData.automations
-    .filter((automation) => !q || automation.name.toLowerCase().includes(q) || automation.prompt.toLowerCase().includes(q) || automation.id.toLowerCase().includes(q))
+    .map(automationWithRuntimeFields)
+    .filter((automation) => !q || automation.name.toLowerCase().includes(q) || automation.prompt.toLowerCase().includes(q) || (automation.command ?? "").toLowerCase().includes(q) || automation.id.toLowerCase().includes(q))
     .filter((automation) => !status || automation.status === status)
     .filter((automation) => !projectId || (projectId === "global" ? !automation.projectId : automation.projectId === projectId))
+    .filter((automation) => !actionType || automation.actionType === actionType)
     .filter((automation) => !cursor || automation.updatedAt < cursor.sortValue || (automation.updatedAt === cursor.sortValue && automation.id < cursor.id))
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.id.localeCompare(a.id));
   return c.json(pageFromRows(filtered, limit, (item) => item.updatedAt));
 });
 app.post("/api/automations", async (c) => {
   const body = await c.req.json<CreateAutomationRequest>().catch(() => null);
-  if (!body?.name?.trim() || !body.prompt?.trim() || !body.schedule?.trim()) return c.json({ error: "invalid_automation" }, 400);
+  const actionType = body?.actionType === "command" ? "command" : "agent";
+  if (!body?.name?.trim() || !body.schedule?.trim()) return c.json({ error: "invalid_automation" }, 400);
+  if (actionType === "agent" && !body.prompt?.trim()) return c.json({ error: "invalid_automation_prompt" }, 400);
+  if (actionType === "command" && !body.command?.trim()) return c.json({ error: "invalid_automation_command" }, 400);
   if (!isValidAutomationSchedule(body.schedule)) return c.json({ error: "invalid_automation_schedule" }, 400);
   const project = body.projectId ? appData.projects.find((item) => item.id === body.projectId) : null;
   const provider = body.providerId ? appData.providers.find((item) => item.id === body.providerId) : null;
@@ -14678,7 +15187,14 @@ app.post("/api/automations", async (c) => {
     projectId: project?.id ?? null,
     providerId: provider?.id ?? null,
     model: body.model?.trim() || null,
-    prompt: body.prompt.trim(),
+    actionType,
+    prompt: body.prompt?.trim() || body.command?.trim() || "",
+    command: body.command?.trim() || null,
+    cwd: body.cwd?.trim() || null,
+    commandTimeoutSeconds: actionType === "command" ? automationCommandTimeoutSeconds(body.commandTimeoutSeconds) : null,
+    retryMax: sanitizeAutomationRetryMax(body.retryMax),
+    retryDelayMinutes: sanitizeAutomationRetryDelayMinutes(body.retryDelayMinutes),
+    overlapPolicy: sanitizeAutomationOverlapPolicy(body.overlapPolicy),
     schedule: body.schedule.trim(),
     status: "active",
     createdAt: now,
@@ -14686,7 +15202,7 @@ app.post("/api/automations", async (c) => {
   };
   appData.automations.unshift(automation);
   upsertAutomation(automation);
-  return c.json(automation, 201);
+  return c.json(automationWithRuntimeFields(automation), 201);
 });
 app.patch("/api/automations/:id", async (c) => {
   const automation = appData.automations.find((item) => item.id === c.req.param("id"));
@@ -14697,7 +15213,16 @@ app.patch("/api/automations/:id", async (c) => {
   if (body.projectId !== undefined) automation.projectId = appData.projects.find((item) => item.id === body.projectId)?.id ?? null;
   if (body.providerId !== undefined) automation.providerId = appData.providers.find((item) => item.id === body.providerId)?.id ?? null;
   if (body.model !== undefined) automation.model = body.model?.trim() || null;
+  if (body.actionType !== undefined) automation.actionType = body.actionType === "command" ? "command" : "agent";
   if (body.prompt !== undefined) automation.prompt = body.prompt.trim() || automation.prompt;
+  if (body.command !== undefined) automation.command = body.command?.trim() || null;
+  if (body.cwd !== undefined) automation.cwd = body.cwd?.trim() || null;
+  if (body.commandTimeoutSeconds !== undefined) automation.commandTimeoutSeconds = automation.actionType === "command" ? automationCommandTimeoutSeconds(body.commandTimeoutSeconds) : null;
+  if (body.retryMax !== undefined) automation.retryMax = sanitizeAutomationRetryMax(body.retryMax);
+  if (body.retryDelayMinutes !== undefined) automation.retryDelayMinutes = sanitizeAutomationRetryDelayMinutes(body.retryDelayMinutes);
+  if (body.overlapPolicy !== undefined) automation.overlapPolicy = sanitizeAutomationOverlapPolicy(body.overlapPolicy);
+  if ((automation.actionType ?? "agent") === "agent" && !automation.prompt.trim()) return c.json({ error: "invalid_automation_prompt" }, 400);
+  if (automation.actionType === "command" && !automation.command?.trim()) return c.json({ error: "invalid_automation_command" }, 400);
   if (body.schedule !== undefined) {
     if (!isValidAutomationSchedule(body.schedule)) return c.json({ error: "invalid_automation_schedule" }, 400);
     automation.schedule = body.schedule.trim() || automation.schedule;
@@ -14705,7 +15230,7 @@ app.patch("/api/automations/:id", async (c) => {
   if (body.status !== undefined) automation.status = body.status;
   automation.updatedAt = new Date().toISOString();
   upsertAutomation(automation);
-  return c.json(automation);
+  return c.json(automationWithRuntimeFields(automation));
 });
 app.delete("/api/automations/:id", (c) => {
   const index = appData.automations.findIndex((item) => item.id === c.req.param("id"));
@@ -14720,21 +15245,88 @@ app.get("/api/automations/:id/runs", (c) => {
   if (!automation) return c.json({ error: "automation_not_found" }, 404);
   const limit = parsePageLimit(c.req.query("limit"), 20);
   const cursor = decodePageCursor(c.req.query("cursor"));
+  const status = c.req.query("status");
+  const statusFilter = status === "queued" || status === "running" || status === "done" || status === "failed" || status === "stopped" || status === "skipped" || status === "canceled" ? status : null;
   const rows = db.prepare(`
     select id, automation_id, session_id, status, exit_code, started_at, finished_at
     from automation_runs
     where automation_id = @automationId
+      ${statusFilter ? "and status = @status" : ""}
       ${cursor ? "and (started_at < @cursorSort or (started_at = @cursorSort and id < @cursorId))" : ""}
     order by started_at desc, id desc
     limit @limit
-  `).all({ automationId: automation.id, cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
+  `).all({ automationId: automation.id, status: statusFilter, cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
   return c.json(pageFromRows(rows.map(automationRunFromRow), limit, (item) => item.startedAt));
+});
+app.delete("/api/automations/:id/runs", (c) => {
+  const automation = appData.automations.find((item) => item.id === c.req.param("id"));
+  if (!automation) return c.json({ error: "automation_not_found" }, 404);
+  const result = db.prepare("delete from automation_runs where automation_id = ? and status in ('done', 'failed', 'stopped', 'skipped', 'canceled')").run(automation.id);
+  return c.json({ ok: true, cleared: result.changes });
+});
+app.post("/api/automations/:id/runs/cancel-queued", (c) => {
+  const automation = appData.automations.find((item) => item.id === c.req.param("id"));
+  if (!automation) return c.json({ error: "automation_not_found" }, 404);
+  const now = new Date().toISOString();
+  const result = db.prepare(`
+    update automation_runs
+    set status = 'canceled', finished_at = ?
+    where automation_id = ? and status = 'queued'
+  `).run(now, automation.id);
+  const session = latestAutomationSession(automation.id);
+  if (session && result.changes > 0) {
+    appendSessionMessage(session.id, "system", `Automation queued runs canceled: ${automation.name} (${now})`);
+    saveAppData();
+  }
+  return c.json({ ok: true, canceled: result.changes, automation: automationWithRuntimeFields(automation) });
+});
+app.post("/api/automations/:id/runs/stop-running", (c) => {
+  const automation = appData.automations.find((item) => item.id === c.req.param("id"));
+  if (!automation) return c.json({ error: "automation_not_found" }, 404);
+  const runningRun = db.prepare(`
+    select session_id
+    from automation_runs
+    where automation_id = ? and status = 'running'
+    order by started_at desc, id desc
+    limit 1
+  `).get(automation.id) as { session_id?: string | null } | undefined;
+  const sessionId = runningRun?.session_id ? String(runningRun.session_id) : "";
+  const session = sessionId ? appData.sessions.find((item) => item.id === sessionId) : null;
+  if (!session) return c.json({ error: "automation_run_not_found" }, 404);
+  const runningTaskRun = latestRunningTaskRun(session.id);
+  const runnerPid = typeof runningTaskRun?.pid === "number" ? runningTaskRun.pid : null;
+  const shellChild = shellTaskProcesses.get(session.id);
+  const codexChild = codexTaskProcesses.get(session.id);
+  if (!shellChild && !codexChild && !isProcessAlive(runnerPid)) {
+    session.status = session.status === "running" ? "paused" : session.status;
+    session.updatedAt = new Date().toISOString();
+    upsertSession(session);
+    finishAutomationRun(session.id, null, true);
+    return c.json({ ok: true, stopped: false, session, automation: automationWithRuntimeFields(automation) });
+  }
+  shellTaskStopRequested.add(session.id);
+  codexTaskStopRequested.add(session.id);
+  markTaskRunStopRequested(session.id);
+  try {
+    if (shellChild) shellChild.kill("SIGTERM");
+    else if (codexChild) codexChild.kill("SIGTERM");
+    else if (runnerPid) process.kill(runnerPid, "SIGTERM");
+  } catch {
+    finishAutomationRun(session.id, null, true);
+  }
+  session.status = "paused";
+  session.updatedAt = new Date().toISOString();
+  upsertSession(session);
+  appendCodexErrorOutput(session, "\n[automation run stop requested]\n");
+  appendSessionMessage(session.id, "assistant", `用户主动停止自动化运行。停止时间：${new Date().toISOString()}。`);
+  return c.json({ ok: true, stopped: true, session, automation: automationWithRuntimeFields(automation) });
 });
 app.post("/api/automations/:id/run", (c) => {
   const automation = appData.automations.find((item) => item.id === c.req.param("id"));
   if (!automation) return c.json({ error: "automation_not_found" }, 404);
   try {
-    return c.json(runAutomationNow(automation), 201);
+    const result = runAutomationNow(automation);
+    return c.json({ ...result.session, automationRunStatus: result.runStatus }, 201);
   } catch (error) {
     return c.json({ error: error instanceof Error ? error.message : "automation_run_failed" }, 400);
   }
@@ -16226,6 +16818,8 @@ app.post("/api/terminal/exec", async (c) => {
     if (!body?.command?.trim()) return c.json({ error: "command_required" }, 400);
     const cwd = resolveTerminalCwd(body.cwd);
     if (!statSync(cwd).isDirectory()) return c.json({ error: "cwd_not_directory" }, 400);
+    const session = body.sessionId ? appData.sessions.find((item) => item.id === body.sessionId) : null;
+    if (session) return c.json(await runLoggedShellCommand(session, body.command, cwd, { source: "terminal-exec" }));
     return c.json(await runShellCommand(body.command, cwd));
   } catch (error) {
     return c.json({ error: error instanceof Error ? error.message : "command_failed" }, 400);

@@ -149,7 +149,7 @@ Open the app at:
 http://localhost:5173
 ```
 
-The Docker image runs Nginx on `5173`, serves the built frontend, and proxies `/api/*` and `/preview/*` to the API service inside the container. The API listens on `8787` internally. Expose `8787` only when direct API access is needed:
+The Docker image runs Nginx on `5173`, serves the built frontend, and proxies `/api/*` and `/preview/*` to the API service inside the container. The startup script registers both the API process and Nginx directly with PM2 using `pm2 start ...`, then keeps the container foregrounded with `pm2 logs --raw`. The API listens on `8787` internally. Expose `8787` only when direct API access is needed:
 
 ```bash
 -p 8787:8787
@@ -157,7 +157,7 @@ The Docker image runs Nginx on `5173`, serves the built frontend, and proxies `/
 
 The `codex-web-data` volume stores the application database, sessions, rooms, preview logs, generated workspaces, settings, providers, and other runtime data from `apps/api/data`.
 
-The image installs the Codex CLI with `npm install -g @openai/codex` during the runtime stage, because the API starts Codex tasks by invoking the `codex` executable inside the container.
+The image installs the Codex CLI with `npm install -g @openai/codex`, installs PM2 for process supervision, and installs `mise` into `/usr/local/bin/mise` during the runtime stage. The API invokes `codex` for tasks and uses `mise` for Settings -> Environment Management runtime installs and probes inside the container.
 
 The restore workflow may create automatic pre-restore backup ZIP files under `/app/apps/api/restore-backups` inside the container before overwriting `apps/api/data`. This directory is not an auto-restore input folder and is not mounted by default. To restore a backup, upload the backup ZIP from the web UI.
 
