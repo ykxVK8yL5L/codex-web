@@ -4117,6 +4117,13 @@ button:disabled {
   gap: 6px;
 }
 
+.environment-package-name-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 10px;
+}
+
 .environment-package-manager-hint,
 .environment-package-inline-state {
   display: flex;
@@ -4134,6 +4141,12 @@ button:disabled {
   color: var(--muted);
   font-size: 12px;
   font-weight: 700;
+}
+
+@media (max-width: 640px) {
+  .environment-package-name-row {
+    grid-template-columns: 1fr;
+  }
 }
 
 .notification-check-grid {

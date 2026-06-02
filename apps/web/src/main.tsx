@@ -28,6 +28,7 @@ import {
   Minimize2,
   MoreHorizontal,
   Pause,
+  PackageX,
   PanelLeftOpen,
   Pencil,
   Play,
@@ -36,6 +37,7 @@ import {
   RefreshCw,
   RotateCcw,
   Save,
+  Search,
   Send,
   Settings,
   ShieldCheck,
@@ -683,6 +685,7 @@ function App() {
   const [providers, setProviders] = useState<ProviderSummary[]>([]);
   const [automations, setAutomations] = useState<AutomationSummary[]>([]);
   const [pendingApprovalsCount, setPendingApprovalsCount] = useState(0);
+  const pendingApprovalIdsRef = useRef<Set<string>>(new Set());
   const [taskDetails, setTaskDetails] = useState<Record<string, CodexTaskDetail>>({});
   const [optimisticMessages, setOptimisticMessages] = useState<Record<string, SessionMessage[]>>({});
   const [messageQueues, setMessageQueues] = useState<Record<string, QueuedMessage[]>>({});
@@ -740,6 +743,14 @@ function App() {
     if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
     setToast({ id: Date.now(), message, tone });
     toastTimerRef.current = window.setTimeout(() => setToast(null), 3600);
+  }, []);
+
+  const rememberPendingApprovalId = useCallback((approvalId?: string | null) => {
+    if (!approvalId) return;
+    const known = pendingApprovalIdsRef.current;
+    if (known.has(approvalId)) return;
+    known.add(approvalId);
+    setPendingApprovalsCount((count) => count + 1);
   }, []);
 
   const notificationMatchesCurrentSession = useCallback((item: AppNotificationSummary) => {
@@ -915,6 +926,13 @@ function App() {
         const result = JSON.parse((event as MessageEvent).data) as AppNotificationStreamEvent;
         if (result.type !== "notification") return;
         const knownIds = appNotificationIdsRef.current;
+        if (
+          result.notification.eventType === "needs_approval"
+          && result.notification.sourceType === "approval"
+          && !knownIds.has(result.notification.id)
+        ) {
+          rememberPendingApprovalId(result.notification.sourceId);
+        }
         if (shouldSuppressAppNotification(result.notification)) {
           rememberSuppressedAppNotifications([result.notification.id]);
           if (!result.notification.readAt) markSuppressedAppNotificationsRead([result.notification.id]);
@@ -947,7 +965,7 @@ function App() {
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       source?.close();
     };
-  }, [applyAppNotifications, pushBrowserNotification, sessionToken, shouldSuppressAppNotification]);
+  }, [applyAppNotifications, pushBrowserNotification, rememberPendingApprovalId, sessionToken, shouldSuppressAppNotification]);
 
   const resetToLogin = useCallback((nextAuth?: AuthState) => {
     localStorage.removeItem("codex-web-session");
@@ -997,6 +1015,7 @@ function App() {
     setProjects(nextProjects);
     setProviders(nextProviders);
     setAutomations(nextAutomations);
+    pendingApprovalIdsRef.current = new Set(nextApprovals.items.map((item) => item.id));
     setPendingApprovalsCount(nextApprovals.items.length + (nextApprovals.hasMore ? 1 : 0));
     if (activeSessionId && !nextSessions.items.some((session) => session.id === activeSessionId)) void ensureSessionLoaded(activeSessionId, token);
     if (!selectedProviderId && nextProviders[0]) setSelectedProviderId(nextProviders[0].id);
@@ -1418,7 +1437,7 @@ function App() {
         localStorage.setItem("codex-web-session", token);
         setSessionToken(token);
         setAuth(nextAuth);
-      }} onLogout={() => resetToLogin()} notify={notify} />}
+      }} onLogout={() => resetToLogin()} notify={notify} onApprovalRequired={(approval) => rememberPendingApprovalId(approval.id)} />}
     </div>
     </NotificationCenterContext.Provider>
   );
@@ -11393,6 +11412,7 @@ function SettingsPage({
   onSessionRefresh,
   onLogout,
   notify,
+  onApprovalRequired,
 }: {
   sessionToken: string;
   t: TFunction;
@@ -11401,6 +11421,7 @@ function SettingsPage({
   onSessionRefresh: (token: string, auth: AuthState) => void;
   onLogout: () => void;
   notify: (message: string, tone?: ToastTone) => void;
+  onApprovalRequired: (approval: ApprovalSummary) => void;
 }) {
   const dialog = useAppDialog(t);
   const [currentAccessToken, setCurrentAccessToken] = useState("");
@@ -11464,7 +11485,7 @@ function SettingsPage({
     versionSpec: "",
     notes: "",
   });
-  const [environmentPackageProbe, setEnvironmentPackageProbe] = useState<{ installed: boolean; manager: string; packageName: string } | null>(null);
+  const [environmentPackageProbe, setEnvironmentPackageProbe] = useState<{ installed: boolean; manager: string; packageName: string; version?: string | null; checked?: boolean } | null>(null);
   const [environmentInstallForm, setEnvironmentInstallForm] = useState({
     tool: "",
     version: "",
@@ -12857,6 +12878,7 @@ function SettingsPage({
       if (!response.ok) {
         const result = await response.json().catch(() => null) as { error?: string; approval?: ApprovalSummary } | null;
         if (response.status === 409 && result?.error === "approval_required") {
+          if (result.approval) onApprovalRequired(result.approval);
           notify(t("approval.required"), "info");
           return;
         }
@@ -13156,7 +13178,33 @@ function SettingsPage({
   const selectedEnvironmentPackageManager = environmentPackagePanel?.managers.find((manager) => manager.id === environmentPackageForm.manager) ?? null;
   const normalizedEnvironmentPackageName = environmentPackageForm.packageName.trim().toLowerCase();
   const environmentPackageAlreadyTracked = environmentPackagePanel?.packages.some((pkg) => pkg.manager === environmentPackageForm.manager && pkg.packageName.trim().toLowerCase() === normalizedEnvironmentPackageName) ?? false;
+  const filteredEnvironmentPackages = environmentPackagePanel?.packages.filter((pkg) => {
+    if (!normalizedEnvironmentPackageName) return true;
+    return pkg.packageName.toLowerCase().includes(normalizedEnvironmentPackageName);
+  }) ?? [];
   const environmentPackageNeedsManualCleanup = (pkg: EnvironmentPackageRecord) => pkg.manager === "go-install" || pkg.manager === "shards";
+
+  async function probeEnvironmentPackage() {
+    if (!environmentPackagePanel || !environmentPackageForm.manager || !environmentPackageForm.packageName.trim()) return;
+    setBusy("environment-package-probe");
+    try {
+      const params = new URLSearchParams({
+        manager: environmentPackageForm.manager,
+        package: environmentPackageForm.packageName.trim(),
+      });
+      const response = await fetch(`/api/settings/environment/tools/${environmentPackagePanel.toolRecord.id}/packages/probe?${params.toString()}`, {
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) throw new Error("environment_package_probe_failed");
+      const probe = (await response.json()) as { installed: boolean; version?: string | null; manager: string; packageName: string };
+      setEnvironmentPackageProbe({ ...probe, checked: true });
+      notify(probe.installed ? t("settings.environmentPackageDetected") : t("settings.environmentPackageNotDetected"), probe.installed ? "success" : "info");
+    } catch {
+      notify(t("settings.environmentPackageCheckFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
 
   async function runEnvironmentBulkAction(input: EnvironmentBulkActionRequest) {
     setBusy(`environment-bulk:${input.action}`);
@@ -13750,7 +13798,7 @@ function SettingsPage({
                             )}
                             <button className="ghost-button icon-only" type="button" disabled={busy === `environment-packages:${tool.id}`} title={t("settings.environmentPackageManage")} aria-label={t("settings.environmentPackageManage")} onClick={() => void openEnvironmentPackagePanel(tool)}><IconText icon={Boxes}>{t("settings.environmentPackageManage")}</IconText></button>
                             {tool.source === "mise" && (
-                              <button className="ghost-button danger-button icon-only" type="button" disabled={busy === `environment-tool-uninstall:${tool.id}`} title={t("settings.environmentToolUninstall")} aria-label={t("settings.environmentToolUninstall")} onClick={() => void uninstallEnvironmentTool(tool)}><IconText icon={RotateCcw}>{t("settings.environmentToolUninstall")}</IconText></button>
+                              <button className="ghost-button danger-button icon-only" type="button" disabled={busy === `environment-tool-uninstall:${tool.id}`} title={t("settings.environmentToolUninstall")} aria-label={t("settings.environmentToolUninstall")} onClick={() => void uninstallEnvironmentTool(tool)}><IconText icon={PackageX}>{t("settings.environmentToolUninstall")}</IconText></button>
                             )}
                             <button className="ghost-button danger-button icon-only" type="button" disabled={busy === `environment-tool-delete:${tool.id}`} title={t("action.delete")} aria-label={t("action.delete")} onClick={() => void deleteEnvironmentToolRecord(tool)}><IconText icon={Trash2}>{t("action.delete")}</IconText></button>
                           </div>
@@ -14611,6 +14659,7 @@ function SettingsPage({
                 <strong>{t("settings.environmentPackageManage")}</strong>
                 <p>{`${environmentPackagePanel.toolRecord.tool}@${environmentPackagePanel.toolRecord.requestedVersion}`}</p>
                 <p>{t("settings.environmentPackageSupportHint")}</p>
+                {environmentPackagePanel.toolRecord.tool === "python" && <p>{t("settings.environmentPythonPackageHint")}</p>}
               </div>
               <div className="dialog-head-actions">
                 <button className="drawer-close" type="button" aria-label={t("action.close")} onClick={() => setEnvironmentPackagePanel(null)}><X size={16} /></button>
@@ -14623,7 +14672,7 @@ function SettingsPage({
                   const manager = event.target.value;
                   setEnvironmentPackageForm((current) => ({ ...current, manager }));
                   setEnvironmentPackageProbe(environmentPackagePanel.packages.some((pkg) => pkg.packageName.toLowerCase() === environmentPackageForm.packageName.trim().toLowerCase() && pkg.manager === manager)
-                    ? { installed: true, manager, packageName: environmentPackageForm.packageName.trim() }
+                    ? { installed: true, manager, packageName: environmentPackageForm.packageName.trim(), checked: false }
                     : null);
                 }} required>
                   <option value="">{t("settings.environmentPackageManagerPlaceholder")}</option>
@@ -14637,25 +14686,35 @@ function SettingsPage({
                   <span className="pill">{selectedEnvironmentPackageManager.label}</span>
                   {selectedEnvironmentPackageManager.detectedVersion && <span className="pill">{`${t("settings.environmentDetectedVersion")} ${selectedEnvironmentPackageManager.detectedVersion}`}</span>}
                   <span className="subtle">{selectedEnvironmentPackageManager.installCommandExample}</span>
+                  {environmentPackagePanel.toolRecord.tool === "python" && selectedEnvironmentPackageManager.id === "pip" && <span className="subtle">{t("settings.environmentPythonPipHint")}</span>}
+                  {environmentPackagePanel.toolRecord.tool === "python" && selectedEnvironmentPackageManager.id === "uv" && <span className="subtle">{t("settings.environmentPythonUvToolHint")}</span>}
                 </div>
               )}
-              <label>
-                <span>{t("settings.environmentPackageName")}</span>
-                <input value={environmentPackageForm.packageName} onChange={(event) => {
-                  const value = event.target.value;
-                  setEnvironmentPackageForm((current) => ({ ...current, packageName: value }));
-                  setEnvironmentPackageProbe(environmentPackagePanel.packages.some((pkg) => pkg.packageName.toLowerCase() === value.trim().toLowerCase() && pkg.manager === environmentPackageForm.manager)
-                    ? { installed: true, manager: environmentPackageForm.manager, packageName: value.trim() }
-                    : null);
-                }} placeholder={t("settings.environmentPackageNamePlaceholder")} required />
-              </label>
+              <div className="environment-package-name-row">
+                <label>
+                  <span>{t("settings.environmentPackageName")}</span>
+                  <input value={environmentPackageForm.packageName} onChange={(event) => {
+                    const value = event.target.value;
+                    setEnvironmentPackageForm((current) => ({ ...current, packageName: value }));
+                    setEnvironmentPackageProbe(environmentPackagePanel.packages.some((pkg) => pkg.packageName.toLowerCase() === value.trim().toLowerCase() && pkg.manager === environmentPackageForm.manager)
+                      ? { installed: true, manager: environmentPackageForm.manager, packageName: value.trim(), checked: false }
+                      : null);
+                  }} placeholder={t("settings.environmentPackageNamePlaceholder")} required />
+                </label>
+                <button className="ghost-button" type="button" disabled={busy === "environment-package-probe" || !environmentPackageForm.manager || !environmentPackageForm.packageName.trim()} onClick={() => void probeEnvironmentPackage()}>
+                  <IconText icon={busy === "environment-package-probe" ? RefreshCw : Search}>{busy === "environment-package-probe" ? t("settings.environmentPackageChecking") : t("settings.environmentPackageCheck")}</IconText>
+                </button>
+              </div>
               {normalizedEnvironmentPackageName && (
                 <div className="environment-package-inline-state">
                   {environmentPackageAlreadyTracked
                     ? <span className="pill">{t("settings.environmentPackageAlreadyTracked")}</span>
                     : environmentPackageProbe?.installed
                       ? <span className="pill">{t("settings.environmentPackageDetected")}</span>
-                      : <span className="subtle">{t("settings.environmentPackageWillInstall")}</span>}
+                      : environmentPackageProbe?.checked
+                        ? <span className="subtle">{t("settings.environmentPackageNotDetected")}</span>
+                        : <span className="subtle">{t("settings.environmentPackageWillInstall")}</span>}
+                  {environmentPackageProbe?.installed && environmentPackageProbe.version && <span className="pill">{environmentPackageProbe.version}</span>}
                 </div>
               )}
               <label>
@@ -14700,7 +14759,8 @@ function SettingsPage({
             </div>
             <div className="environment-package-list">
               {!environmentPackagePanel.packages.length && <div className="empty-state">{t("settings.environmentPackageEmpty")}</div>}
-              {environmentPackagePanel.packages.map((pkg) => (
+              {Boolean(environmentPackagePanel.packages.length) && !filteredEnvironmentPackages.length && <div className="empty-state">{t("settings.environmentPackageFilterEmpty")}</div>}
+              {filteredEnvironmentPackages.map((pkg) => (
                 <article className="environment-item" key={pkg.id}>
                   <div className="environment-item-main">
                     <div className="environment-item-head">

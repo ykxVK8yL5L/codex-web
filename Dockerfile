@@ -38,7 +38,7 @@ RUN apt-get update \
   && rm -rf /var/lib/apt/lists/* \
   && corepack enable \
   && corepack prepare pnpm@9.15.0 --activate \
-  && curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh \
+  && bash -lc 'set -euo pipefail; tmp="$(mktemp)"; trap "rm -f \"$tmp\"" EXIT; curl -fsSL https://mise.run -o "$tmp"; MISE_INSTALL_PATH=/usr/local/bin/mise sh "$tmp"; /usr/local/bin/mise --version' \
   && npm install -g @openai/codex pm2
 
 COPY --from=build /app /app

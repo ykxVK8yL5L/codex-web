@@ -5,7 +5,7 @@ import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFile
 import { fork, spawn as spawnProcess, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import type { IncomingMessage } from "node:http";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { basename, delimiter, dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn as spawnPty } from "node-pty";
 import { generateSecret, generateURI } from "otplib";
@@ -2328,7 +2328,7 @@ function applyRoomRunMerge(roomId: string, runId: string): RoomRunMergeResponse 
   const gateCommands = splitProjectCheckCommands(project.checkCommand);
   for (const gateCommand of gateCommands) {
     const startedAt = new Date().toISOString();
-    const gate = spawnSync("/bin/zsh", ["-lc", gateCommand], { cwd: projectPath, env: process.env, encoding: "utf8", timeout: 30_000, maxBuffer: 128 * 1024 });
+    const gate = spawnSync("/bin/zsh", ["-lc", gateCommand], { cwd: projectPath, env: managedChildEnv(), encoding: "utf8", timeout: 30_000, maxBuffer: 128 * 1024 });
     const result = {
       command: gateCommand,
       cwd: toTerminalPath(projectPath),
@@ -5472,6 +5472,51 @@ function resolveMiseCommand() {
   return "mise";
 }
 
+function managedChildEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const home = process.env.HOME;
+  const additions = [
+    process.env.MISE_SHIMS_DIR,
+    home ? join(home, ".local/share/mise/shims") : null,
+    home ? join(home, ".mise/shims") : null,
+    home ? join(home, ".local/bin") : null,
+    home ? join(home, ".mise/bin") : null,
+    "/usr/local/bin",
+  ].filter((item): item is string => Boolean(item));
+  const currentPath = process.env.PATH ?? "";
+  const currentParts = currentPath.split(delimiter).filter(Boolean);
+  const nextPath = [
+    ...additions.filter((item) => !currentParts.includes(item)),
+    ...currentParts,
+  ].join(delimiter);
+  return {
+    ...process.env,
+    PATH: nextPath,
+    ...extra,
+  };
+}
+
+function isPythonTool(tool?: string | null) {
+  const key = tool?.trim().toLowerCase();
+  return key === "python" || key === "python3";
+}
+
+function isMisePythonAttestationFailure(result: ReturnType<typeof spawnSync>) {
+  const output = [result.stderr, result.stdout].join("\n").toLowerCase();
+  return output.includes("github artifact attestations")
+    || output.includes("mise_python_github_attestations")
+    || output.includes("attestation verification");
+}
+
+function runMiseUseGlobal(tool: string, target: string) {
+  const command = resolveMiseCommand();
+  const result = spawnSync(command, ["use", "-g", target], { encoding: "utf8" });
+  if (result.status === 0 || !isPythonTool(tool) || !isMisePythonAttestationFailure(result)) return result;
+  return spawnSync(command, ["use", "-g", target], {
+    encoding: "utf8",
+    env: managedChildEnv({ MISE_PYTHON_GITHUB_ATTESTATIONS: "false" }),
+  });
+}
+
 function detectToolVersion(tool: string) {
   const key = tool.trim().toLowerCase();
   if (!key) return null;
@@ -6181,11 +6226,10 @@ function startPreviewProcess(preview: PreviewRecord) {
     cwd,
     shell: true,
     detached: process.platform !== "win32",
-    env: {
-      ...process.env,
+    env: managedChildEnv({
       HOST: "0.0.0.0",
       PORT: String(preview.port),
-    },
+    }),
     stdio: ["ignore", "pipe", "pipe"],
   });
   previewProcesses.set(preview.id, child);
@@ -8212,7 +8256,7 @@ function runShellCommand(command: string, cwd: string): Promise<TerminalCommandR
     let stdout = "";
     let stderr = "";
     let timedOut = false;
-    const child = spawnProcess("/bin/zsh", ["-lc", command], { cwd, env: process.env });
+    const child = spawnProcess("/bin/zsh", ["-lc", command], { cwd, env: managedChildEnv() });
     const trimOutput = (value: string) => value.slice(-64 * 1024);
     child.stdout?.on("data", (chunk: Buffer) => {
       stdout = trimOutput(stdout + chunk.toString("utf8"));
@@ -9095,7 +9139,7 @@ function listRooms(status?: string, limit = 50, cursorValue?: string | null) {
 function createTerminalAdapter(cwd: string): { adapter: TerminalAdapter; mode: "pty" | "pipe"; warning: string | null } {
   const shellPath = resolveShellPath();
   try {
-    const shell = spawnPty(shellPath, ["-l"], { name: "xterm-256color", cols: 100, rows: 30, cwd, env: process.env });
+    const shell = spawnPty(shellPath, ["-l"], { name: "xterm-256color", cols: 100, rows: 30, cwd, env: managedChildEnv() });
     return {
       mode: "pty",
       warning: null,
@@ -9108,7 +9152,7 @@ function createTerminalAdapter(cwd: string): { adapter: TerminalAdapter; mode: "
       },
     };
   } catch (error) {
-    const child = spawnProcess(shellPath, ["-i"], { cwd, env: process.env });
+    const child = spawnProcess(shellPath, ["-i"], { cwd, env: managedChildEnv() });
     return {
       mode: "pipe",
       warning: error instanceof Error ? `PTY fallback: ${error.message}` : "PTY fallback active",
@@ -10405,7 +10449,7 @@ async function runTelegramTerminal(account: NotificationAccountRecord, chatId: s
   await sendTelegramText(account, chatId, `Running in ${cwd}:\n${command}`);
   const shell = resolveShellPath();
   const output = await new Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }>((resolveRun) => {
-    const child = spawnProcess(shell, ["-lc", command], { cwd, env: process.env });
+    const child = spawnProcess(shell, ["-lc", command], { cwd, env: managedChildEnv() });
     let stdout = "";
     let stderr = "";
     const timer = setTimeout(() => {
@@ -11388,7 +11432,7 @@ function startCodexTask(
   if (useResume && session.codexSessionId) args.push(session.codexSessionId);
   else args.push("--");
   args.push(managedPrompt);
-  const env = { ...process.env };
+  const env = managedChildEnv();
   if (provider?.apiKey) env.OPENAI_API_KEY = provider.apiKey;
   if (provider?.baseUrl && provider.kind !== "openai-compatible-chat") env.OPENAI_BASE_URL = provider.baseUrl;
   appendCodexErrorOutput(session, [
@@ -12322,26 +12366,37 @@ app.post("/api/settings/environment/mise/install", (c) => {
   const home = process.env.HOME;
   if (!home) return c.json({ error: "home_not_available" }, 400);
   const installPath = join(home, ".local/bin/mise");
-  const result = spawnSync("/bin/sh", ["-lc", "mkdir -p \"$HOME/.local/bin\" && curl -fsSL https://mise.run | MISE_INSTALL_PATH=\"$HOME/.local/bin/mise\" sh"], {
+  const installScript = [
+    "set -euo pipefail",
+    "mkdir -p \"$HOME/.local/bin\"",
+    "tmp=\"$(mktemp)\"",
+    "trap 'rm -f \"$tmp\"' EXIT",
+    "curl -fsSL https://mise.run -o \"$tmp\"",
+    "MISE_INSTALL_PATH=\"$HOME/.local/bin/mise\" sh \"$tmp\"",
+    "\"$HOME/.local/bin/mise\" --version",
+  ].join(" && ");
+  const result = spawnSync("/bin/bash", ["-lc", installScript], {
     encoding: "utf8",
-    env: process.env,
+    env: managedChildEnv(),
   });
+  const verification = spawnSync(installPath, ["--version"], { encoding: "utf8" });
+  const installed = result.status === 0 && verification.status === 0;
   const now = new Date().toISOString();
   environmentOverview = buildEnvironmentOverview();
   environmentOverview.restoreRuns = [
     {
       id: `env-restore-${randomUUID()}`,
-      status: (result.status === 0 ? "success" : "failed") as EnvironmentRestoreRun["status"],
-      summary: result.status === 0
+      status: (installed ? "success" : "failed") as EnvironmentRestoreRun["status"],
+      summary: installed
         ? `Installed mise to ${installPath}`
-        : [result.stderr, result.stdout].join("\n").trim() || "Failed to install mise",
+        : [result.stderr, result.stdout, verification.stderr, verification.stdout].join("\n").trim() || "Failed to install mise",
       createdAt: now,
     },
     ...environmentOverview.restoreRuns,
   ].slice(0, 20);
   environmentOverview.updatedAt = now;
   saveEnvironmentOverview(environmentOverview);
-  if (result.status !== 0) return c.json({ error: "mise_install_failed", detail: result.stderr || result.stdout, overview: environmentOverview }, 400);
+  if (!installed) return c.json({ error: "mise_install_failed", detail: [result.stderr, result.stdout, verification.stderr, verification.stdout].join("\n").trim(), overview: environmentOverview }, 400);
   return c.json(environmentOverview);
 });
 
@@ -12386,7 +12441,7 @@ app.post("/api/settings/environment/tools/install", async (c) => {
   const version = body.version.trim();
   const scope = body.scope ?? "global";
   const note = body.notes?.trim() ?? null;
-  const installResult = spawnSync(resolveMiseCommand(), ["use", "-g", `${requestedTool}@${version}`], { encoding: "utf8" });
+  const installResult = runMiseUseGlobal(requestedTool, `${requestedTool}@${version}`);
   const detectedVersion = detectToolVersion(requestedTool);
   const status: EnvironmentToolRecord["status"] = installResult.status === 0
     ? (detectedVersion && !detectedVersion.includes(version) ? "version_mismatch" : "installed")
@@ -12511,7 +12566,7 @@ app.post("/api/settings/environment/tools/:id/set-default", (c) => {
   const tool = environmentOverview.tools.find((item) => item.id === id) ?? null;
   if (!tool) return c.json({ error: "environment_tool_not_found" }, 404);
   const target = `${tool.tool}@${tool.requestedVersion}`;
-  const result = spawnSync(resolveMiseCommand(), ["use", "-g", target], { encoding: "utf8" });
+  const result = runMiseUseGlobal(tool.tool, target);
   const now = new Date().toISOString();
   environmentOverview = buildEnvironmentOverview();
   environmentOverview.tools = environmentOverview.tools.map((item) => item.tool === tool.tool
@@ -12548,6 +12603,17 @@ app.get("/api/settings/environment/tools/:id/packages", (c) => {
     restorePreview: buildEnvironmentRestorePreview(toolRecord, [...recordedPackages, ...detectedPackages]),
   };
   return c.json(response);
+});
+
+app.get("/api/settings/environment/tools/:id/packages/probe", (c) => {
+  const id = c.req.param("id");
+  const toolRecord = environmentOverview.tools.find((item) => item.id === id) ?? null;
+  if (!toolRecord) return c.json({ error: "environment_tool_not_found" }, 404);
+  const manager = c.req.query("manager")?.trim() ?? "";
+  const packageName = c.req.query("package")?.trim() ?? "";
+  if (!manager || !packageName) return c.json({ error: "invalid_environment_package_probe" }, 400);
+  const probe = environmentPackageRegistry.inspectEnvironmentPackage(manager, packageName);
+  return c.json({ ...probe, manager, packageName });
 });
 
 app.post("/api/settings/environment/bulk", async (c) => {

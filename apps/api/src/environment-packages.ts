@@ -79,7 +79,7 @@ function resolveMiseCommand() {
 export function packageInstallCommandArgs(manager: string, packageName: string, versionSpec?: string | null) {
   const spec = versionSpec?.trim() ? `${packageName}@${versionSpec.trim()}` : packageName;
   if (manager === "uv") return ["exec", "--", "uv", "tool", "install", spec];
-  if (manager === "pip") return ["exec", "--", "python", "-m", "pip", "install", spec];
+  if (manager === "pip") return ["exec", "--", "python3", "-m", "pip", "install", spec];
   if (manager === "bun") return ["exec", "--", "bun", "add", "-g", spec];
   if (manager === "go-install") return ["exec", "--", "go", "install", versionSpec?.trim() ? spec : `${packageName}@latest`];
   if (manager === "cargo") return ["exec", "--", "cargo", "install", packageName];
@@ -92,7 +92,7 @@ export function packageInstallCommandArgs(manager: string, packageName: string, 
 
 export function packageUninstallCommandArgs(manager: string, packageName: string) {
   if (manager === "uv") return ["exec", "--", "uv", "tool", "uninstall", packageName];
-  if (manager === "pip") return ["exec", "--", "python", "-m", "pip", "uninstall", "-y", packageName];
+  if (manager === "pip") return ["exec", "--", "python3", "-m", "pip", "uninstall", "-y", packageName];
   if (manager === "bun") return ["exec", "--", "bun", "remove", "-g", packageName];
   if (manager === "cargo") return ["exec", "--", "cargo", "uninstall", packageName];
   if (manager === "gem") return ["exec", "--", "gem", "uninstall", packageName, "-a", "-x", "-I"];
@@ -149,32 +149,32 @@ export function createEnvironmentPackageRegistry(commandVersion: (command: strin
     python: {
       managers: [
         {
-          managerId: "uv",
-          label: "uv",
-          installExample: "uv tool install <package>",
-          uninstallExample: "uv tool uninstall <package>",
-          version: () => commandVersion("uv", ["--version"]),
-          inspect: packageListInspector(["exec", "--", "uv", "tool", "list"], (line, packageName) => line.toLowerCase().startsWith(`${packageName.toLowerCase()} `) ? line.split(/\s+/)[1] ?? null : null),
-        },
-        {
           managerId: "pip",
           label: "pip",
-          installExample: "python -m pip install <package>",
-          uninstallExample: "python -m pip uninstall <package>",
+          installExample: "python3 -m pip install <package>",
+          uninstallExample: "python3 -m pip uninstall <package>",
           version: () => commandVersion("python3", ["-m", "pip", "--version"]) ?? commandVersion("python", ["-m", "pip", "--version"]),
           inspect: (pkg) => {
-            const result = spawnSync(resolveMiseCommand(), ["exec", "--", "python", "-m", "pip", "show", pkg], { encoding: "utf8" });
+            const result = spawnSync(resolveMiseCommand(), ["exec", "--", "python3", "-m", "pip", "show", pkg], { encoding: "utf8" });
             if (result.status !== 0) return { installed: false, version: null };
             const version = result.stdout.split(/\r?\n/).find((line) => line.startsWith("Version:"))?.replace("Version:", "").trim() ?? null;
             return { installed: Boolean(version), version };
           },
           scan: (toolRecord) => {
-            const result = spawnSync(resolveMiseCommand(), ["exec", "--", "python", "-m", "pip", "list", "--format", "json"], { encoding: "utf8" });
+            const result = spawnSync(resolveMiseCommand(), ["exec", "--", "python3", "-m", "pip", "list", "--format", "json"], { encoding: "utf8" });
             const output = [result.stdout, result.stderr].join("\n").trim();
             if (result.status !== 0 || !output) return [];
             const parsed = JSON.parse(output) as Array<{ name: string; version?: string }>;
             return parsed.map((item) => detectedEnvironmentPackageRecord(toolRecord, "pip", item.name, item.version ?? null));
           },
+        },
+        {
+          managerId: "uv",
+          label: "uv tool",
+          installExample: "uv tool install <package>",
+          uninstallExample: "uv tool uninstall <package>",
+          version: () => commandVersion("uv", ["--version"]),
+          inspect: packageListInspector(["exec", "--", "uv", "tool", "list"], (line, packageName) => line.toLowerCase().startsWith(`${packageName.toLowerCase()} `) ? line.split(/\s+/)[1] ?? null : null),
         },
       ],
     },
