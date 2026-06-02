@@ -5438,19 +5438,53 @@ function commandVersion(command: string, args: string[]) {
   }
 }
 
+function miseExecVersion(command: string, args: string[]) {
+  try {
+    const result = spawnSync(resolveMiseCommand(), ["exec", "--", command, ...args], { encoding: "utf8" });
+    if (result.status !== 0) return null;
+    return [result.stdout, result.stderr].join("\n").trim().split(/\r?\n/)[0] || "installed";
+  } catch {
+    return null;
+  }
+}
+
+function miseCommandCandidates() {
+  const home = process.env.HOME;
+  return [
+    process.env.MISE_BIN,
+    process.env.MISE_PATH,
+    "mise",
+    home ? join(home, ".local/bin/mise") : null,
+    home ? join(home, ".mise/bin/mise") : null,
+    "/usr/local/bin/mise",
+    "/opt/homebrew/bin/mise",
+    "/usr/bin/mise",
+  ].filter((item): item is string => Boolean(item));
+}
+
+function resolveMiseCommand() {
+  for (const candidate of miseCommandCandidates()) {
+    try {
+      const result = spawnSync(candidate, ["--version"], { encoding: "utf8" });
+      if (result.status === 0) return candidate;
+    } catch {}
+  }
+  return "mise";
+}
+
 function detectToolVersion(tool: string) {
   const key = tool.trim().toLowerCase();
   if (!key) return null;
-  if (key === "node") return commandVersion("node", ["-v"]);
-  if (key === "pnpm") return commandVersion("pnpm", ["-v"]);
-  if (key === "python" || key === "python3") return commandVersion("python3", ["--version"]) ?? commandVersion("python", ["--version"]);
-  if (key === "git") return commandVersion("git", ["--version"]);
-  if (key === "uv") return commandVersion("uv", ["--version"]);
-  if (key === "ffmpeg") return commandVersion("ffmpeg", ["-version"]);
-  if (key === "go") return commandVersion("go", ["version"]);
-  if (key === "bun") return commandVersion("bun", ["--version"]);
-  if (key === "mise") return commandVersion("mise", ["--version"]);
-  return commandVersion(key, ["--version"]) ?? commandVersion(key, ["version"]);
+  if (key === "node") return commandVersion("node", ["-v"]) ?? miseExecVersion("node", ["-v"]);
+  if (key === "pnpm") return commandVersion("pnpm", ["-v"]) ?? miseExecVersion("pnpm", ["-v"]);
+  if (key === "python" || key === "python3") return commandVersion("python3", ["--version"]) ?? commandVersion("python", ["--version"]) ?? miseExecVersion("python", ["--version"]);
+  if (key === "git") return commandVersion("git", ["--version"]) ?? miseExecVersion("git", ["--version"]);
+  if (key === "uv") return commandVersion("uv", ["--version"]) ?? miseExecVersion("uv", ["--version"]);
+  if (key === "ffmpeg") return commandVersion("ffmpeg", ["-version"]) ?? miseExecVersion("ffmpeg", ["-version"]);
+  if (key === "go") return commandVersion("go", ["version"]) ?? miseExecVersion("go", ["version"]);
+  if (key === "bun") return commandVersion("bun", ["--version"]) ?? miseExecVersion("bun", ["--version"]);
+  if (key === "mise") return commandVersion(resolveMiseCommand(), ["--version"]);
+  return commandVersion(key, ["--version"]) ?? commandVersion(key, ["version"]) ?? miseExecVersion(key, ["--version"]) ?? miseExecVersion(key, ["version"]);
 }
 
 function probeEnvironmentTool(tool: string): EnvironmentToolProbe {
@@ -5464,7 +5498,7 @@ function probeEnvironmentTool(tool: string): EnvironmentToolProbe {
 
 function detectMiseStatus() {
   try {
-    const result = spawnSync("mise", ["--version"], { encoding: "utf8" });
+    const result = spawnSync(resolveMiseCommand(), ["--version"], { encoding: "utf8" });
     const output = [result.stdout, result.stderr].join("\n");
     const versionLine = output.split(/\r?\n/).map((line) => line.trim()).find((line) => line && !line.startsWith("[WARN]") && !line.startsWith("mise WARN")) ?? null;
     const warningLine = output.split(/\r?\n/).map((line) => line.trim()).find((line) => line.startsWith("[WARN]") || line.startsWith("mise WARN")) ?? null;
@@ -5507,7 +5541,7 @@ function listEnvironmentToolRegistry(query?: string) {
   const trimmed = query?.trim();
   const args = trimmed ? ["search", trimmed] : ["registry"];
   try {
-    const result = spawnSync("mise", args, { encoding: "utf8" });
+    const result = spawnSync(resolveMiseCommand(), args, { encoding: "utf8" });
     if (result.status !== 0) return [];
     const items = parseRegistryLines([result.stdout, result.stderr].join("\n"));
     return items.slice(0, trimmed ? 100 : 400);
@@ -5520,7 +5554,7 @@ function listEnvironmentToolVersions(tool: string) {
   const trimmed = tool.trim();
   if (!trimmed) return { items: [] as EnvironmentToolVersionItem[], error: "tool_required" as string | null };
   try {
-    const result = spawnSync("mise", ["ls-remote", trimmed], { encoding: "utf8" });
+    const result = spawnSync(resolveMiseCommand(), ["ls-remote", trimmed], { encoding: "utf8" });
     if (result.status !== 0) {
       return {
         items: [] as EnvironmentToolVersionItem[],
@@ -5600,7 +5634,7 @@ function buildEnvironmentOverview(): EnvironmentOverview {
   const mise = detectMiseStatus();
   const currentOutput = (() => {
     try {
-      const result = spawnSync("mise", ["current"], { encoding: "utf8" });
+      const result = spawnSync(resolveMiseCommand(), ["current"], { encoding: "utf8" });
       return result.status === 0 ? [result.stdout, result.stderr].join("\n") : "";
     } catch {
       return "";
@@ -12284,6 +12318,33 @@ app.post("/api/settings/environment/scan", (c) => {
   return c.json(environmentOverview);
 });
 
+app.post("/api/settings/environment/mise/install", (c) => {
+  const home = process.env.HOME;
+  if (!home) return c.json({ error: "home_not_available" }, 400);
+  const installPath = join(home, ".local/bin/mise");
+  const result = spawnSync("/bin/sh", ["-lc", "mkdir -p \"$HOME/.local/bin\" && curl -fsSL https://mise.run | MISE_INSTALL_PATH=\"$HOME/.local/bin/mise\" sh"], {
+    encoding: "utf8",
+    env: process.env,
+  });
+  const now = new Date().toISOString();
+  environmentOverview = buildEnvironmentOverview();
+  environmentOverview.restoreRuns = [
+    {
+      id: `env-restore-${randomUUID()}`,
+      status: (result.status === 0 ? "success" : "failed") as EnvironmentRestoreRun["status"],
+      summary: result.status === 0
+        ? `Installed mise to ${installPath}`
+        : [result.stderr, result.stdout].join("\n").trim() || "Failed to install mise",
+      createdAt: now,
+    },
+    ...environmentOverview.restoreRuns,
+  ].slice(0, 20);
+  environmentOverview.updatedAt = now;
+  saveEnvironmentOverview(environmentOverview);
+  if (result.status !== 0) return c.json({ error: "mise_install_failed", detail: result.stderr || result.stdout, overview: environmentOverview }, 400);
+  return c.json(environmentOverview);
+});
+
 app.get("/api/settings/environment/tool-registry", (c) => {
   try {
     const items = listEnvironmentToolRegistry(c.req.query("q")).map((item) => ({
@@ -12325,7 +12386,7 @@ app.post("/api/settings/environment/tools/install", async (c) => {
   const version = body.version.trim();
   const scope = body.scope ?? "global";
   const note = body.notes?.trim() ?? null;
-  const installResult = spawnSync("mise", ["use", "-g", `${requestedTool}@${version}`], { encoding: "utf8" });
+  const installResult = spawnSync(resolveMiseCommand(), ["use", "-g", `${requestedTool}@${version}`], { encoding: "utf8" });
   const detectedVersion = detectToolVersion(requestedTool);
   const status: EnvironmentToolRecord["status"] = installResult.status === 0
     ? (detectedVersion && !detectedVersion.includes(version) ? "version_mismatch" : "installed")
@@ -12418,7 +12479,7 @@ app.delete("/api/settings/environment/tools/:id/uninstall", (c) => {
   if (tool.source !== "mise") return c.json({ error: "environment_tool_uninstall_not_allowed" }, 400);
   const now = new Date().toISOString();
   const target = `${tool.tool}@${tool.requestedVersion}`;
-  const uninstallResult = spawnSync("mise", ["uninstall", target], { encoding: "utf8" });
+  const uninstallResult = spawnSync(resolveMiseCommand(), ["uninstall", target], { encoding: "utf8" });
   const summary = uninstallResult.status === 0
     ? `Uninstalled ${target} via mise`
     : [uninstallResult.stderr, uninstallResult.stdout].join("\n").trim() || `Failed to uninstall ${target}`;
@@ -12450,7 +12511,7 @@ app.post("/api/settings/environment/tools/:id/set-default", (c) => {
   const tool = environmentOverview.tools.find((item) => item.id === id) ?? null;
   if (!tool) return c.json({ error: "environment_tool_not_found" }, 404);
   const target = `${tool.tool}@${tool.requestedVersion}`;
-  const result = spawnSync("mise", ["use", "-g", target], { encoding: "utf8" });
+  const result = spawnSync(resolveMiseCommand(), ["use", "-g", target], { encoding: "utf8" });
   const now = new Date().toISOString();
   environmentOverview = buildEnvironmentOverview();
   environmentOverview.tools = environmentOverview.tools.map((item) => item.tool === tool.tool
@@ -12545,7 +12606,7 @@ app.post("/api/settings/environment/bulk", async (c) => {
     for (const pkg of targets) {
       const commandArgs = packageInstallCommandArgs(pkg.manager, pkg.packageName, pkg.versionSpec ?? null);
       if (!commandArgs) continue;
-      const result = spawnSync("mise", commandArgs, { encoding: "utf8" });
+      const result = spawnSync(resolveMiseCommand(), commandArgs, { encoding: "utf8" });
       if (result.status === 0) {
         successCount += 1;
         const index = updatedRecords.findIndex((item) => item.id === pkg.id);
@@ -12585,7 +12646,7 @@ app.post("/api/settings/environment/packages/install", async (c) => {
   const probe = environmentPackageRegistry.inspectEnvironmentPackage(manager, packageName);
   const commandArgs = packageInstallCommandArgs(manager, packageName, versionSpec);
   if (!commandArgs) return c.json({ error: "environment_package_manager_not_supported" }, 400);
-  const result = probe.installed ? { status: 0, stdout: "already installed", stderr: "" } : spawnSync("mise", commandArgs, { encoding: "utf8" });
+  const result = probe.installed ? { status: 0, stdout: "already installed", stderr: "" } : spawnSync(resolveMiseCommand(), commandArgs, { encoding: "utf8" });
   const now = new Date().toISOString();
   const record: EnvironmentPackageRecord = {
     id: `env-pkg-${randomUUID()}`,
@@ -12642,7 +12703,7 @@ app.delete("/api/settings/environment/packages/:id", async (c) => {
   const manager = body?.manager?.trim() || pkg.manager;
   const commandArgs = packageUninstallCommandArgs(manager, pkg.packageName);
   if (!commandArgs) return c.json({ error: "environment_package_manager_not_supported" }, 400);
-  const result = spawnSync("mise", commandArgs, { encoding: "utf8" });
+  const result = spawnSync(resolveMiseCommand(), commandArgs, { encoding: "utf8" });
   const now = new Date().toISOString();
   environmentOverview = {
     ...buildEnvironmentOverview(),

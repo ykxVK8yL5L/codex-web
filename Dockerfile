@@ -34,11 +34,12 @@ ENV PORT=8787
 WORKDIR /app
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends bash ca-certificates git nginx \
+  && apt-get install -y --no-install-recommends bash ca-certificates curl git nginx procps \
   && rm -rf /var/lib/apt/lists/* \
   && corepack enable \
   && corepack prepare pnpm@9.15.0 --activate \
-  && npm install -g @openai/codex
+  && curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh \
+  && npm install -g @openai/codex pm2
 
 COPY --from=build /app /app
 COPY docker/nginx.conf /etc/nginx/conf.d/default.conf

@@ -12996,6 +12996,28 @@ function SettingsPage({
     }
   }
 
+  async function installMise() {
+    setBusy("environment-mise-install");
+    try {
+      const response = await fetch("/api/settings/environment/mise/install", {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      const result = await response.json().catch(() => null) as EnvironmentOverview | { overview?: EnvironmentOverview } | null;
+      if (!response.ok) {
+        if (result && "overview" in result && result.overview) setEnvironmentOverview(result.overview);
+        notify(t("settings.environmentMiseInstallFailed"), "error");
+        return;
+      }
+      setEnvironmentOverview(result as EnvironmentOverview);
+      notify(t("settings.environmentMiseInstallSuccess"), "success");
+    } catch {
+      notify(t("settings.environmentMiseInstallFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function installEnvironmentTool(event: React.FormEvent) {
     event.preventDefault();
     setBusy("environment-install");
@@ -13486,6 +13508,11 @@ function SettingsPage({
                 </div>
               </div>
               <div className="settings-actions">
+                {!miseInstalled && (
+                  <button className="ghost-button" type="button" disabled={busy === "environment-mise-install"} onClick={() => void installMise()}>
+                    <IconText icon={Download}>{busy === "environment-mise-install" ? t("settings.environmentMiseInstalling") : t("settings.environmentMiseInstall")}</IconText>
+                  </button>
+                )}
                 <button className="ghost-button" type="button" disabled={busy === "environment-scan"} onClick={() => void scanEnvironment()}><IconText icon={RefreshCw}>{t("settings.environmentScan")}</IconText></button>
               </div>
             </div>

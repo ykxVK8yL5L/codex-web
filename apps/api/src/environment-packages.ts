@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { join } from "node:path";
 import type {
   EnvironmentPackageManagerOption,
   EnvironmentPackageRecord,
@@ -47,8 +48,32 @@ function packageListScanner(
 }
 
 function installedPackageLines(command: string, args: string[]) {
-  const result = spawnSync(command, args, { encoding: "utf8" });
+  const result = spawnSync(command === "mise" ? resolveMiseCommand() : command, args, { encoding: "utf8" });
   return result.status === 0 ? result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) : [];
+}
+
+function miseCommandCandidates() {
+  const home = process.env.HOME;
+  return [
+    process.env.MISE_BIN,
+    process.env.MISE_PATH,
+    "mise",
+    home ? join(home, ".local/bin/mise") : null,
+    home ? join(home, ".mise/bin/mise") : null,
+    "/usr/local/bin/mise",
+    "/opt/homebrew/bin/mise",
+    "/usr/bin/mise",
+  ].filter((item): item is string => Boolean(item));
+}
+
+function resolveMiseCommand() {
+  for (const candidate of miseCommandCandidates()) {
+    try {
+      const result = spawnSync(candidate, ["--version"], { encoding: "utf8" });
+      if (result.status === 0) return candidate;
+    } catch {}
+  }
+  return "mise";
 }
 
 export function packageInstallCommandArgs(manager: string, packageName: string, versionSpec?: string | null) {
@@ -138,13 +163,13 @@ export function createEnvironmentPackageRegistry(commandVersion: (command: strin
           uninstallExample: "python -m pip uninstall <package>",
           version: () => commandVersion("python3", ["-m", "pip", "--version"]) ?? commandVersion("python", ["-m", "pip", "--version"]),
           inspect: (pkg) => {
-            const result = spawnSync("mise", ["exec", "--", "python", "-m", "pip", "show", pkg], { encoding: "utf8" });
+            const result = spawnSync(resolveMiseCommand(), ["exec", "--", "python", "-m", "pip", "show", pkg], { encoding: "utf8" });
             if (result.status !== 0) return { installed: false, version: null };
             const version = result.stdout.split(/\r?\n/).find((line) => line.startsWith("Version:"))?.replace("Version:", "").trim() ?? null;
             return { installed: Boolean(version), version };
           },
           scan: (toolRecord) => {
-            const result = spawnSync("mise", ["exec", "--", "python", "-m", "pip", "list", "--format", "json"], { encoding: "utf8" });
+            const result = spawnSync(resolveMiseCommand(), ["exec", "--", "python", "-m", "pip", "list", "--format", "json"], { encoding: "utf8" });
             const output = [result.stdout, result.stderr].join("\n").trim();
             if (result.status !== 0 || !output) return [];
             const parsed = JSON.parse(output) as Array<{ name: string; version?: string }>;
@@ -162,7 +187,7 @@ export function createEnvironmentPackageRegistry(commandVersion: (command: strin
           uninstallExample: "pnpm remove -g <package>",
           version: () => commandVersion("pnpm", ["--version"]),
           inspect: (pkg) => {
-            const result = spawnSync("mise", ["exec", "--", "pnpm", "list", "-g", pkg, "--depth", "0", "--json"], { encoding: "utf8" });
+            const result = spawnSync(resolveMiseCommand(), ["exec", "--", "pnpm", "list", "-g", pkg, "--depth", "0", "--json"], { encoding: "utf8" });
             const output = [result.stdout, result.stderr].join("\n").trim();
             if (result.status !== 0 || !output) return { installed: false, version: null };
             const parsed = JSON.parse(output) as Array<{ dependencies?: Record<string, { version?: string }> }>;
@@ -170,7 +195,7 @@ export function createEnvironmentPackageRegistry(commandVersion: (command: strin
             return { installed: Boolean(version), version };
           },
           scan: (toolRecord) => {
-            const result = spawnSync("mise", ["exec", "--", "pnpm", "list", "-g", "--depth", "0", "--json"], { encoding: "utf8" });
+            const result = spawnSync(resolveMiseCommand(), ["exec", "--", "pnpm", "list", "-g", "--depth", "0", "--json"], { encoding: "utf8" });
             const output = [result.stdout, result.stderr].join("\n").trim();
             if (result.status !== 0 || !output) return [];
             const parsed = JSON.parse(output) as Array<{ dependencies?: Record<string, { version?: string }> }>;
@@ -184,7 +209,7 @@ export function createEnvironmentPackageRegistry(commandVersion: (command: strin
           uninstallExample: "npm uninstall -g <package>",
           version: () => commandVersion("npm", ["--version"]),
           inspect: (pkg) => {
-            const result = spawnSync("mise", ["exec", "--", "npm", "list", "-g", pkg, "--depth", "0", "--json"], { encoding: "utf8" });
+            const result = spawnSync(resolveMiseCommand(), ["exec", "--", "npm", "list", "-g", pkg, "--depth", "0", "--json"], { encoding: "utf8" });
             const output = [result.stdout, result.stderr].join("\n").trim();
             if (!output) return { installed: false, version: null };
             const parsed = JSON.parse(output) as { dependencies?: Record<string, { version?: string }> };
@@ -267,7 +292,7 @@ export function createEnvironmentPackageRegistry(commandVersion: (command: strin
         uninstallExample: "deno uninstall <package>",
         version: () => commandVersion("deno", ["--version"]),
         inspect: () => {
-          const result = spawnSync("mise", ["exec", "--", "deno", "uninstall", "--help"], { encoding: "utf8" });
+          const result = spawnSync(resolveMiseCommand(), ["exec", "--", "deno", "uninstall", "--help"], { encoding: "utf8" });
           return { installed: result.status === 0, version: null };
         },
       }],
