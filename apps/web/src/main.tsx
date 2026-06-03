@@ -23,9 +23,7 @@ import {
   Info,
   Lock,
   Menu,
-  Maximize2,
   MessageSquare,
-  Minimize2,
   MoreHorizontal,
   Pause,
   PackageX,
@@ -55,6 +53,7 @@ import "./styles.css";
 import { useAppDialog } from "@/components/AppDialog";
 import { AppErrorBoundary } from "@/components/AppErrorBoundary";
 import { Button } from "@/components/ui/button";
+import { CodeEditor, preferredCodeEditorMode, type CodeEditorMode } from "@/components/CodeEditor";
 import { FilterSearchInput, FilterToolbar } from "@/components/FilterControls";
 import { IconText } from "@/components/IconText";
 import { Input } from "@/components/ui/input";
@@ -87,6 +86,12 @@ import type {
   AppNotificationSummary,
   AppNotificationStreamEvent,
   AppNotificationsResponse,
+  ApiKeyDetailResponse,
+  ApiKeyPermission,
+  ApiKeyPermissionGroup,
+  ApiKeyPermissionsResponse,
+  ApiKeyPreset,
+  ApiKeySummary,
   ArchiveIgnoreTemplate,
   AuthState,
   AutomationRunSummary,
@@ -108,7 +113,9 @@ import type {
   CreatePreviewRequest,
   CreateProviderRequest,
   CreateAutomationRequest,
+  CreateApiKeyRequest,
   CreateTerminalSessionRequest,
+  DeleteMarketplaceItemsRequest,
   ExtensionDetail,
   ExtensionSummary,
   ExecutionContextSummary,
@@ -117,6 +124,8 @@ import type {
   EnvironmentPackageDetailResponse,
   EnvironmentPackageManagerOption,
   EnvironmentPackageRecord,
+  EnvironmentRestoreMissingRequest,
+  EnvironmentRestorePreviewResponse,
   EnvironmentRestoreRun,
   EnvironmentToolRecord,
   EnvironmentToolRegistryItem,
@@ -206,6 +215,7 @@ import type {
   TaskRunSummary,
   TerminalSessionSummary,
   UploadAttachmentInput,
+  UpdateApiKeyRequest,
   UpdateQueuedMessageRequest,
   UpdateSessionCompactionRequest,
   UpdateSessionCompactionSettingsRequest,
@@ -1897,9 +1907,9 @@ function GoalPanel({
         </button>
       </div>
       {expanded && <form className="goal-form" onSubmit={saveGoal}>
-        <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder={t("goal.placeholder")} rows={compact ? 2 : 3} />
+        <textarea name="goal-text" value={text} onChange={(event) => setText(event.target.value)} placeholder={t("goal.placeholder")} rows={compact ? 2 : 3} />
         <div className="goal-form-row">
-          <select value={mode} onChange={(event) => setMode(event.target.value as GoalMode)}>
+          <select name="goal-mode" value={mode} onChange={(event) => setMode(event.target.value as GoalMode)}>
             <option value="reference">{t("goal.modeReference")}</option>
             <option value="tracked">{t("goal.modeTracked")}</option>
             <option value="managed">{t("goal.modeManaged")}</option>
@@ -1909,11 +1919,11 @@ function GoalPanel({
         </div>
         {agents.length > 0 && (
           <div className="goal-form-row">
-            <select value={managerAgentId} onChange={(event) => setManagerAgentId(event.target.value)}>
+            <select name="goal-manager-agent-id" value={managerAgentId} onChange={(event) => setManagerAgentId(event.target.value)}>
               <option value="">{t("goal.noManager")}</option>
               {agents.map((agent) => <option key={agent.id} value={agent.id}>{t("goal.manager")}: {agent.name}</option>)}
             </select>
-            <select value={coordinatorAgentId} onChange={(event) => setCoordinatorAgentId(event.target.value)}>
+            <select name="goal-coordinator-agent-id" value={coordinatorAgentId} onChange={(event) => setCoordinatorAgentId(event.target.value)}>
               <option value="">{t("goal.noCoordinator")}</option>
               {agents.map((agent) => <option key={agent.id} value={agent.id}>{t("goal.coordinator")}: {agent.name}</option>)}
             </select>
@@ -1945,7 +1955,7 @@ function GoalPanel({
             </div>
           )}
           <form className="goal-form inline" onSubmit={createFocus}>
-            <input value={focusText} onChange={(event) => setFocusText(event.target.value)} placeholder={goal.currentFocus?.text ?? t("goal.focusPlaceholder")} />
+            <input name="goal-focus-text" value={focusText} onChange={(event) => setFocusText(event.target.value)} placeholder={goal.currentFocus?.text ?? t("goal.focusPlaceholder")} />
             <button className="ghost-button" type="submit" disabled={busy || !focusText.trim()}>{t("goal.setFocus")}</button>
           </form>
           {pendingProposals.length > 0 && (
@@ -1979,9 +1989,9 @@ function GoalPanel({
             </details>
           )}
           <form className="goal-form inline" onSubmit={createItem}>
-            <input value={itemTitle} onChange={(event) => setItemTitle(event.target.value)} placeholder={t("goal.itemPlaceholder")} />
+            <input name="goal-item-title" value={itemTitle} onChange={(event) => setItemTitle(event.target.value)} placeholder={t("goal.itemPlaceholder")} />
             {agents.length > 0 && (
-              <select value={itemAgentId} onChange={(event) => setItemAgentId(event.target.value)}>
+              <select name="goal-item-agent-id" value={itemAgentId} onChange={(event) => setItemAgentId(event.target.value)}>
                 <option value="">{t("room.unassigned")}</option>
                 {agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
               </select>
@@ -3517,22 +3527,21 @@ function SessionPage({
             <button className="ghost-button icon-only session-secondary-action" title={t("session.infoTitle")} aria-label={t("session.infoTitle")} onClick={() => setInfoOpen(true)}><IconText icon={Info}>{t("session.infoTitle")}</IconText></button>
             <button className="ghost-button icon-only session-primary-action" title={t("nav.files")} aria-label={t("nav.files")} disabled={!session} onClick={openWorkspaceFiles}><IconText icon={Files}>{t("nav.files")}</IconText></button>
             <button className="ghost-button icon-only session-primary-action" title={t("nav.terminal")} aria-label={t("nav.terminal")} disabled={!session} onClick={openWorkspaceTerminal}><IconText icon={TerminalIcon}>{t("nav.terminal")}</IconText></button>
+            <button className="ghost-button icon-only session-mobile-progress" type="button" title={t("progress.title")} aria-label={t("progress.title")} disabled={!session} onClick={() => setMobileContextPanel("progress")}><IconText icon={Check}>{t("progress.title")}</IconText></button>
             <button className="ghost-button icon-only session-secondary-action" title={t("project.preview")} aria-label={t("project.preview")} disabled={!session} onClick={() => void openSessionPreviews()}><IconText icon={Globe}>{t("project.preview")}</IconText></button>
             <button className="ghost-button icon-only session-secondary-action" title={t("preview.stop")} aria-label={t("preview.stop")} disabled={!session || session.status !== "running"} onClick={() => session && onStopTask(session.id)}><IconText icon={Square}>{t("preview.stop")}</IconText></button>
             <button className="ghost-button danger-button icon-only session-secondary-action" title={t("action.delete")} aria-label={t("action.delete")} disabled={!session} onClick={() => session && onDeleteSession(session.id)}><IconText icon={Trash2}>{t("action.delete")}</IconText></button>
+            <button className="ghost-button danger-button icon-only session-mobile-delete" type="button" title={t("action.delete")} aria-label={t("action.delete")} disabled={!session} onClick={() => session && onDeleteSession(session.id)}><IconText icon={Trash2}>{t("action.delete")}</IconText></button>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button className="ghost-button icon-only session-mobile-more" type="button" title={t("action.more")} aria-label={t("action.more")}><IconText icon={MoreHorizontal}>{t("action.more")}</IconText></button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 <DropdownMenuItem onSelect={() => setInfoOpen(true)}><IconText icon={Info}>{t("session.infoTitle")}</IconText></DropdownMenuItem>
-                <DropdownMenuItem disabled={!session} onSelect={() => setMobileContextPanel("progress")}><IconText icon={Check}>{t("progress.title")}</IconText></DropdownMenuItem>
                 <DropdownMenuItem disabled={!session} onSelect={() => setMobileContextPanel("activity")}><IconText icon={Activity}>{t("session.activityTitle")}</IconText></DropdownMenuItem>
                 <DropdownMenuItem disabled={!session} onSelect={() => setMobileContextPanel("changes")}><IconText icon={FolderGit2}>{t("workspace.changes")}</IconText></DropdownMenuItem>
                 <DropdownMenuItem disabled={!session} onSelect={() => void openSessionPreviews()}><IconText icon={Globe}>{t("project.preview")}</IconText></DropdownMenuItem>
                 <DropdownMenuItem disabled={!session || session.status !== "running"} onSelect={() => session && void onStopTask(session.id)}><IconText icon={Square}>{t("preview.stop")}</IconText></DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem disabled={!session} className="text-red-700 focus:bg-red-50 focus:text-red-800" onSelect={() => session && void onDeleteSession(session.id)}><IconText icon={Trash2}>{t("action.delete")}</IconText></DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
@@ -4999,7 +5008,7 @@ function RoomConsole({ sessionToken, roomId, sessionWorkspacePath, projectWorksp
                 <span>{t("room.decision")} · {readableRoomDecisionStatus(decision.status, t)} · {formatShortDate(decision.createdAt)}</span>
               </div>
               <div className="row-actions room-state-actions">
-                <select value={decision.status} aria-label={t("room.updateDecisionStatus")} onChange={(event) => void updateDecision(decision, { status: event.target.value as RoomDecisionSummary["status"] })}>
+                <select name={`room-decision-status-${decision.id}`} value={decision.status} aria-label={t("room.updateDecisionStatus")} onChange={(event) => void updateDecision(decision, { status: event.target.value as RoomDecisionSummary["status"] })}>
                   <option value="open">{t("room.decisionStatusOpen")}</option>
                   <option value="approved">{t("room.decisionStatusApproved")}</option>
                   <option value="rejected">{t("room.decisionStatusRejected")}</option>
@@ -5019,7 +5028,7 @@ function RoomConsole({ sessionToken, roomId, sessionWorkspacePath, projectWorksp
                 <span>{t("room.handoff")} · {readableRoomHandoffStatus(handoff.status, t)} · {formatShortDate(handoff.createdAt)}</span>
               </div>
               <div className="row-actions room-state-actions">
-                <select value={handoff.status} aria-label={t("room.updateHandoffStatus")} onChange={(event) => void updateHandoff(handoff, { status: event.target.value as RoomHandoffSummary["status"] })}>
+                <select name={`room-handoff-status-${handoff.id}`} value={handoff.status} aria-label={t("room.updateHandoffStatus")} onChange={(event) => void updateHandoff(handoff, { status: event.target.value as RoomHandoffSummary["status"] })}>
                   <option value="open">{t("room.handoffStatusOpen")}</option>
                   <option value="accepted">{t("room.handoffStatusAccepted")}</option>
                   <option value="returned">{t("room.handoffStatusReturned")}</option>
@@ -5736,7 +5745,7 @@ function FilesPage({
   const [reloadKey, setReloadKey] = useState(0);
   const [pendingOpenPath, setPendingOpenPath] = useState<string | null>(null);
   const [terminalCwd, setTerminalCwd] = useState<string | null>(null);
-  const [previewExpanded, setPreviewExpanded] = useState(false);
+  const [editorMode, setEditorMode] = useState<CodeEditorMode>(() => preferredCodeEditorMode());
   const [mountsPanelOpen, setMountsPanelOpen] = useState(false);
   const [transientRootPath, setTransientRootPath] = useState<string | null>(null);
   const [transientMountName, setTransientMountName] = useState<string | null>(null);
@@ -5755,6 +5764,7 @@ function FilesPage({
   const activeMount = mounts.find((mount) => mount.id === activeMountId) ?? mounts[0] ?? null;
   const lockedRootPath = embedded ? initialRootPath : undefined;
   const activeRootPath = lockedRootPath ?? transientRootPath ?? undefined;
+  const hasFileRoot = Boolean(activeRootPath || activeMountId);
   const fileQuery = (path: string, mountIdOverride = activeMountId, rootPathOverride = activeRootPath) => new URLSearchParams({
     path,
     ...(rootPathOverride ? { rootPath: rootPathOverride } : mountIdOverride ? { mountId: mountIdOverride } : {}),
@@ -5847,12 +5857,29 @@ function FilesPage({
 
   async function openEntry(entry: FileEntry) {
     setMessage("");
-    setSelectedEntry(entry);
     if (entry.kind === "directory") {
-      setCurrentPath(entry.path);
+      if (selectedEntry?.kind === "directory" && selectedEntry.path === entry.path) {
+        setCurrentPath(entry.path);
+        return;
+      }
+      setSelectedEntry(entry);
+      if (!dirty) {
+        setSelectedFile(null);
+        setDraft("");
+      }
       return;
     }
 
+    if (selectedEntry?.kind === "file" && selectedEntry.path === entry.path) {
+      setSelectedEntry(entry);
+    } else {
+      setSelectedEntry(entry);
+      if (!dirty) {
+        setSelectedFile(null);
+        setDraft("");
+      }
+      return;
+    }
     const response = await fetch(`/api/files/content?${fileQuery(entry.path)}`, {
       headers: authHeaders,
     });
@@ -6073,7 +6100,6 @@ function FilesPage({
     setSelectedFile(null);
     setDraft("");
     setDirty(false);
-    setPreviewExpanded(false);
   }
 
   async function copyCurrentPath() {
@@ -6321,7 +6347,7 @@ function FilesPage({
     setDirty(false);
   }
 
-  const selectedPath = selectedFile?.path;
+  const selectedPath = selectedEntry?.path ?? selectedFile?.path;
   const filteredFileEntries = fileList?.entries.filter((entry) => entry.name.toLowerCase().includes(fileFilter.trim().toLowerCase())) ?? [];
   const visibleFileEntries = filteredFileEntries.slice(0, fileVisibleCount);
   const fileCountText = fileList
@@ -6352,7 +6378,7 @@ function FilesPage({
             </div>
           </div>
         ))}
-        {!mounts.length && <div className="subtle">{t("file.loadingMounts")}</div>}
+        {!mounts.length && <div className="empty-state">{t("file.noMounts")}</div>}
       </>
     );
   }
@@ -6361,7 +6387,7 @@ function FilesPage({
     <main className={`files-page ${embedded ? "embedded-page" : ""}`}>
       {dialog.node}
       {!embedded && <PageHeader crumb={`${t("page.global")} / ${t("nav.files")}`} title={t("page.files")} action={t("action.refresh")} onAction={() => setReloadKey((key) => key + 1)} onOpenMainNav={onOpenMainNav} menuLabel={t("nav.files")} />}
-      <section className={`file-workbench ${activeRootPath ? "locked-workspace" : ""}`}>
+      <section className={`file-workbench ${activeRootPath ? "locked-workspace" : ""} ${embedded && !selectedFile ? "no-preview" : ""}`}>
         {!activeRootPath && (
           <aside className="mounts-pane">
             {renderMounts()}
@@ -6372,14 +6398,22 @@ function FilesPage({
             <div><strong>{transientMountName ? `${transientMountName} · ${fileList?.path ?? currentPath}` : fileList?.path ?? currentPath}</strong><span className="subtle"> · {fileCountText}</span></div>
             <div className="file-actions">
               {!activeRootPath && <button className="ghost-button icon-only file-mobile-mounts" type="button" title={t("file.mounts")} aria-label={t("file.mounts")} onClick={() => setMountsPanelOpen(true)}><IconText icon={FolderOpen}>{t("file.mounts")}</IconText></button>}
-              <button className="ghost-button icon-only" type="button" title={t("file.newFile")} aria-label={t("file.newFile")} onClick={() => createEntry("file")}><IconText icon={FilePlus2}>{t("file.newFile")}</IconText></button>
-              <button className="ghost-button icon-only" type="button" title={t("file.newDirectory")} aria-label={t("file.newDirectory")} onClick={() => createEntry("directory")}><IconText icon={FolderPlus}>{t("file.newDirectory")}</IconText></button>
-              {!embedded && <button className="ghost-button icon-only" type="button" title={t("file.openTerminal")} aria-label={t("file.openTerminal")} onClick={openTerminalHere}><IconText icon={TerminalIcon}>{t("file.openTerminal")}</IconText></button>}
-              <button className="ghost-button icon-only" type="button" title={t("file.previewFolder")} aria-label={t("file.previewFolder")} onClick={() => void openFolderPreviewPanel()}><IconText icon={Globe}>{t("file.previewFolder")}</IconText></button>
-              <button className="ghost-button icon-only" type="button" title={t("file.archiveDownload")} aria-label={t("file.archiveDownload")} onClick={openArchivePanel}><IconText icon={Download}>{t("file.archiveDownload")}</IconText></button>
-              <button className="ghost-button icon-only" type="button" title={t("file.copyPath")} aria-label={t("file.copyPath")} onClick={() => void copyCurrentPath()}><IconText icon={Copy}>{t("file.copyPath")}</IconText></button>
+              <button className="ghost-button icon-only" type="button" title={t("file.newFile")} aria-label={t("file.newFile")} disabled={!hasFileRoot} onClick={() => createEntry("file")}><IconText icon={FilePlus2}>{t("file.newFile")}</IconText></button>
+              <button className="ghost-button icon-only" type="button" title={t("file.newDirectory")} aria-label={t("file.newDirectory")} disabled={!hasFileRoot} onClick={() => createEntry("directory")}><IconText icon={FolderPlus}>{t("file.newDirectory")}</IconText></button>
+              {!embedded && <button className="ghost-button icon-only" type="button" title={t("file.openTerminal")} aria-label={t("file.openTerminal")} disabled={!hasFileRoot} onClick={openTerminalHere}><IconText icon={TerminalIcon}>{t("file.openTerminal")}</IconText></button>}
+              <button className="ghost-button icon-only" type="button" title={t("file.copyPath")} aria-label={t("file.copyPath")} disabled={!hasFileRoot} onClick={() => void copyCurrentPath()}><IconText icon={Copy}>{t("file.copyPath")}</IconText></button>
               <button className="ghost-button icon-only" type="button" title={t("action.rename")} aria-label={t("action.rename")} disabled={!selectedEntry} onClick={renameEntry}><IconText icon={Pencil}>{t("action.rename")}</IconText></button>
-              <button className="ghost-button danger-button icon-only" type="button" title={t("action.delete")} aria-label={t("action.delete")} disabled={!selectedEntry} onClick={deleteEntry}><IconText icon={Trash2}>{t("action.delete")}</IconText></button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button className="ghost-button icon-only" type="button" title={t("action.more")} aria-label={t("action.more")}><IconText icon={MoreHorizontal}>{t("action.more")}</IconText></button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuItem disabled={!hasFileRoot} onSelect={() => void openFolderPreviewPanel()}><IconText icon={Globe}>{t("file.preview")}</IconText></DropdownMenuItem>
+                  <DropdownMenuItem disabled={!hasFileRoot} onSelect={() => openArchivePanel()}><IconText icon={Download}>{t("file.archiveDownload")}</IconText></DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem className="danger-menu-item" disabled={!selectedEntry} onSelect={() => void deleteEntry()}><IconText icon={Trash2}>{t("action.delete")}</IconText></DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
             </div>
           </div>
           <input name="filefilter" className="search-input file-search-input" value={fileFilter} onChange={(event) => setFileFilter(event.target.value)} placeholder={t("file.searchCurrentDirectory")} />
@@ -6399,17 +6433,29 @@ function FilesPage({
             <button className="ghost-button load-more" type="button" onClick={() => setFileVisibleCount((count) => count + 100)}>{t("session.loadMore")}</button>
           )}
           {fileList && fileFilter && !filteredFileEntries.length && <div className="empty-state">{t("file.searchEmpty")}</div>}
-          {!fileList && <div className="subtle">{t("file.loadingFiles")}</div>}
+          {!fileList && <div className="subtle">{hasFileRoot ? t("file.loadingFiles") : t("file.noMounts")}</div>}
         </section>
-        <section className={`file-preview-pane ${selectedFile ? "has-file" : ""} ${previewExpanded ? "expanded-preview" : ""}`}>
+        {(!embedded || selectedFile) && <section className={`file-preview-pane ${selectedFile ? "has-file" : ""}`}>
           <div className="file-preview-head">
             <div className="file-preview-title">
               <div className="file-preview-title-line">
                 <strong>{selectedFile?.path ?? t("file.selectFile")}</strong>
                 <div className="file-actions preview-actions">
-                  <button className="ghost-button icon-only preview-expand-button" type="button" title={previewExpanded ? t("action.collapse") : t("action.fullscreen")} aria-label={previewExpanded ? t("action.collapse") : t("action.fullscreen")} onClick={() => setPreviewExpanded((value) => !value)}>
-                    <IconText icon={previewExpanded ? Minimize2 : Maximize2}>{previewExpanded ? t("action.collapse") : t("action.fullscreen")}</IconText>
-                  </button>
+                  {selectedFile && (
+                    <div className="editor-mode-switch" role="group" aria-label={t("file.editorMode")}>
+                      {(["monaco", "codemirror", "textarea"] as CodeEditorMode[]).map((mode) => (
+                        <button
+                          className={`editor-mode-button ${editorMode === mode ? "active" : ""}`}
+                          type="button"
+                          key={mode}
+                          onClick={() => setEditorMode(mode)}
+                          title={mode === "monaco" ? t("file.editorMonaco") : mode === "codemirror" ? t("file.editorCodeMirror") : t("file.editorPlainText")}
+                        >
+                          {mode === "monaco" ? t("file.editorMonacoShort") : mode === "codemirror" ? t("file.editorCodeMirrorShort") : t("file.editorPlainTextShort")}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                   <button className="ghost-button icon-only file-preview-close" type="button" title={t("action.close")} aria-label={t("action.close")} onClick={() => void closeSelectedFile()}><IconText icon={X}>{t("action.close")}</IconText></button>
                   <button className="ghost-button icon-only" title={t("action.save")} aria-label={t("action.save")} disabled={!selectedFile || !dirty} onClick={saveFile}><IconText icon={Save}>{t("action.save")}</IconText></button>
                 </div>
@@ -6418,19 +6464,19 @@ function FilesPage({
             </div>
           </div>
           {selectedFile ? (
-            <textarea name="draft-2"
-              className="large-code file-editor"
+            <CodeEditor
+              mode={editorMode}
               value={draft}
-              spellCheck={false}
-              onChange={(event) => {
-                setDraft(event.target.value);
+              path={selectedFile.path}
+              onChange={(value) => {
+                setDraft(value);
                 setDirty(true);
               }}
             />
           ) : (
             <div className="empty-state">{t("file.chooseTextFile")}</div>
           )}
-        </section>
+        </section>}
       </section>
       {!activeRootPath && mountsPanelOpen && (
         <div className="workspace-modal compact-modal file-mounts-modal" role="dialog" aria-modal="true">
@@ -9061,7 +9107,7 @@ function AutomationsPage({
   const [automationModels, setAutomationModels] = useState<string[]>([]);
   const [automationCustomModel, setAutomationCustomModel] = useState(false);
   const [discoveringAutomationModels, setDiscoveringAutomationModels] = useState(false);
-  const [scheduleMode, setScheduleMode] = useState<"manual" | "hourly" | "daily" | "weekly" | "cron">("manual");
+  const [scheduleMode, setScheduleMode] = useState<"manual" | "startup" | "hourly" | "daily" | "weekly" | "cron">("manual");
   const [dailyTime, setDailyTime] = useState("09:00");
   const [weeklyDay, setWeeklyDay] = useState("1");
   const [cronExpression, setCronExpression] = useState("0 9 * * *");
@@ -9082,7 +9128,7 @@ function AutomationsPage({
   const [automationProjectFilter, setAutomationProjectFilter] = useState("all");
   const [automationRunStatusFilter, setAutomationRunStatusFilter] = useState<"all" | AutomationRunSummary["status"]>("all");
   const [runsPanel, setRunsPanel] = useState<{ automation: AutomationSummary; runs: AutomationRunSummary[] | null; cursor?: string | null; hasMore?: boolean } | null>(null);
-  const [runDetailPanel, setRunDetailPanel] = useState<{ automation: AutomationSummary; run: AutomationRunSummary } | null>(null);
+  const [runDetailPanel, setRunDetailPanel] = useState<{ automation: AutomationSummary; run: AutomationRunSummary; log?: string | null } | null>(null);
   const [createPanelOpen, setCreatePanelOpen] = useState(false);
   const [editingAutomation, setEditingAutomation] = useState<AutomationSummary | null>(null);
   const [editForm, setEditForm] = useState({
@@ -9108,6 +9154,7 @@ function AutomationsPage({
   }
 
   function automationScheduleValue() {
+    if (scheduleMode === "startup") return "startup";
     if (scheduleMode === "hourly") return "hourly";
     if (scheduleMode === "daily") return `daily ${dailyTime}`;
     if (scheduleMode === "weekly") return `weekly ${weeklyDay} ${dailyTime}`;
@@ -9119,6 +9166,7 @@ function AutomationsPage({
     const value = schedule.trim();
     const dailyMatch = value.match(/^daily\s+([0-2]\d:[0-5]\d)$/i);
     const weeklyMatch = value.match(/^weekly\s+([0-7])\s+([0-2]\d:[0-5]\d)$/i);
+    if (value === "startup") return { mode: "startup", time: "09:00", weekday: "1", cron: "0 9 * * *" };
     if (value === "hourly") return { mode: "hourly", time: "09:00", weekday: "1", cron: "0 9 * * *" };
     if (dailyMatch?.[1]) return { mode: "daily", time: dailyMatch[1], weekday: "1", cron: "0 9 * * *" };
     if (weeklyMatch?.[1] && weeklyMatch[2]) return { mode: "weekly", time: weeklyMatch[2], weekday: weeklyMatch[1] === "7" ? "0" : weeklyMatch[1], cron: "0 9 * * *" };
@@ -9127,6 +9175,7 @@ function AutomationsPage({
   }
 
   function buildAutomationSchedule(mode: typeof scheduleMode, time = "09:00", weekday = "1", cron = "0 9 * * *") {
+    if (mode === "startup") return "startup";
     if (mode === "hourly") return "hourly";
     if (mode === "daily") return `daily ${time || "09:00"}`;
     if (mode === "weekly") return `weekly ${weekday || "1"} ${time || "09:00"}`;
@@ -9254,7 +9303,7 @@ function AutomationsPage({
   }
 
   function validAutomationSchedule(schedule: string) {
-    return /^(manual|hourly|daily\s+[0-2]\d:[0-5]\d|weekly\s+[0-7]\s+[0-2]\d:[0-5]\d|cron\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+)$/i.test(schedule.trim());
+    return /^(manual|startup|hourly|daily\s+[0-2]\d:[0-5]\d|weekly\s+[0-7]\s+[0-2]\d:[0-5]\d|cron\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+)$/i.test(schedule.trim());
   }
 
   async function updateAutomation(automation: AutomationSummary, input: UpdateAutomationRequest) {
@@ -9397,6 +9446,19 @@ function AutomationsPage({
     }));
   }
 
+  async function openAutomationRunDetail(automation: AutomationSummary, run: AutomationRunSummary) {
+    setRunDetailPanel({ automation, run, log: null });
+    const response = await fetch(`/api/codex/tasks/${run.sessionId}/log?maxBytes=120000`, {
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    if (!response.ok) {
+      setRunDetailPanel((current) => current?.run.id === run.id ? { ...current, log: t("session.noTaskLog") } : current);
+      return;
+    }
+    const result = (await response.json()) as TaskLogResponse;
+    setRunDetailPanel((current) => current?.run.id === run.id ? { ...current, log: result.log ? newestTaskRunsFirst(result.log) : t("session.noTaskLog") } : current);
+  }
+
   useEffect(() => {
     if (runsPanel?.automation) void openRuns(runsPanel.automation);
   }, [automationRunStatusFilter]);
@@ -9493,6 +9555,7 @@ function AutomationsPage({
   function automationScheduleLabel(schedule: string) {
     const parsed = parseAutomationSchedule(schedule);
     if (parsed.mode === "manual") return t("automation.scheduleManual");
+    if (parsed.mode === "startup") return t("automation.scheduleStartup");
     if (parsed.mode === "hourly") return t("automation.scheduleHourly");
     if (parsed.mode === "daily") return t("automation.scheduleDailyAt").replace("{time}", parsed.time);
     if (parsed.mode === "weekly") return t("automation.scheduleWeeklyAt").replace("{weekday}", automationWeekdayLabel(parsed.weekday)).replace("{time}", parsed.time);
@@ -9529,6 +9592,7 @@ function AutomationsPage({
     const value = schedule.trim().toLowerCase();
     if (!validAutomationSchedule(value)) return t("automation.schedulePreviewInvalid");
     if (value === "manual") return t("automation.schedulePreviewManual");
+    if (value === "startup") return t("automation.schedulePreviewStartup");
     const from = new Date();
     const next = new Date(from);
     next.setSeconds(0, 0);
@@ -9605,6 +9669,7 @@ function AutomationsPage({
           });
         }}>
           <option value="manual">{t("automation.scheduleManual")}</option>
+          <option value="startup">{t("automation.scheduleStartup")}</option>
           <option value="hourly">{t("automation.scheduleHourly")}</option>
           <option value="daily">{t("automation.scheduleDaily")}</option>
           <option value="weekly">{t("automation.scheduleWeekly")}</option>
@@ -9700,6 +9765,7 @@ function AutomationsPage({
           )}
           <select name="schedule-mode" value={scheduleMode} onChange={(event) => setScheduleMode(event.target.value as typeof scheduleMode)}>
             <option value="manual">{t("automation.scheduleManual")}</option>
+            <option value="startup">{t("automation.scheduleStartup")}</option>
             <option value="hourly">{t("automation.scheduleHourly")}</option>
             <option value="daily">{t("automation.scheduleDaily")}</option>
             <option value="weekly">{t("automation.scheduleWeekly")}</option>
@@ -9844,7 +9910,7 @@ function AutomationsPage({
           <div className="extension-detail">
             {!runsPanel.runs && <div className="subtle">{t("automation.runsLoading")}</div>}
             {runsPanel.runs?.map((run) => (
-              <button className="file-list-item" key={run.id} type="button" onClick={() => setRunDetailPanel({ automation: runsPanel.automation, run })}>
+              <button className="file-list-item" key={run.id} type="button" onClick={() => void openAutomationRunDetail(runsPanel.automation, run)}>
                 <span>{automationRunStatusLabel(run.status)}{run.exitCode !== null ? ` · exit ${run.exitCode}` : ""} · {automationRunTimingLabel(run)}</span>
                 <em>{formatShortDate(run.finishedAt ?? run.startedAt)}</em>
               </button>
@@ -9891,6 +9957,12 @@ function AutomationsPage({
                 <code title={automationContentText(runDetailPanel.automation)}>{automationContentPreview(runDetailPanel.automation)}</code>
               </div>
             </div>
+            {runDetailPanel.automation.actionType === "command" && (
+              <div className="automation-run-log-panel">
+                <strong>{t("automation.commandOutput")}</strong>
+                <pre>{runDetailPanel.log === null ? t("automation.runsLoading") : runDetailPanel.log}</pre>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -9993,6 +10065,7 @@ function AutomationsPage({
             )}
             <select name="mobile-schedule-mode" value={scheduleMode} onChange={(event) => setScheduleMode(event.target.value as typeof scheduleMode)}>
               <option value="manual">{t("automation.scheduleManual")}</option>
+              <option value="startup">{t("automation.scheduleStartup")}</option>
               <option value="hourly">{t("automation.scheduleHourly")}</option>
               <option value="daily">{t("automation.scheduleDaily")}</option>
               <option value="weekly">{t("automation.scheduleWeekly")}</option>
@@ -11673,6 +11746,8 @@ function ExtensionsPage({ sessionToken, title, t, notify, onOpenMainNav }: { ses
   const [marketImportOpen, setMarketImportOpen] = useState(false);
   const [marketImportForm, setMarketImportForm] = useState<ImportMarketplaceCatalogRequest>({ url: "", content: "" });
   const [marketImporting, setMarketImporting] = useState(false);
+  const [marketSelectedIds, setMarketSelectedIds] = useState<string[]>([]);
+  const [marketDeleting, setMarketDeleting] = useState(false);
 
   function extensionEndpoint(type: ExtensionSummary["type"]) {
     return type === "plugin" ? "plugins" : type === "skill" ? "skills" : "mcp";
@@ -11747,6 +11822,29 @@ function ExtensionsPage({ sessionToken, title, t, notify, onOpenMainNav }: { ses
     const matchesSearch = !query || [item.name, item.description, item.category, item.source, ...(item.tags ?? [])].some((value) => value?.toLowerCase().includes(query));
     return matchesType && matchesCategory && matchesSearch;
   });
+  const visibleMarketItemIds = visibleMarketItems.map((item) => item.id);
+  const selectedVisibleMarketCount = visibleMarketItemIds.filter((id) => marketSelectedIds.includes(id)).length;
+
+  function isMarketplaceItemInstalled(item: MarketplaceCatalogItem) {
+    if (item.type === "skill" && item.install.kind === "skill") {
+      const name = item.install.skill.name.trim().toLowerCase();
+      return items.skill.some((entry) => entry.name.trim().toLowerCase() === name);
+    }
+    if (item.type === "skill" && item.install.kind === "skillUrl") {
+      const byName = item.name.trim().toLowerCase();
+      return items.skill.some((entry) => entry.name.trim().toLowerCase() === byName);
+    }
+    if (item.type === "plugin" && item.install.kind === "plugin") {
+      const name = item.install.manifest.name.trim().toLowerCase();
+      return items.plugin.some((entry) => entry.name.trim().toLowerCase() === name);
+    }
+    if (item.type === "mcp" && item.install.kind === "mcpServers") {
+      const candidateNames = Object.keys(item.install.config?.mcpServers ?? item.install.config ?? {}).map((name) => name.trim().toLowerCase()).filter(Boolean);
+      if (!candidateNames.length) return false;
+      return candidateNames.every((name) => items.mcp.some((entry) => entry.name.trim().toLowerCase() === name));
+    }
+    return false;
+  }
 
   function extensionDirectory(item: ExtensionSummary) {
     if (!item.path) return "";
@@ -12004,6 +12102,7 @@ function ExtensionsPage({ sessionToken, title, t, notify, onOpenMainNav }: { ses
       const payload = (await response.json()) as MarketplaceCatalogResponse;
       setMarketItems(payload.items ?? []);
       setMarketSourceName(payload.source?.name ?? "");
+      setMarketSelectedIds((current) => current.filter((id) => (payload.items ?? []).some((item) => item.id === id)));
     } catch {
       notify(t("extension.marketReadFailed"), "error");
     } finally {
@@ -12030,6 +12129,7 @@ function ExtensionsPage({ sessionToken, title, t, notify, onOpenMainNav }: { ses
       setMarketSourceName(payload.source?.name ?? "");
       setMarketType("all");
       setMarketCategory("all");
+      setMarketSelectedIds([]);
       setMarketImportOpen(false);
       setMarketImportForm({ url: "", content: "" });
       setTab("market");
@@ -12057,6 +12157,80 @@ function ExtensionsPage({ sessionToken, title, t, notify, onOpenMainNav }: { ses
     const installedType = result.installed?.[0]?.type ?? item.type;
     if (installedType === "plugin" || installedType === "skill" || installedType === "mcp") await loadExtensionType(installedType, true, extensionSearch);
     notify(t("extension.marketInstalled").replace("{count}", String(result.installed?.length ?? 1)), "success");
+  }
+
+  function toggleMarketplaceItemSelection(id: string) {
+    setMarketSelectedIds((current) => current.includes(id) ? current.filter((value) => value !== id) : [...current, id]);
+  }
+
+  function toggleVisibleMarketplaceSelection() {
+    if (!visibleMarketItemIds.length) return;
+    const allVisibleSelected = visibleMarketItemIds.every((id) => marketSelectedIds.includes(id));
+    setMarketSelectedIds((current) => {
+      if (allVisibleSelected) return current.filter((id) => !visibleMarketItemIds.includes(id));
+      const next = new Set(current);
+      visibleMarketItemIds.forEach((id) => next.add(id));
+      return Array.from(next);
+    });
+  }
+
+  async function deleteSelectedMarketplaceItems() {
+    const selectedIds = marketSelectedIds.filter((id) => marketItems.some((item) => item.id === id));
+    if (!selectedIds.length) return;
+    const confirmed = await dialog.confirm({
+      title: t("extension.marketDeleteSelected"),
+      message: t("extension.marketDeleteSelectedConfirm"),
+      confirmLabel: t("action.delete"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setMarketDeleting(true);
+    try {
+      const body: DeleteMarketplaceItemsRequest = { ids: selectedIds };
+      const response = await fetch("/api/extensions/marketplace", {
+        method: "DELETE",
+        headers: { "content-type": "application/json", authorization: `Bearer ${sessionToken}` },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) throw new Error("marketplace_delete_failed");
+      const payload = (await response.json()) as MarketplaceCatalogResponse;
+      setMarketItems(payload.items ?? []);
+      setMarketSourceName(payload.source?.name ?? "");
+      setMarketSelectedIds([]);
+      notify(t("extension.marketDeletedSelected").replace("{count}", String(selectedIds.length)), "success");
+    } catch {
+      notify(t("extension.marketDeleteSelectedFailed"), "error");
+    } finally {
+      setMarketDeleting(false);
+    }
+  }
+
+  async function clearMarketplaceItems() {
+    if (!marketItems.length) return;
+    const confirmed = await dialog.confirm({
+      title: t("extension.marketClearAll"),
+      message: t("extension.marketClearAllConfirm"),
+      confirmLabel: t("extension.marketClearAll"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setMarketDeleting(true);
+    try {
+      const response = await fetch("/api/extensions/marketplace/all", {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) throw new Error("marketplace_clear_failed");
+      const payload = (await response.json()) as MarketplaceCatalogResponse;
+      setMarketItems(payload.items ?? []);
+      setMarketSourceName(payload.source?.name ?? "");
+      setMarketSelectedIds([]);
+      notify(t("extension.marketCleared"), "success");
+    } catch {
+      notify(t("extension.marketClearFailed"), "error");
+    } finally {
+      setMarketDeleting(false);
+    }
   }
 
   function extensionLabel(value?: string) {
@@ -12129,6 +12303,9 @@ function ExtensionsPage({ sessionToken, title, t, notify, onOpenMainNav }: { ses
           <IconText icon={RefreshCw}>{tab === "market" ? t("extension.marketRefresh") : tab === "skill" ? t("extension.syncLocalCapabilities") : t("action.refresh")}</IconText>
         </Button>
         {tab === "market" && <Button className="market-import-button" variant="default" size="sm" type="button" onClick={() => setMarketImportOpen(true)}>{t("extension.marketImportCatalog")}</Button>}
+        {tab === "market" && <Button variant="outline" size="sm" type="button" disabled={!visibleMarketItemIds.length} onClick={toggleVisibleMarketplaceSelection}>{visibleMarketItemIds.length && visibleMarketItemIds.every((id) => marketSelectedIds.includes(id)) ? t("extension.marketClearSelection") : t("extension.marketSelectAll")}</Button>}
+        {tab === "market" && <Button variant="outline" size="sm" type="button" disabled={!marketSelectedIds.length || marketDeleting} onClick={() => void deleteSelectedMarketplaceItems()}><IconText icon={Trash2}>{t("extension.marketDeleteSelected")}</IconText></Button>}
+        {tab === "market" && <Button variant="outline" size="sm" type="button" disabled={!marketItems.length || marketDeleting} onClick={() => void clearMarketplaceItems()}><IconText icon={PackageX}>{t("extension.marketClearAll")}</IconText></Button>}
         {showLegacyExtensionEntryPoints && tab === "plugin" && <Button variant="default" size="sm" type="button" onClick={() => setPluginCreateOpen(true)}><IconText icon={Plus}>{t("extension.addPlugin")}</IconText></Button>}
         {showLegacyExtensionEntryPoints && tab === "skill" && <Button variant="outline" size="sm" type="button" onClick={openCreateSkill}><IconText icon={Plus}>{t("extension.addSkill")}</IconText></Button>}
         {showLegacyExtensionEntryPoints && tab === "skill" && <Button variant="default" size="sm" type="button" onClick={() => setSkillImportOpen(true)}><IconText icon={Download}>{t("extension.importSkill")}</IconText></Button>}
@@ -12178,20 +12355,35 @@ function ExtensionsPage({ sessionToken, title, t, notify, onOpenMainNav }: { ses
                   </div>
                 </div>
               </div>
+              <div className="extension-marketplace-selection-bar">
+                <span>{t("extension.marketSelectedCount").replace("{count}", String(selectedVisibleMarketCount || marketSelectedIds.length))}</span>
+              </div>
               <div className="extension-marketplace-grid">
                 {visibleMarketItems.map((item) => (
-                  <article className="extension-marketplace-card" key={item.id}>
+                  <article className={`extension-marketplace-card ${marketSelectedIds.includes(item.id) ? "selected" : ""}`} key={item.id}>
+                    <label className="extension-marketplace-select">
+                      <input
+                        name={`extension-market-selected-${item.id}`}
+                        type="checkbox"
+                        checked={marketSelectedIds.includes(item.id)}
+                        onChange={() => toggleMarketplaceItemSelection(item.id)}
+                      />
+                      <span>{t("extension.marketDeleteSelected")}</span>
+                    </label>
                     <div>
                       <strong>{item.name}</strong>
                       <span>{item.type.toUpperCase()}</span>
                     </div>
                     <p>{item.description}</p>
                     <div className="extension-chip-row">
+                      {isMarketplaceItemInstalled(item) && <span className="pill">{t("extension.marketInstalledBadge")}</span>}
                       {item.category && <span className="extension-chip">{marketCategories.find((category) => category.id === item.category)?.label ?? item.category}</span>}
                       {(item.tags ?? []).slice(0, 3).map((tag) => <span className="extension-chip" key={tag}>{tag}</span>)}
                     </div>
                     <code>{item.install.kind}</code>
-                    <Button size="sm" type="button" onClick={() => void installMarketplaceItem(item)}><IconText icon={Download}>{t("extension.marketInstall")}</IconText></Button>
+                    <Button size="sm" type="button" disabled={isMarketplaceItemInstalled(item)} onClick={() => void installMarketplaceItem(item)}>
+                      <IconText icon={isMarketplaceItemInstalled(item) ? Check : Download}>{isMarketplaceItemInstalled(item) ? t("extension.marketInstalledBadge") : t("extension.marketInstall")}</IconText>
+                    </Button>
                   </article>
                 ))}
               </div>
@@ -12252,11 +12444,11 @@ function ExtensionsPage({ sessionToken, title, t, notify, onOpenMainNav }: { ses
           <form className="management-form" onSubmit={importMarketplace}>
             <label>
               <span>{t("extension.marketImportUrl")}</span>
-              <input value={marketImportForm.url ?? ""} onChange={(event) => setMarketImportForm((current) => ({ ...current, url: event.target.value }))} placeholder={t("extension.marketImportUrlPlaceholder")} />
+              <input name="extension-market-import-url" value={marketImportForm.url ?? ""} onChange={(event) => setMarketImportForm((current) => ({ ...current, url: event.target.value }))} placeholder={t("extension.marketImportUrlPlaceholder")} />
             </label>
             <label>
               <span>{t("extension.marketImportContent")}</span>
-              <textarea value={marketImportForm.content ?? ""} onChange={(event) => setMarketImportForm((current) => ({ ...current, content: event.target.value }))} placeholder={t("extension.marketImportContentPlaceholder")} rows={10} />
+              <textarea name="extension-market-import-content" value={marketImportForm.content ?? ""} onChange={(event) => setMarketImportForm((current) => ({ ...current, content: event.target.value }))} placeholder={t("extension.marketImportContentPlaceholder")} rows={10} />
             </label>
             <div className="settings-actions">
               <Button variant="outline" type="button" onClick={() => setMarketImportOpen(false)}>{t("action.cancel")}</Button>
@@ -12280,15 +12472,15 @@ function ExtensionsPage({ sessionToken, title, t, notify, onOpenMainNav }: { ses
           <form className="management-form" onSubmit={saveSkill}>
             <label>
               <span>{t("extension.skillName")}</span>
-              <input value={skillForm.name} onChange={(event) => setSkillForm((current) => ({ ...current, name: event.target.value }))} placeholder={t("extension.skillNamePlaceholder")} required />
+              <input name="extension-skill-name" value={skillForm.name} onChange={(event) => setSkillForm((current) => ({ ...current, name: event.target.value }))} placeholder={t("extension.skillNamePlaceholder")} required />
             </label>
             <label>
               <span>{t("extension.skillDescription")}</span>
-              <input value={skillForm.description} onChange={(event) => setSkillForm((current) => ({ ...current, description: event.target.value }))} placeholder={t("extension.skillDescriptionPlaceholder")} required />
+              <input name="extension-skill-description" value={skillForm.description} onChange={(event) => setSkillForm((current) => ({ ...current, description: event.target.value }))} placeholder={t("extension.skillDescriptionPlaceholder")} required />
             </label>
             <label>
               <span>{t("extension.skillInstructions")}</span>
-              <textarea value={skillForm.instructions} onChange={(event) => setSkillForm((current) => ({ ...current, instructions: event.target.value }))} placeholder={t("extension.skillInstructionsPlaceholder")} rows={8} required />
+              <textarea name="extension-skill-instructions" value={skillForm.instructions} onChange={(event) => setSkillForm((current) => ({ ...current, instructions: event.target.value }))} placeholder={t("extension.skillInstructionsPlaceholder")} rows={8} required />
             </label>
             <div className="settings-actions">
               <Button variant="outline" type="button" onClick={() => {
@@ -12312,11 +12504,11 @@ function ExtensionsPage({ sessionToken, title, t, notify, onOpenMainNav }: { ses
           <form className="management-form" onSubmit={importSkill}>
             <label>
               <span>{t("extension.skillImportUrl")}</span>
-              <input value={skillImportForm.url ?? ""} onChange={(event) => setSkillImportForm((current) => ({ ...current, url: event.target.value }))} placeholder={t("extension.skillImportUrlPlaceholder")} />
+              <input name="extension-skill-import-url" value={skillImportForm.url ?? ""} onChange={(event) => setSkillImportForm((current) => ({ ...current, url: event.target.value }))} placeholder={t("extension.skillImportUrlPlaceholder")} />
             </label>
             <label>
               <span>{t("extension.skillImportContent")}</span>
-              <textarea value={skillImportForm.content ?? ""} onChange={(event) => setSkillImportForm((current) => ({ ...current, content: event.target.value }))} placeholder={t("extension.skillImportContentPlaceholder")} rows={8} />
+              <textarea name="extension-skill-import-content" value={skillImportForm.content ?? ""} onChange={(event) => setSkillImportForm((current) => ({ ...current, content: event.target.value }))} placeholder={t("extension.skillImportContentPlaceholder")} rows={8} />
             </label>
             <div className="settings-actions">
               <Button variant="outline" type="button" onClick={() => setSkillImportOpen(false)}>{t("action.cancel")}</Button>
@@ -12337,11 +12529,11 @@ function ExtensionsPage({ sessionToken, title, t, notify, onOpenMainNav }: { ses
           <form className="management-form" onSubmit={createPlugin}>
             <label>
               <span>{t("extension.pluginName")}</span>
-              <input value={pluginForm.name} onChange={(event) => setPluginForm((current) => ({ ...current, name: event.target.value }))} placeholder={t("extension.pluginNamePlaceholder")} required />
+              <input name="extension-plugin-name" value={pluginForm.name} onChange={(event) => setPluginForm((current) => ({ ...current, name: event.target.value }))} placeholder={t("extension.pluginNamePlaceholder")} required />
             </label>
             <label>
               <span>{t("extension.pluginDescription")}</span>
-              <input value={pluginForm.description ?? ""} onChange={(event) => setPluginForm((current) => ({ ...current, description: event.target.value }))} placeholder={t("extension.pluginDescriptionPlaceholder")} />
+              <input name="extension-plugin-description" value={pluginForm.description ?? ""} onChange={(event) => setPluginForm((current) => ({ ...current, description: event.target.value }))} placeholder={t("extension.pluginDescriptionPlaceholder")} />
             </label>
             <div className="settings-actions">
               <Button variant="outline" type="button" onClick={() => setPluginCreateOpen(false)}>{t("action.cancel")}</Button>
@@ -12362,19 +12554,19 @@ function ExtensionsPage({ sessionToken, title, t, notify, onOpenMainNav }: { ses
           <form className="management-form" onSubmit={createMcp}>
             <label>
               <span>{t("extension.mcpName")}</span>
-              <input value={mcpForm.name} onChange={(event) => setMcpForm((current) => ({ ...current, name: event.target.value }))} placeholder={t("extension.mcpNamePlaceholder")} required />
+              <input name="extension-mcp-name" value={mcpForm.name} onChange={(event) => setMcpForm((current) => ({ ...current, name: event.target.value }))} placeholder={t("extension.mcpNamePlaceholder")} required />
             </label>
             <label>
               <span>{t("extension.mcpCommand")}</span>
-              <input value={mcpForm.command} onChange={(event) => setMcpForm((current) => ({ ...current, command: event.target.value }))} placeholder={t("extension.mcpCommandPlaceholder")} required />
+              <input name="extension-mcp-command" value={mcpForm.command} onChange={(event) => setMcpForm((current) => ({ ...current, command: event.target.value }))} placeholder={t("extension.mcpCommandPlaceholder")} required />
             </label>
             <label>
               <span>{t("extension.mcpArgs")}</span>
-              <input value={mcpForm.args} onChange={(event) => setMcpForm((current) => ({ ...current, args: event.target.value }))} placeholder={t("extension.mcpArgsPlaceholder")} />
+              <input name="extension-mcp-args" value={mcpForm.args} onChange={(event) => setMcpForm((current) => ({ ...current, args: event.target.value }))} placeholder={t("extension.mcpArgsPlaceholder")} />
             </label>
             <label>
               <span>{t("extension.mcpEnv")}</span>
-              <textarea value={mcpForm.env} onChange={(event) => setMcpForm((current) => ({ ...current, env: event.target.value }))} placeholder={t("extension.mcpEnvPlaceholder")} rows={4} />
+              <textarea name="extension-mcp-env" value={mcpForm.env} onChange={(event) => setMcpForm((current) => ({ ...current, env: event.target.value }))} placeholder={t("extension.mcpEnvPlaceholder")} rows={4} />
             </label>
             <div className="settings-actions">
               <Button variant="outline" type="button" onClick={() => setMcpCreateOpen(false)}>{t("action.cancel")}</Button>
@@ -12395,11 +12587,11 @@ function ExtensionsPage({ sessionToken, title, t, notify, onOpenMainNav }: { ses
           <form className="management-form" onSubmit={importMcp}>
             <label>
               <span>{t("extension.mcpImportUrl")}</span>
-              <input value={mcpImportForm.url ?? ""} onChange={(event) => setMcpImportForm((current) => ({ ...current, url: event.target.value }))} placeholder={t("extension.mcpImportUrlPlaceholder")} />
+              <input name="extension-mcp-import-url" value={mcpImportForm.url ?? ""} onChange={(event) => setMcpImportForm((current) => ({ ...current, url: event.target.value }))} placeholder={t("extension.mcpImportUrlPlaceholder")} />
             </label>
             <label>
               <span>{t("extension.mcpImportContent")}</span>
-              <textarea value={mcpImportForm.content ?? ""} onChange={(event) => setMcpImportForm((current) => ({ ...current, content: event.target.value }))} placeholder={t("extension.mcpImportContentPlaceholder")} rows={8} />
+              <textarea name="extension-mcp-import-content" value={mcpImportForm.content ?? ""} onChange={(event) => setMcpImportForm((current) => ({ ...current, content: event.target.value }))} placeholder={t("extension.mcpImportContentPlaceholder")} rows={8} />
             </label>
             <div className="settings-actions">
               <Button variant="outline" type="button" onClick={() => setMcpImportOpen(false)}>{t("action.cancel")}</Button>
@@ -12711,6 +12903,16 @@ function SettingsPage({
   const [tokenMessage, setTokenMessage] = useState("");
   const [otpMessage, setOtpMessage] = useState("");
   const [otpCopyMessage, setOtpCopyMessage] = useState("");
+  const [apiKeys, setApiKeys] = useState<ApiKeySummary[]>([]);
+  const [apiKeyGroups, setApiKeyGroups] = useState<ApiKeyPermissionGroup[]>([]);
+  const [apiKeyPresets, setApiKeyPresets] = useState<ApiKeyPreset[]>([]);
+  const [apiKeyForm, setApiKeyForm] = useState({ name: "", permissions: [] as ApiKeyPermission[] });
+  const [apiKeyEditorOpen, setApiKeyEditorOpen] = useState(false);
+  const [apiKeyEditorMode, setApiKeyEditorMode] = useState<"create" | "edit">("create");
+  const [apiKeyEditingId, setApiKeyEditingId] = useState("");
+  const [expandedApiKeyPermissions, setExpandedApiKeyPermissions] = useState("");
+  const [createdApiKey, setCreatedApiKey] = useState<ApiKeyDetailResponse | null>(null);
+  const [apiKeyMessage, setApiKeyMessage] = useState("");
   const [cleanupMessage, setCleanupMessage] = useState("");
   const [storageScan, setStorageScan] = useState<StorageScanResponse | null>(null);
   const [storageSearch, setStorageSearch] = useState("");
@@ -12772,6 +12974,9 @@ function SettingsPage({
   });
   const environmentReconcileItems = environmentOverview?.reconcile ?? [];
   const environmentProjectUsageItems = environmentOverview?.projectUsage ?? [];
+  const environmentMissingToolCount = environmentOverview?.tools.filter((tool) => tool.status === "missing" && tool.autoRestore).length ?? 0;
+  const environmentMissingPackageCount = environmentOverview?.packageRecords.filter((pkg) => pkg.status === "missing" && pkg.autoRestore).length ?? 0;
+  const environmentRestoreBusy = busy.startsWith("environment-restore-missing:");
   const [rateLimitEnabled, setRateLimitEnabled] = useState(true);
   const [rateLimitForm, setRateLimitForm] = useState({
     globalPerMinute: "300",
@@ -12886,6 +13091,11 @@ function SettingsPage({
     notify(value, value === t("settings.otpReset") || value === t("settings.otpGenerated") || value === t("action.copied") ? "success" : "error");
   }
 
+  function showApiKeyNotice(value: string, tone: ToastTone = "success") {
+    setApiKeyMessage(value);
+    notify(value, tone);
+  }
+
   useEffect(() => {
     const headers = { authorization: `Bearer ${sessionToken}` };
     fetch("/api/settings/codex-runtime", { headers })
@@ -12957,6 +13167,21 @@ function SettingsPage({
       .then((result: { items: EnvironmentToolRegistryItem[] } | null) => {
         if (!result) return;
         setEnvironmentRegistry(result.items);
+      })
+      .catch(() => undefined);
+    fetch("/api/auth/api-key-permissions", { headers })
+      .then((response) => response.ok ? response.json() : null)
+      .then((result: ApiKeyPermissionsResponse | null) => {
+        if (!result) return;
+        setApiKeyGroups(result.groups);
+        setApiKeyPresets(result.presets);
+      })
+      .catch(() => undefined);
+    fetch("/api/auth/api-keys", { headers })
+      .then((response) => response.ok ? response.json() : null)
+      .then((result: ApiKeySummary[] | null) => {
+        if (!result) return;
+        setApiKeys(result);
       })
       .catch(() => undefined);
     void loadNotifications();
@@ -13815,6 +14040,230 @@ function SettingsPage({
     window.setTimeout(() => setOtpCopyMessage(""), 4000);
   }
 
+  function toggleApiKeyPermission(permission: ApiKeyPermission) {
+    setApiKeyForm((current) => ({
+      ...current,
+      permissions: current.permissions.includes(permission)
+        ? current.permissions.filter((item) => item !== permission)
+        : [...current.permissions, permission],
+    }));
+  }
+
+  function applyApiKeyPreset(preset: ApiKeyPreset) {
+    setApiKeyForm((current) => ({ ...current, permissions: [...preset.permissions] }));
+  }
+
+  function openCreateApiKeyEditor() {
+    setApiKeyEditorMode("create");
+    setApiKeyEditingId("");
+    setApiKeyForm({ name: "", permissions: [] });
+    setCreatedApiKey(null);
+    setApiKeyEditorOpen(true);
+  }
+
+  function openEditApiKeyEditor(key: ApiKeySummary) {
+    setApiKeyEditorMode("edit");
+    setApiKeyEditingId(key.id);
+    setApiKeyForm({ name: key.name, permissions: [...key.permissions] });
+    setCreatedApiKey(null);
+    setApiKeyEditorOpen(true);
+  }
+
+  function closeApiKeyEditor() {
+    setApiKeyEditorOpen(false);
+    setApiKeyEditingId("");
+    setApiKeyEditorMode("create");
+    setApiKeyForm({ name: "", permissions: [] });
+    setCreatedApiKey(null);
+  }
+
+  function apiKeyModuleLabel(moduleId: string) {
+    const labels: Record<string, string> = {
+      auth: t("settings.apiKeyModuleAuth"),
+      sessions: t("settings.apiKeyModuleSessions"),
+      rooms: t("settings.apiKeyModuleRooms"),
+      agents: t("settings.apiKeyModuleAgents"),
+      automations: t("settings.apiKeyModuleAutomations"),
+      goals: t("settings.apiKeyModuleGoals"),
+      projects: t("settings.apiKeyModuleProjects"),
+      previews: t("settings.apiKeyModulePreviews"),
+      files: t("settings.apiKeyModuleFiles"),
+      terminal: t("settings.apiKeyModuleTerminal"),
+      providers: t("settings.apiKeyModuleProviders"),
+      extensions: t("settings.apiKeyModuleExtensions"),
+      environment: t("settings.apiKeyModuleEnvironment"),
+      notifications: t("settings.apiKeyModuleNotifications"),
+      approvals: t("settings.apiKeyModuleApprovals"),
+      settings: t("settings.apiKeyModuleSettings"),
+      storage: t("settings.apiKeyModuleStorage"),
+      backup: t("settings.apiKeyModuleBackup"),
+    };
+    return labels[moduleId] ?? moduleId;
+  }
+
+  function apiKeyActionLabel(actionId: string) {
+    const labels: Record<string, string> = {
+      read: t("settings.apiKeyActionRead"),
+      manage: t("settings.apiKeyActionManage"),
+      run: t("settings.apiKeyActionRun"),
+      git: t("settings.apiKeyActionGit"),
+      write: t("settings.apiKeyActionWrite"),
+      exec: t("settings.apiKeyActionExec"),
+      install: t("settings.apiKeyActionInstall"),
+      restore: t("settings.apiKeyActionRestore"),
+      decide: t("settings.apiKeyActionDecide"),
+    };
+    return labels[actionId] ?? actionId;
+  }
+
+  function apiKeyPresetLabel(preset: ApiKeyPreset) {
+    const labels: Record<string, string> = {
+      "read-only": t("settings.apiKeyPresetReadOnly"),
+      "automation-runner": t("settings.apiKeyPresetAutomationRunner"),
+      "environment-restore": t("settings.apiKeyPresetEnvironmentRestore"),
+      "project-ops": t("settings.apiKeyPresetProjectOps"),
+      "full-access": t("settings.apiKeyPresetFullAccess"),
+    };
+    return labels[preset.id] ?? preset.label;
+  }
+
+  function apiKeyPermissionLabel(permission: ApiKeyPermission) {
+    const [moduleId, actionId] = permission.split(".");
+    if (!moduleId || !actionId) return permission;
+    return `${apiKeyModuleLabel(moduleId)}${apiKeyActionLabel(actionId)}`;
+  }
+
+  function apiKeyGroupLabel(groupId: string) {
+    return apiKeyModuleLabel(groupId);
+  }
+
+  function apiKeyPermissionOptionLabel(permission: ApiKeyPermission) {
+    const [moduleId, actionId] = permission.split(".");
+    if (!moduleId || !actionId) return permission;
+    return `${apiKeyActionLabel(actionId)}${apiKeyModuleLabel(moduleId)}`;
+  }
+
+  function apiKeyPermissionOptionTitle(permission: ApiKeyPermission) {
+    const [moduleId, actionId] = permission.split(".");
+    if (!moduleId || !actionId) return permission;
+    return `${apiKeyModuleLabel(moduleId)} · ${apiKeyActionLabel(actionId)}`;
+  }
+
+  function apiKeyPermissionGroupDescription(group: ApiKeyPermissionGroup) {
+    return group.permissions.map((permission) => apiKeyActionLabel(permission.id.split(".")[1] ?? permission.id)).join(" / ");
+  }
+
+  function apiKeyPermissionGroupLabel(permission: { id: ApiKeyPermission; label: string }) {
+    return apiKeyPermissionOptionLabel(permission.id);
+  }
+
+  function apiKeyPermissionGroupTitle(permission: { id: ApiKeyPermission; label: string }) {
+    return apiKeyPermissionOptionTitle(permission.id);
+  }
+
+  async function saveApiKey(event: React.FormEvent) {
+    event.preventDefault();
+    setApiKeyMessage("");
+    if (!apiKeyForm.name.trim() || !apiKeyForm.permissions.length) {
+      showApiKeyNotice(t("settings.apiKeysCreateInvalid"), "error");
+      return;
+    }
+    const editing = apiKeyEditorMode === "edit";
+    setBusy(editing ? "api-key-update" : "api-key-create");
+    try {
+      const body: CreateApiKeyRequest | UpdateApiKeyRequest = {
+        name: apiKeyForm.name.trim(),
+        permissions: apiKeyForm.permissions,
+      };
+      const response = await fetch(editing ? `/api/auth/api-keys/${apiKeyEditingId}` : "/api/auth/api-keys", {
+        method: editing ? "PATCH" : "POST",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const result = await response.json().catch(() => null) as ((ApiKeyDetailResponse | ApiKeySummary) & { error?: string }) | null;
+      if (!response.ok || !result?.id) {
+        showApiKeyNotice(editing ? t("settings.apiKeysUpdateFailed") : t("settings.apiKeysCreateFailed"), "error");
+        return;
+      }
+      if (editing) {
+        setApiKeys((current) => current.map((item) => item.id === result.id ? { ...item, ...result } : item));
+        closeApiKeyEditor();
+        showApiKeyNotice(t("settings.apiKeysUpdated"), "success");
+      } else {
+        const detail = result as ApiKeyDetailResponse;
+        setCreatedApiKey(detail);
+        setApiKeys((current) => [detail, ...current]);
+        setApiKeyForm({ name: "", permissions: [] });
+        showApiKeyNotice(t("settings.apiKeysCreated"), "success");
+      }
+    } catch {
+      showApiKeyNotice(apiKeyEditorMode === "edit" ? t("settings.apiKeysUpdateFailed") : t("settings.apiKeysCreateFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function revokeApiKey(key: ApiKeySummary) {
+    const confirmed = await dialog.confirm({
+      title: t("settings.apiKeysRevoke"),
+      message: `${key.name}\n${t("settings.apiKeysRevokeConfirm")}`,
+      confirmLabel: t("settings.apiKeysRevoke"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy(`api-key-revoke:${key.id}`);
+    try {
+      const response = await fetch(`/api/auth/api-keys/${key.id}`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      const result = await response.json().catch(() => null) as (ApiKeySummary & { error?: string }) | null;
+      if (!response.ok || !result?.id) {
+        showApiKeyNotice(t("settings.apiKeysRevokeFailed"), "error");
+        return;
+      }
+      setApiKeys((current) => current.map((item) => item.id === result.id ? result : item));
+      showApiKeyNotice(t("settings.apiKeysRevoked"), "success");
+    } catch {
+      showApiKeyNotice(t("settings.apiKeysRevokeFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function deleteRevokedApiKey(key: ApiKeySummary) {
+    const confirmed = await dialog.confirm({
+      title: t("settings.apiKeysDeleteRecord"),
+      message: `${key.name}\n${t("settings.apiKeysDeleteRecordConfirm")}`,
+      confirmLabel: t("action.delete"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy(`api-key-delete:${key.id}`);
+    try {
+      const response = await fetch(`/api/auth/api-keys/${key.id}/record`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) {
+        showApiKeyNotice(t("settings.apiKeysDeleteRecordFailed"), "error");
+        return;
+      }
+      setApiKeys((current) => current.filter((item) => item.id !== key.id));
+      showApiKeyNotice(t("settings.apiKeysDeleteRecordDone"), "success");
+    } catch {
+      showApiKeyNotice(t("settings.apiKeysDeleteRecordFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function copyCreatedApiKey() {
+    if (!createdApiKey?.key) return;
+    const copied = await copyText(createdApiKey.key);
+    showApiKeyNotice(copied ? t("action.copied") : t("settings.copyFailed"), copied ? "success" : "error");
+  }
+
   async function cleanupMaintenance() {
     if (!window.confirm(cleanupApprovalAuditLog ? t("settings.cleanupAuditConfirm") : t("settings.cleanupConfirm"))) return;
     setCleanupMessage("");
@@ -14295,6 +14744,65 @@ function SettingsPage({
     }
   }
 
+  async function previewEnvironmentRestore(mode: "all" | "auto" = "auto") {
+    const request: EnvironmentRestoreMissingRequest = {
+      mode,
+      includeTools: true,
+      includePackages: true,
+    };
+    const response = await fetch("/api/settings/environment/restore-preview", {
+      method: "POST",
+      headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+      body: JSON.stringify(request),
+    });
+    if (!response.ok) throw new Error("environment_restore_preview_failed");
+    return (await response.json()) as EnvironmentRestorePreviewResponse;
+  }
+
+  async function restoreMissingEnvironment(mode: "all" | "auto" = "auto") {
+    setBusy(`environment-restore-missing:${mode}`);
+    try {
+      const preview = await previewEnvironmentRestore(mode);
+      if (!preview.items.length) {
+        notify(t("settings.environmentRestoreMissingNothing"), "info");
+        return;
+      }
+      const message = [
+        t("settings.environmentRestoreMissingConfirm")
+          .replace("{tools}", String(preview.tools))
+          .replace("{packages}", String(preview.packages)),
+        ...preview.items.slice(0, 5).map((item) => `- ${item.title}`),
+        preview.items.length > 5 ? t("settings.environmentRestoreMissingMore").replace("{count}", String(preview.items.length - 5)) : "",
+      ].filter(Boolean).join("\n");
+      const confirmed = await dialog.confirm({
+        title: t("settings.environmentRestoreMissing"),
+        message,
+        confirmLabel: t("settings.environmentRestoreMissing"),
+        danger: false,
+      });
+      if (!confirmed) return;
+      const request: EnvironmentRestoreMissingRequest = {
+        mode,
+        includeTools: true,
+        includePackages: true,
+      };
+      const response = await fetch("/api/settings/environment/restore-missing", {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify(request),
+      });
+      const result = await response.json().catch(() => null) as EnvironmentOverview | null;
+      if (!response.ok || !result) throw new Error("environment_restore_missing_failed");
+      setEnvironmentOverview(result);
+      if (environmentPackagePanel) await openEnvironmentPackagePanel(environmentPackagePanel.toolRecord);
+      notify(t("settings.environmentRestoreMissingDone"), "success");
+    } catch {
+      notify(t("settings.environmentRestoreMissingFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function installMise() {
     setBusy("environment-mise-install");
     try {
@@ -14484,6 +14992,12 @@ function SettingsPage({
   }
 
   async function runEnvironmentBulkAction(input: EnvironmentBulkActionRequest) {
+    const detectedCount = input.action === "record_detected_packages"
+      ? environmentPackagePanel?.packages.filter((pkg) => !pkg.persisted).length ?? 0
+      : 0;
+    const missingCount = input.action === "install_missing_packages"
+      ? environmentPackagePanel?.packages.filter((pkg) => pkg.status === "missing").length ?? 0
+      : 0;
     setBusy(`environment-bulk:${input.action}`);
     try {
       const response = await fetch("/api/settings/environment/bulk", {
@@ -14500,6 +15014,16 @@ function SettingsPage({
       setEnvironmentOverview(result as EnvironmentOverview);
       if (environmentPackagePanel && input.toolRecordId === environmentPackagePanel.toolRecord.id) {
         await openEnvironmentPackagePanel(environmentPackagePanel.toolRecord);
+      }
+      if (input.action === "record_detected_packages") {
+        notify(detectedCount
+          ? t("settings.environmentBulkRecordDetectedDone").replace("{count}", String(detectedCount))
+          : t("settings.environmentBulkRecordDetectedEmpty"), detectedCount ? "success" : "info");
+      }
+      if (input.action === "install_missing_packages") {
+        notify(missingCount
+          ? t("settings.environmentBulkInstallMissingDone").replace("{count}", String(missingCount))
+          : t("settings.environmentBulkInstallMissingEmpty"), missingCount ? "success" : "info");
       }
     } catch {
       notify(t("settings.environmentPackagesLoadFailed"), "error");
@@ -14755,6 +15279,97 @@ function SettingsPage({
           {otpMessage && <span className={otpMessage === t("settings.otpReset") || otpMessage === t("settings.otpGenerated") || otpMessage === t("action.copied") ? "result-ok" : "result-error"}>{otpMessage}</span>}
           </form>
           <section className="provider-card">
+          <div className="api-keys-head">
+            <div className="api-keys-head-copy">
+              <strong>{t("settings.apiKeysTitle")}</strong>
+              <span>{t("settings.apiKeysHelp")}</span>
+            </div>
+            <button className="ghost-button" type="button" onClick={openCreateApiKeyEditor}><IconText icon={Plus}>{t("settings.apiKeysCreate")}</IconText></button>
+          </div>
+          {apiKeyMessage && <span className={apiKeyMessage === t("settings.apiKeysCreated") || apiKeyMessage === t("settings.apiKeysRevoked") || apiKeyMessage === t("settings.apiKeysUpdated") || apiKeyMessage === t("settings.apiKeysDeleteRecordDone") || apiKeyMessage === t("action.copied") ? "result-ok" : "result-error"}>{apiKeyMessage}</span>}
+          <div className="storage-list">
+            {!apiKeys.length && <div className="empty-state">{t("settings.apiKeysEmpty")}</div>}
+            {apiKeys.map((key) => (
+              <div className="storage-item" key={key.id}>
+                <div>
+                  <strong>{key.name}</strong>
+                  <span>{key.keyPreview}</span>
+                  <div className="api-key-permission-summary">
+                    {(expandedApiKeyPermissions === key.id ? key.permissions : key.permissions.slice(0, 4)).map((permission) => (
+                      <span className="api-key-permission-chip" key={permission}>{apiKeyPermissionLabel(permission)}</span>
+                    ))}
+                    {key.permissions.length > 4 && (
+                      <button className="api-key-permission-more" type="button" onClick={() => setExpandedApiKeyPermissions((current) => current === key.id ? "" : key.id)}>
+                        {expandedApiKeyPermissions === key.id ? t("action.collapse") : `+${key.permissions.length - 4}`}
+                      </button>
+                    )}
+                  </div>
+                  <span>{key.revokedAt ? `${t("settings.apiKeysStatusRevoked")} · ${formatShortDate(key.revokedAt)}` : `${t("settings.apiKeysStatusActive")} · ${t("settings.apiKeysLastUsed").replace("{time}", key.lastUsedAt ? formatShortDate(key.lastUsedAt) : t("settings.apiKeysNeverUsed"))}`}</span>
+                </div>
+                <div className="storage-actions">
+                  <button className="ghost-button" type="button" onClick={() => openEditApiKeyEditor(key)}><IconText icon={Pencil}>{t("action.edit")}</IconText></button>
+                  {!key.revokedAt && <button className="ghost-button danger-button" type="button" disabled={busy === `api-key-revoke:${key.id}`} onClick={() => void revokeApiKey(key)}>{t("settings.apiKeysRevoke")}</button>}
+                  {key.revokedAt && <button className="ghost-button danger-button" type="button" disabled={busy === `api-key-delete:${key.id}`} onClick={() => void deleteRevokedApiKey(key)}><IconText icon={Trash2}>{t("settings.apiKeysDeleteRecord")}</IconText></button>}
+                </div>
+              </div>
+            ))}
+          </div>
+          {apiKeyEditorOpen && (
+            <div className="dialog-layer" role="presentation">
+              <button className="dialog-backdrop" type="button" aria-label={t("action.close")} onClick={closeApiKeyEditor} />
+              <form className="dialog-card api-key-editor-dialog" role="dialog" aria-modal="true" aria-label={apiKeyEditorMode === "edit" ? t("settings.apiKeysEdit") : t("settings.apiKeysCreate")} onSubmit={saveApiKey}>
+                <div className="dialog-head">
+                  <div>
+                    <strong>{apiKeyEditorMode === "edit" ? t("settings.apiKeysEdit") : t("settings.apiKeysCreate")}</strong>
+                    <p>{t("settings.apiKeysHelp")}</p>
+                  </div>
+                  <button className="drawer-close" type="button" aria-label={t("action.close")} onClick={closeApiKeyEditor}><X size={16} /></button>
+                </div>
+                <label>
+                  <span>{t("settings.apiKeysName")}</span>
+                  <input name="api-key-name" value={apiKeyForm.name} onChange={(event) => setApiKeyForm((current) => ({ ...current, name: event.target.value }))} placeholder={t("settings.apiKeysNamePlaceholder")} required />
+                </label>
+                <div className="api-keys-preset-row">
+                  {apiKeyPresets.map((preset) => (
+                    <button key={preset.id} className="ghost-button" type="button" onClick={() => applyApiKeyPreset(preset)}>{apiKeyPresetLabel(preset)}</button>
+                  ))}
+                </div>
+                <div className="api-keys-groups">
+                  {apiKeyGroups.map((group) => (
+                    <div className="api-key-group" key={group.id}>
+                      <strong>{apiKeyGroupLabel(group.id)}</strong>
+                      <span className="subtle">{apiKeyPermissionGroupDescription(group)}</span>
+                      <div className="api-key-group-options">
+                        {group.permissions.map((permission) => (
+                          <label className="checkbox-row" key={permission.id} title={apiKeyPermissionGroupTitle(permission)}>
+                            <input name={`api-key-permission-${permission.id}`} type="checkbox" checked={apiKeyForm.permissions.includes(permission.id)} onChange={() => toggleApiKeyPermission(permission.id)} />
+                            <span>{apiKeyPermissionGroupLabel(permission)}</span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                {createdApiKey?.key && apiKeyEditorMode === "create" && (
+                  <div className="api-key-secret-card">
+                    <span>{t("settings.apiKeysCreatedHint")}</span>
+                    <div className="secret-row">
+                      <code className="secret-box">{createdApiKey.key}</code>
+                      <button className="ghost-button" type="button" onClick={() => void copyCreatedApiKey()}>{t("action.copy")}</button>
+                    </div>
+                  </div>
+                )}
+                <div className="dialog-actions">
+                  <button className="ghost-button" type="button" onClick={closeApiKeyEditor}>{createdApiKey?.key && apiKeyEditorMode === "create" ? t("action.close") : t("action.cancel")}</button>
+                  <button className="ghost-button" type="submit" disabled={busy === "api-key-create" || busy === "api-key-update"}>
+                    <IconText icon={apiKeyEditorMode === "edit" ? Save : Plus}>{apiKeyEditorMode === "edit" ? t("action.saveChanges") : t("settings.apiKeysCreate")}</IconText>
+                  </button>
+                </div>
+              </form>
+            </div>
+          )}
+          </section>
+          <section className="provider-card">
           <strong>{t("settings.logoutTitle")}</strong>
           <span>{t("settings.logoutHelp")}</span>
           <div className="settings-actions">
@@ -14854,6 +15469,7 @@ function SettingsPage({
                     <span>{t("settings.environmentToolName")}</span>
                     <div className="environment-tool-picker">
                       <input
+                        name="environment-tool"
                         className="search-input"
                         value={environmentToolQuery || environmentInstallForm.tool}
                         onFocus={() => {
@@ -14907,6 +15523,7 @@ function SettingsPage({
                     <span>{t("settings.environmentToolVersion")}</span>
                     <div className="environment-tool-picker">
                       <input
+                        name="environment-version"
                         className="search-input"
                         value={environmentInstallForm.version}
                         onFocus={() => {
@@ -14980,7 +15597,7 @@ function SettingsPage({
                   </label>
                   <label>
                     <span>{t("settings.environmentScope")}</span>
-                    <select className="search-input" value={environmentInstallForm.scope} onChange={(event) => setEnvironmentInstallForm((current) => ({ ...current, scope: event.target.value }))}>
+                    <select name="environment-scope" className="search-input" value={environmentInstallForm.scope} onChange={(event) => setEnvironmentInstallForm((current) => ({ ...current, scope: event.target.value }))}>
                       <option value="global">{t("settings.environmentScopeGlobal")}</option>
                       <option value="workspace">{t("settings.environmentScopeWorkspace")}</option>
                       <option value="room">{t("settings.environmentScopeRoom")}</option>
@@ -14989,7 +15606,7 @@ function SettingsPage({
                   </label>
                   <label>
                     <span>{t("settings.environmentNotes")}</span>
-                    <input className="search-input" value={environmentInstallForm.notes} onChange={(event) => setEnvironmentInstallForm((current) => ({ ...current, notes: event.target.value }))} placeholder={t("settings.environmentNotesPlaceholder")} />
+                    <input name="environment-notes" className="search-input" value={environmentInstallForm.notes} onChange={(event) => setEnvironmentInstallForm((current) => ({ ...current, notes: event.target.value }))} placeholder={t("settings.environmentNotesPlaceholder")} />
                   </label>
                 </div>
                 {environmentProbe?.tool === environmentInstallForm.tool && (
@@ -15005,7 +15622,7 @@ function SettingsPage({
                   </div>
                 )}
                 <label className="checkbox-row environment-inline-toggle">
-                  <input type="checkbox" checked={environmentInstallForm.autoRestore} onChange={(event) => setEnvironmentInstallForm((current) => ({ ...current, autoRestore: event.target.checked }))} />
+                  <input name="environment-auto-restore" type="checkbox" checked={environmentInstallForm.autoRestore} onChange={(event) => setEnvironmentInstallForm((current) => ({ ...current, autoRestore: event.target.checked }))} />
                   <span>{t("settings.environmentAutoRestore")}</span>
                 </label>
                 <div className="settings-actions environment-actions">
@@ -15025,9 +15642,29 @@ function SettingsPage({
                       <strong>{t("settings.environmentReconcileTitle")}</strong>
                       <span>{t("settings.environmentReconcileHelp")}</span>
                     </div>
-                    <span className="pill">{environmentReconcileItems.length}</span>
+                    <div className="provider-card-actions">
+                      <span className="pill">{environmentReconcileItems.length}</span>
+                      <button
+                        className="ghost-button"
+                        type="button"
+                        disabled={busy === "environment-scan" || environmentRestoreBusy || (!environmentMissingToolCount && !environmentMissingPackageCount)}
+                        onClick={() => void restoreMissingEnvironment("auto")}
+                      >
+                        <IconText icon={RotateCcw}>{environmentRestoreBusy ? t("settings.environmentRestoringMissing") : t("settings.environmentRestoreMissing")}</IconText>
+                      </button>
+                    </div>
                   </div>
                   {!environmentReconcileItems.length && <div className="empty-state">{t("settings.environmentEmptyReconcile")}</div>}
+                  {Boolean(environmentMissingToolCount || environmentMissingPackageCount) && (
+                    <div className="environment-reconcile-banner">
+                      <span>{t("settings.environmentRestoreMissingHint").replace("{tools}", String(environmentMissingToolCount)).replace("{packages}", String(environmentMissingPackageCount))}</span>
+                    </div>
+                  )}
+                  {environmentRestoreBusy && (
+                    <div className="environment-reconcile-banner running">
+                      <span>{t("settings.environmentRestoreRunningHint")}</span>
+                    </div>
+                  )}
                   {Boolean(environmentReconcileItems.length) && (
                     <div className="environment-list">
                       {environmentReconcileItems.map((item) => (
@@ -15800,7 +16437,7 @@ function SettingsPage({
             <strong>{t("settings.restoreTitle")}</strong>
             <span>{t("settings.restoreHelp")}</span>
             <div className="restore-file-picker">
-              <input ref={restoreFileInputRef} className="restore-file-native" type="file" accept=".zip,application/zip" onChange={(event) => {
+              <input ref={restoreFileInputRef} name="restore-backup-file" className="restore-file-native" type="file" accept=".zip,application/zip" onChange={(event) => {
                 const file = event.target.files?.[0];
                 if (file) void previewRestoreBackup(file);
               }} />
@@ -15945,7 +16582,7 @@ function SettingsPage({
             <form className="environment-package-form" onSubmit={installEnvironmentPackage}>
               <label>
                 <span>{t("settings.environmentPackageManager")}</span>
-                <select value={environmentPackageForm.manager} onChange={(event) => {
+                <select name="environment-package-manager" value={environmentPackageForm.manager} onChange={(event) => {
                   const manager = event.target.value;
                   setEnvironmentPackageForm((current) => ({ ...current, manager }));
                   setEnvironmentPackageProbe(environmentPackagePanel.packages.some((pkg) => pkg.packageName.toLowerCase() === environmentPackageForm.packageName.trim().toLowerCase() && pkg.manager === manager)
@@ -15970,7 +16607,7 @@ function SettingsPage({
               <div className="environment-package-name-row">
                 <label>
                   <span>{t("settings.environmentPackageName")}</span>
-                  <input value={environmentPackageForm.packageName} onChange={(event) => {
+                  <input name="environment-package-name" value={environmentPackageForm.packageName} onChange={(event) => {
                     const value = event.target.value;
                     setEnvironmentPackageForm((current) => ({ ...current, packageName: value }));
                     setEnvironmentPackageProbe(environmentPackagePanel.packages.some((pkg) => pkg.packageName.toLowerCase() === value.trim().toLowerCase() && pkg.manager === environmentPackageForm.manager)
@@ -15996,11 +16633,11 @@ function SettingsPage({
               )}
               <label>
                 <span>{t("settings.environmentPackageVersion")}</span>
-                <input value={environmentPackageForm.versionSpec} onChange={(event) => setEnvironmentPackageForm((current) => ({ ...current, versionSpec: event.target.value }))} placeholder={t("settings.environmentPackageVersionPlaceholder")} />
+                <input name="environment-package-version" value={environmentPackageForm.versionSpec} onChange={(event) => setEnvironmentPackageForm((current) => ({ ...current, versionSpec: event.target.value }))} placeholder={t("settings.environmentPackageVersionPlaceholder")} />
               </label>
               <label>
                 <span>{t("settings.environmentNotes")}</span>
-                <input value={environmentPackageForm.notes} onChange={(event) => setEnvironmentPackageForm((current) => ({ ...current, notes: event.target.value }))} placeholder={t("settings.environmentNotesPlaceholder")} />
+                <input name="environment-package-notes" value={environmentPackageForm.notes} onChange={(event) => setEnvironmentPackageForm((current) => ({ ...current, notes: event.target.value }))} placeholder={t("settings.environmentNotesPlaceholder")} />
               </label>
               <div className="dialog-actions">
                 <button className="ghost-button" type="submit" disabled={busy === "environment-package-install" || !environmentPackageForm.manager}><IconText icon={Plus}>{environmentPackageProbe?.installed ? t("settings.environmentPackageRecord") : t("settings.environmentPackageInstall")}</IconText></button>

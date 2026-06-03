@@ -7,6 +7,8 @@ import type {
 } from "@codex-web/protocol";
 
 type PackageInspectResult = { installed: boolean; version: string | null };
+type PackageCommandSpec = { command: string; args: string[]; text: string };
+type ResolvedCommand = { command: string; argsPrefix: string[]; textPrefix: string };
 
 type PackageHandler = {
   managerId: string;
@@ -48,7 +50,8 @@ function packageListScanner(
 }
 
 function installedPackageLines(command: string, args: string[]) {
-  const result = spawnSync(command === "mise" ? resolveMiseCommand() : command, args, { encoding: "utf8" });
+  const resolved = resolveCommandInvocation(command, args);
+  const result = spawnSync(resolved.command, resolved.args, { encoding: "utf8" });
   return result.status === 0 ? result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) : [];
 }
 
@@ -76,6 +79,124 @@ function resolveMiseCommand() {
   return "mise";
 }
 
+function firstSuccessfulCommand(candidates: ResolvedCommand[], probeArgs: string[]) {
+  for (const candidate of candidates) {
+    try {
+      const result = spawnSync(candidate.command, [...candidate.argsPrefix, ...probeArgs], { encoding: "utf8" });
+      if (result.status === 0) return candidate;
+    } catch {}
+  }
+  return null;
+}
+
+function resolvePipCommand() {
+  const miseCommand = resolveMiseCommand();
+  return firstSuccessfulCommand([
+    { command: "python3", argsPrefix: ["-m", "pip"], textPrefix: "python3 -m pip" },
+    { command: "python", argsPrefix: ["-m", "pip"], textPrefix: "python -m pip" },
+    { command: miseCommand, argsPrefix: ["exec", "--", "python3", "-m", "pip"], textPrefix: "mise exec -- python3 -m pip" },
+  ], ["--version"]);
+}
+
+function resolveToolCommand(command: string) {
+  const miseCommand = resolveMiseCommand();
+  return firstSuccessfulCommand([
+    { command, argsPrefix: [], textPrefix: command },
+    { command: miseCommand, argsPrefix: ["exec", "--", command], textPrefix: `mise exec -- ${command}` },
+  ], ["--version"]);
+}
+
+function resolveCommandInvocation(command: string, args: string[]): { command: string; args: string[]; textPrefix: string } {
+  if (command === "mise" && args[0] === "exec" && args[1] === "--" && args[2]) {
+    const tool = args[2];
+    const resolved = resolveToolCommand(tool);
+    if (resolved) return { command: resolved.command, args: [...resolved.argsPrefix, ...args.slice(3)], textPrefix: resolved.textPrefix };
+  }
+  const resolvedCommand = command === "mise" ? resolveMiseCommand() : command;
+  return { command: resolvedCommand, args, textPrefix: command };
+}
+
+function packageCommandSpec(manager: string, args: string[] | null): PackageCommandSpec | null {
+  if (!args) return null;
+  const resolved = resolveCommandInvocation("mise", args);
+  return { command: resolved.command, args: resolved.args, text: `${resolved.textPrefix} ${resolved.args.join(" ")}` };
+}
+
+function detectedPackageInstallCommandText(manager: string, packageName: string, versionSpec?: string | null) {
+  const spec = versionSpec?.trim() ? `${packageName}@${versionSpec.trim()}` : packageName;
+  if (manager === "pip") return `python3 -m pip install ${spec}`;
+  if (manager === "uv") return `uv tool install ${spec}`;
+  if (manager === "pnpm") return `pnpm add -g ${spec}`;
+  if (manager === "npm") return `npm install -g ${spec}`;
+  if (manager === "bun") return `bun add -g ${spec}`;
+  if (manager === "go-install") return `go install ${versionSpec?.trim() ? spec : `${packageName}@latest`}`;
+  if (manager === "cargo") return `cargo install ${packageName}`;
+  if (manager === "gem") return `gem install ${spec}`;
+  if (manager === "composer") return `composer global require ${spec}`;
+  const args = packageInstallCommandArgs(manager, packageName, versionSpec);
+  return args ? `mise ${args.join(" ")}` : `mise exec -- ${manager} install ${packageName}`;
+}
+
+function detectedPackageUninstallCommandText(manager: string, packageName: string) {
+  if (manager === "pip") return `python3 -m pip uninstall -y ${packageName}`;
+  if (manager === "uv") return `uv tool uninstall ${packageName}`;
+  if (manager === "pnpm") return `pnpm remove -g ${packageName}`;
+  if (manager === "npm") return `npm uninstall -g ${packageName}`;
+  if (manager === "bun") return `bun remove -g ${packageName}`;
+  if (manager === "cargo") return `cargo uninstall ${packageName}`;
+  if (manager === "gem") return `gem uninstall ${packageName} -a -x -I`;
+  if (manager === "composer") return `composer global remove ${packageName}`;
+  if (manager === "go-install") return `Remove ${packageName} from GOPATH/bin manually`;
+  if (manager === "shards") return "Manual cleanup required";
+  const args = packageUninstallCommandArgs(manager, packageName);
+  return args ? `mise ${args.join(" ")}` : null;
+}
+
+function parseJsonArrayFromCommandOutput<T>(output: string): T[] {
+  const parsed = parseJsonValueFromCommandOutput(output, "[", "]");
+  return Array.isArray(parsed) ? parsed as T[] : [];
+}
+
+function parseJsonObjectFromCommandOutput<T extends object>(output: string): T | null {
+  const parsed = parseJsonValueFromCommandOutput(output, "{", "}");
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as T : null;
+}
+
+function parseJsonValueFromCommandOutput(output: string, open: "[" | "{", close: "]" | "}") {
+  const trimmed = output.trim();
+  for (let start = trimmed.indexOf(open); start >= 0; start = trimmed.indexOf(open, start + 1)) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < trimmed.length; index += 1) {
+      const char = trimmed[index];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (char === "\\") {
+          escaped = true;
+        } else if (char === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+      if (char === "\"") {
+        inString = true;
+        continue;
+      }
+      if (char === open) depth += 1;
+      if (char === close) depth -= 1;
+      if (depth === 0) {
+        try {
+          return JSON.parse(trimmed.slice(start, index + 1)) as unknown;
+        } catch {}
+        break;
+      }
+    }
+  }
+  return null;
+}
+
 export function packageInstallCommandArgs(manager: string, packageName: string, versionSpec?: string | null) {
   const spec = versionSpec?.trim() ? `${packageName}@${versionSpec.trim()}` : packageName;
   if (manager === "uv") return ["exec", "--", "uv", "tool", "install", spec];
@@ -90,6 +211,29 @@ export function packageInstallCommandArgs(manager: string, packageName: string, 
   return null;
 }
 
+export function packageInstallCommandSpec(manager: string, packageName: string, versionSpec?: string | null): PackageCommandSpec | null {
+  const spec = versionSpec?.trim() ? `${packageName}@${versionSpec.trim()}` : packageName;
+  if (manager === "pip") {
+    const resolved = resolvePipCommand();
+    if (!resolved) return null;
+    const args = [...resolved.argsPrefix, "install", spec];
+    return { command: resolved.command, args, text: `${resolved.textPrefix} install ${spec}` };
+  }
+  if (manager === "pnpm") {
+    const resolved = resolveToolCommand("pnpm");
+    if (!resolved) return null;
+    const args = [...resolved.argsPrefix, "add", "-g", spec];
+    return { command: resolved.command, args, text: `${resolved.textPrefix} add -g ${spec}` };
+  }
+  if (manager === "npm") {
+    const resolved = resolveToolCommand("npm");
+    if (!resolved) return null;
+    const args = [...resolved.argsPrefix, "install", "-g", spec];
+    return { command: resolved.command, args, text: `${resolved.textPrefix} install -g ${spec}` };
+  }
+  return packageCommandSpec(manager, packageInstallCommandArgs(manager, packageName, versionSpec));
+}
+
 export function packageUninstallCommandArgs(manager: string, packageName: string) {
   if (manager === "uv") return ["exec", "--", "uv", "tool", "uninstall", packageName];
   if (manager === "pip") return ["exec", "--", "python3", "-m", "pip", "uninstall", "-y", packageName];
@@ -102,11 +246,32 @@ export function packageUninstallCommandArgs(manager: string, packageName: string
   return null;
 }
 
+export function packageUninstallCommandSpec(manager: string, packageName: string): PackageCommandSpec | null {
+  if (manager === "pip") {
+    const resolved = resolvePipCommand();
+    if (!resolved) return null;
+    const args = [...resolved.argsPrefix, "uninstall", "-y", packageName];
+    return { command: resolved.command, args, text: `${resolved.textPrefix} uninstall -y ${packageName}` };
+  }
+  if (manager === "pnpm") {
+    const resolved = resolveToolCommand("pnpm");
+    if (!resolved) return null;
+    const args = [...resolved.argsPrefix, "remove", "-g", packageName];
+    return { command: resolved.command, args, text: `${resolved.textPrefix} remove -g ${packageName}` };
+  }
+  if (manager === "npm") {
+    const resolved = resolveToolCommand("npm");
+    if (!resolved) return null;
+    const args = [...resolved.argsPrefix, "uninstall", "-g", packageName];
+    return { command: resolved.command, args, text: `${resolved.textPrefix} uninstall -g ${packageName}` };
+  }
+  return packageCommandSpec(manager, packageUninstallCommandArgs(manager, packageName));
+}
+
 export function packageUninstallCommandText(manager: string, packageName: string) {
   if (manager === "go-install") return `Remove ${packageName} from GOPATH/bin manually`;
   if (manager === "shards") return "Manual cleanup required";
-  const args = packageUninstallCommandArgs(manager, packageName);
-  return args ? `mise ${args.join(" ")}` : null;
+  return packageUninstallCommandSpec(manager, packageName)?.text ?? null;
 }
 
 function detectedEnvironmentPackageRecord(
@@ -116,8 +281,8 @@ function detectedEnvironmentPackageRecord(
   installedVersion: string | null,
   versionSpec: string | null = installedVersion,
   commandPackageName = packageName,
+  commands?: { installCommand?: string | null; uninstallCommand?: string | null },
 ) {
-  const commandArgs = packageInstallCommandArgs(manager, commandPackageName, null) ?? ["exec", "--", manager, "install", commandPackageName];
   return {
     id: `detected-${toolRecord.id}-${manager}-${packageName}`,
     toolRecordId: toolRecord.id,
@@ -128,8 +293,8 @@ function detectedEnvironmentPackageRecord(
     packageName,
     installedVersion,
     versionSpec,
-    installCommand: `mise ${commandArgs.join(" ")}`,
-    uninstallCommand: packageUninstallCommandText(manager, packageName),
+    installCommand: commands?.installCommand ?? detectedPackageInstallCommandText(manager, commandPackageName, null),
+    uninstallCommand: commands?.uninstallCommand ?? detectedPackageUninstallCommandText(manager, packageName),
     targetLabel: `${toolRecord.tool}@${toolRecord.requestedVersion}`,
     scope: "global" as const,
     autoRestore: true,
@@ -153,19 +318,31 @@ export function createEnvironmentPackageRegistry(commandVersion: (command: strin
           label: "pip",
           installExample: "python3 -m pip install <package>",
           uninstallExample: "python3 -m pip uninstall <package>",
-          version: () => commandVersion("python3", ["-m", "pip", "--version"]) ?? commandVersion("python", ["-m", "pip", "--version"]),
+          version: () => {
+            const resolved = resolvePipCommand();
+            if (!resolved) return null;
+            const result = spawnSync(resolved.command, [...resolved.argsPrefix, "--version"], { encoding: "utf8" });
+            return result.status === 0 ? [result.stdout, result.stderr].join("\n").trim().split(/\r?\n/)[0] || "installed" : null;
+          },
           inspect: (pkg) => {
-            const result = spawnSync(resolveMiseCommand(), ["exec", "--", "python3", "-m", "pip", "show", pkg], { encoding: "utf8" });
+            const resolved = resolvePipCommand();
+            if (!resolved) return { installed: false, version: null };
+            const result = spawnSync(resolved.command, [...resolved.argsPrefix, "show", pkg], { encoding: "utf8" });
             if (result.status !== 0) return { installed: false, version: null };
             const version = result.stdout.split(/\r?\n/).find((line) => line.startsWith("Version:"))?.replace("Version:", "").trim() ?? null;
             return { installed: Boolean(version), version };
           },
           scan: (toolRecord) => {
-            const result = spawnSync(resolveMiseCommand(), ["exec", "--", "python3", "-m", "pip", "list", "--format", "json"], { encoding: "utf8" });
+            const resolved = resolvePipCommand();
+            if (!resolved) return [];
+            const result = spawnSync(resolved.command, [...resolved.argsPrefix, "list", "--format", "json"], { encoding: "utf8" });
             const output = [result.stdout, result.stderr].join("\n").trim();
             if (result.status !== 0 || !output) return [];
-            const parsed = JSON.parse(output) as Array<{ name: string; version?: string }>;
-            return parsed.map((item) => detectedEnvironmentPackageRecord(toolRecord, "pip", item.name, item.version ?? null));
+            const parsed = parseJsonArrayFromCommandOutput<{ name: string; version?: string }>(output);
+            return parsed.map((item) => detectedEnvironmentPackageRecord(toolRecord, "pip", item.name, item.version ?? null, item.version ?? null, item.name, {
+              installCommand: `${resolved.textPrefix} install ${item.name}`,
+              uninstallCommand: `${resolved.textPrefix} uninstall -y ${item.name}`,
+            }));
           },
         },
         {
@@ -187,18 +364,22 @@ export function createEnvironmentPackageRegistry(commandVersion: (command: strin
           uninstallExample: "pnpm remove -g <package>",
           version: () => commandVersion("pnpm", ["--version"]),
           inspect: (pkg) => {
-            const result = spawnSync(resolveMiseCommand(), ["exec", "--", "pnpm", "list", "-g", pkg, "--depth", "0", "--json"], { encoding: "utf8" });
+            const resolved = resolveToolCommand("pnpm");
+            if (!resolved) return { installed: false, version: null };
+            const result = spawnSync(resolved.command, [...resolved.argsPrefix, "list", "-g", pkg, "--depth", "0", "--json"], { encoding: "utf8" });
             const output = [result.stdout, result.stderr].join("\n").trim();
             if (result.status !== 0 || !output) return { installed: false, version: null };
-            const parsed = JSON.parse(output) as Array<{ dependencies?: Record<string, { version?: string }> }>;
+            const parsed = parseJsonArrayFromCommandOutput<{ dependencies?: Record<string, { version?: string }> }>(output);
             const version = parsed[0]?.dependencies?.[pkg]?.version ?? null;
             return { installed: Boolean(version), version };
           },
           scan: (toolRecord) => {
-            const result = spawnSync(resolveMiseCommand(), ["exec", "--", "pnpm", "list", "-g", "--depth", "0", "--json"], { encoding: "utf8" });
+            const resolved = resolveToolCommand("pnpm");
+            if (!resolved) return [];
+            const result = spawnSync(resolved.command, [...resolved.argsPrefix, "list", "-g", "--depth", "0", "--json"], { encoding: "utf8" });
             const output = [result.stdout, result.stderr].join("\n").trim();
             if (result.status !== 0 || !output) return [];
-            const parsed = JSON.parse(output) as Array<{ dependencies?: Record<string, { version?: string }> }>;
+            const parsed = parseJsonArrayFromCommandOutput<{ dependencies?: Record<string, { version?: string }> }>(output);
             return Object.entries(parsed[0]?.dependencies ?? {}).map(([packageName, value]) => detectedEnvironmentPackageRecord(toolRecord, "pnpm", packageName, value.version ?? null));
           },
         },
@@ -209,12 +390,23 @@ export function createEnvironmentPackageRegistry(commandVersion: (command: strin
           uninstallExample: "npm uninstall -g <package>",
           version: () => commandVersion("npm", ["--version"]),
           inspect: (pkg) => {
-            const result = spawnSync(resolveMiseCommand(), ["exec", "--", "npm", "list", "-g", pkg, "--depth", "0", "--json"], { encoding: "utf8" });
+            const resolved = resolveToolCommand("npm");
+            if (!resolved) return { installed: false, version: null };
+            const result = spawnSync(resolved.command, [...resolved.argsPrefix, "list", "-g", pkg, "--depth", "0", "--json"], { encoding: "utf8" });
             const output = [result.stdout, result.stderr].join("\n").trim();
             if (!output) return { installed: false, version: null };
-            const parsed = JSON.parse(output) as { dependencies?: Record<string, { version?: string }> };
-            const version = parsed.dependencies?.[pkg]?.version ?? null;
+            const parsed = parseJsonObjectFromCommandOutput<{ dependencies?: Record<string, { version?: string }> }>(output);
+            const version = parsed?.dependencies?.[pkg]?.version ?? null;
             return { installed: Boolean(version), version };
+          },
+          scan: (toolRecord) => {
+            const resolved = resolveToolCommand("npm");
+            if (!resolved) return [];
+            const result = spawnSync(resolved.command, [...resolved.argsPrefix, "list", "-g", "--depth", "0", "--json"], { encoding: "utf8" });
+            const output = [result.stdout, result.stderr].join("\n").trim();
+            if (!output) return [];
+            const parsed = parseJsonObjectFromCommandOutput<{ dependencies?: Record<string, { version?: string }> }>(output);
+            return Object.entries(parsed?.dependencies ?? {}).map(([packageName, value]) => detectedEnvironmentPackageRecord(toolRecord, "npm", packageName, value.version ?? null));
           },
         },
       ],
@@ -292,7 +484,9 @@ export function createEnvironmentPackageRegistry(commandVersion: (command: strin
         uninstallExample: "deno uninstall <package>",
         version: () => commandVersion("deno", ["--version"]),
         inspect: () => {
-          const result = spawnSync(resolveMiseCommand(), ["exec", "--", "deno", "uninstall", "--help"], { encoding: "utf8" });
+          const resolved = resolveToolCommand("deno");
+          if (!resolved) return { installed: false, version: null };
+          const result = spawnSync(resolved.command, [...resolved.argsPrefix, "uninstall", "--help"], { encoding: "utf8" });
           return { installed: result.status === 0, version: null };
         },
       }],

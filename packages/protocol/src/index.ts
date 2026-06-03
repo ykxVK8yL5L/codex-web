@@ -278,6 +278,92 @@ export interface ConfirmOtpResetRequest {
   otp: string;
 }
 
+export type ApiKeyPermission =
+  | "auth.read"
+  | "auth.manage"
+  | "sessions.read"
+  | "sessions.manage"
+  | "sessions.run"
+  | "rooms.read"
+  | "rooms.manage"
+  | "rooms.run"
+  | "agents.read"
+  | "agents.manage"
+  | "automations.read"
+  | "automations.manage"
+  | "automations.run"
+  | "goals.read"
+  | "goals.manage"
+  | "goals.run"
+  | "projects.read"
+  | "projects.manage"
+  | "projects.git"
+  | "previews.read"
+  | "previews.manage"
+  | "files.read"
+  | "files.write"
+  | "terminal.exec"
+  | "providers.read"
+  | "providers.manage"
+  | "extensions.read"
+  | "extensions.manage"
+  | "extensions.install"
+  | "environment.read"
+  | "environment.manage"
+  | "environment.restore"
+  | "notifications.read"
+  | "notifications.manage"
+  | "approvals.read"
+  | "approvals.decide"
+  | "settings.read"
+  | "settings.manage"
+  | "storage.read"
+  | "storage.manage"
+  | "backup.read"
+  | "backup.restore";
+
+export interface ApiKeySummary {
+  id: string;
+  name: string;
+  permissions: ApiKeyPermission[];
+  keyPreview: string;
+  lastUsedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  revokedAt?: string | null;
+}
+
+export interface ApiKeyDetailResponse extends ApiKeySummary {
+  key?: string | null;
+}
+
+export interface ApiKeyPermissionGroup {
+  id: string;
+  label: string;
+  permissions: Array<{ id: ApiKeyPermission; label: string }>;
+}
+
+export interface ApiKeyPreset {
+  id: string;
+  label: string;
+  permissions: ApiKeyPermission[];
+}
+
+export interface ApiKeyPermissionsResponse {
+  groups: ApiKeyPermissionGroup[];
+  presets: ApiKeyPreset[];
+}
+
+export interface CreateApiKeyRequest {
+  name: string;
+  permissions: ApiKeyPermission[];
+}
+
+export interface UpdateApiKeyRequest {
+  name: string;
+  permissions: ApiKeyPermission[];
+}
+
 export type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 export type CodexApprovalPolicy = "untrusted" | "on-failure" | "on-request" | "never";
 
@@ -479,6 +565,18 @@ export interface EnvironmentPackageDetailResponse {
   packages: EnvironmentPackageRecord[];
   managers: EnvironmentPackageManagerOption[];
   restorePreview: EnvironmentRestorePreviewItem[];
+}
+
+export interface EnvironmentRestoreMissingRequest {
+  mode?: "all" | "auto";
+  includeTools?: boolean;
+  includePackages?: boolean;
+}
+
+export interface EnvironmentRestorePreviewResponse {
+  items: EnvironmentRestorePreviewItem[];
+  tools: number;
+  packages: number;
 }
 
 export interface InstallEnvironmentPackageRequest {
@@ -1323,6 +1421,10 @@ export interface MarketplaceCatalogResponse {
 export interface ImportMarketplaceCatalogRequest {
   url?: string;
   content?: string;
+}
+
+export interface DeleteMarketplaceItemsRequest {
+  ids: string[];
 }
 
 export interface InstallMarketplaceItemRequest {

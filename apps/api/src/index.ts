@@ -3,7 +3,7 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { fork, spawn as spawnProcess, spawnSync, type ChildProcess } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import { basename, delimiter, dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,6 +32,12 @@ import type {
   AppNotificationSummary,
   AppNotificationStreamEvent,
   AppNotificationsResponse,
+  ApiKeyDetailResponse,
+  ApiKeyPermission,
+  ApiKeyPermissionGroup,
+  ApiKeyPermissionsResponse,
+  ApiKeyPreset,
+  ApiKeySummary,
   ArchiveIgnoreTemplate,
   AuthState,
   AutomationRunSummary,
@@ -45,6 +51,8 @@ import type {
   ConversationType,
   CreateCodexTaskRequest,
   CreateAutomationRequest,
+  CreateApiKeyRequest,
+  UpdateApiKeyRequest,
   CreateAgentGroupRequest,
   CreateAgentCircleRequest,
   CreateAgentRequest,
@@ -67,6 +75,7 @@ import type {
   ImportMcpServerRequest,
   ImportMcpServerResponse,
   ImportMarketplaceCatalogRequest,
+  DeleteMarketplaceItemsRequest,
   InstallMarketplaceItemRequest,
   InstallMarketplaceItemResponse,
   MarketplaceCatalog,
@@ -90,6 +99,8 @@ import type {
   EnvironmentBulkActionRequest,
   EnvironmentProjectUsage,
   EnvironmentReconcileItem,
+  EnvironmentRestoreMissingRequest,
+  EnvironmentRestorePreviewResponse,
   EnvironmentRestoreRun,
   EnvironmentRestorePreviewItem,
   EnvironmentToolRecord,
@@ -253,8 +264,8 @@ import { createRuntimeSettingsStore } from "./runtime-settings.js";
 import { decodeOffsetCursor, decodePageCursor, offsetPageFromRows, pageFromRows, parsePageLimit } from "./pagination.js";
 import {
   createEnvironmentPackageRegistry,
-  packageInstallCommandArgs,
-  packageUninstallCommandArgs,
+  packageInstallCommandSpec,
+  packageUninstallCommandSpec,
   packageUninstallCommandText,
 } from "./environment-packages.js";
 
@@ -334,7 +345,6 @@ const {
   hashToken,
   parseCookieHeader,
   providerProxyToken,
-  requireAuth,
   signPreviewAccessToken,
   signSessionToken,
   verifyOtp,
@@ -396,6 +406,9 @@ const appNotificationSubscribers = new Set<(event: AppNotificationStreamEvent) =
 const telegramPollingOffsets = new Map<string, number>();
 const telegramPollingBusy = new Set<string>();
 const telegramPendingSends = new Map<string, { message: string; sessionIds: string[]; createdAt: number }>();
+const telegramQueuedReplyTargets = new Map<string, Array<{ accountId: string; chatId: string; createdAt: number }>>();
+const telegramActiveReplyTargets = new Map<string, Array<{ accountId: string; chatId: string; createdAt: number }>>();
+const telegramOutboundQueues = new Map<string, Promise<void>>();
 const telegramPendingSelections = new Map<string, { ids: string[]; createdAt: number }>();
 const telegramPendingFileRoots = new Map<string, { roots: Array<{ label: string; root: string }>; createdAt: number }>();
 const telegramPendingFiles = new Map<string, { root: string; relPath: string; dirNames: string[]; createdAt: number }>();
@@ -416,6 +429,18 @@ function openDatabase() {
       otp_secret text not null,
       updated_at text not null
     );
+    create table if not exists api_keys (
+      id text primary key,
+      name text not null,
+      key_hash text not null,
+      key_preview text not null,
+      permissions text not null,
+      last_used_at text,
+      revoked_at text,
+      created_at text not null,
+      updated_at text not null
+    );
+    create unique index if not exists api_keys_key_hash_idx on api_keys(key_hash);
     create table if not exists app_settings (
       key text primary key,
       value text not null,
@@ -1395,6 +1420,203 @@ function saveAuthConfig(config: AuthConfig) {
   `).run(config.accessTokenHash, config.otpSecret, new Date().toISOString());
 }
 
+type ApiKeyRecord = {
+  id: string;
+  name: string;
+  keyHash: string;
+  keyPreview: string;
+  permissions: ApiKeyPermission[];
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type AuthPrincipal =
+  | { type: "session"; userId: string }
+  | { type: "api_key"; key: ApiKeyRecord };
+
+const apiKeyPermissionGroups: ApiKeyPermissionGroup[] = [
+  { id: "sessions", label: "Sessions", permissions: [{ id: "sessions.read", label: "Read" }, { id: "sessions.manage", label: "Manage" }, { id: "sessions.run", label: "Run" }] },
+  { id: "rooms", label: "Rooms", permissions: [{ id: "rooms.read", label: "Read" }, { id: "rooms.manage", label: "Manage" }, { id: "rooms.run", label: "Run" }] },
+  { id: "agents", label: "Agents", permissions: [{ id: "agents.read", label: "Read" }, { id: "agents.manage", label: "Manage" }] },
+  { id: "automations", label: "Automations", permissions: [{ id: "automations.read", label: "Read" }, { id: "automations.manage", label: "Manage" }, { id: "automations.run", label: "Run" }] },
+  { id: "goals", label: "Goals", permissions: [{ id: "goals.read", label: "Read" }, { id: "goals.manage", label: "Manage" }, { id: "goals.run", label: "Run" }] },
+  { id: "projects", label: "Projects", permissions: [{ id: "projects.read", label: "Read" }, { id: "projects.manage", label: "Manage" }, { id: "projects.git", label: "Git actions" }] },
+  { id: "previews", label: "Previews", permissions: [{ id: "previews.read", label: "Read" }, { id: "previews.manage", label: "Manage" }] },
+  { id: "files", label: "Files", permissions: [{ id: "files.read", label: "Read" }, { id: "files.write", label: "Write" }] },
+  { id: "terminal", label: "Terminal", permissions: [{ id: "terminal.exec", label: "Execute" }] },
+  { id: "providers", label: "Providers", permissions: [{ id: "providers.read", label: "Read" }, { id: "providers.manage", label: "Manage" }] },
+  { id: "extensions", label: "Extensions", permissions: [{ id: "extensions.read", label: "Read" }, { id: "extensions.manage", label: "Manage" }, { id: "extensions.install", label: "Install" }] },
+  { id: "environment", label: "Environment", permissions: [{ id: "environment.read", label: "Read" }, { id: "environment.manage", label: "Manage" }, { id: "environment.restore", label: "Restore" }] },
+  { id: "notifications", label: "Notifications", permissions: [{ id: "notifications.read", label: "Read" }, { id: "notifications.manage", label: "Manage" }] },
+  { id: "approvals", label: "Approvals", permissions: [{ id: "approvals.read", label: "Read" }, { id: "approvals.decide", label: "Decide" }] },
+  { id: "settings", label: "Settings", permissions: [{ id: "settings.read", label: "Read" }, { id: "settings.manage", label: "Manage" }] },
+  { id: "storage", label: "Storage", permissions: [{ id: "storage.read", label: "Read" }, { id: "storage.manage", label: "Manage" }] },
+  { id: "backup", label: "Backup", permissions: [{ id: "backup.read", label: "Read" }, { id: "backup.restore", label: "Restore" }] },
+];
+
+const apiKeyPresets: ApiKeyPreset[] = [
+  { id: "read-only", label: "Read only", permissions: apiKeyPermissionGroups.flatMap((group) => group.permissions.map((item) => item.id)).filter((id) => id.endsWith(".read")) },
+  { id: "automation-runner", label: "Automation runner", permissions: ["automations.read", "automations.run", "sessions.read", "sessions.run", "rooms.read", "rooms.run", "goals.read", "goals.run", "projects.read", "previews.read"] },
+  { id: "environment-restore", label: "Environment restore", permissions: ["environment.read", "environment.restore", "settings.read"] },
+  { id: "project-ops", label: "Project ops", permissions: ["projects.read", "projects.manage", "projects.git", "files.read", "files.write", "previews.read", "previews.manage", "terminal.exec"] },
+  { id: "full-access", label: "Full access", permissions: apiKeyPermissionGroups.flatMap((group) => group.permissions.map((item) => item.id)) },
+];
+
+const apiKeyPermissionSet = new Set<ApiKeyPermission>(apiKeyPermissionGroups.flatMap((group) => group.permissions.map((item) => item.id)));
+const apiKeyLastUsedWrites = new Map<string, number>();
+
+function apiKeyPermissionsResponse(): ApiKeyPermissionsResponse {
+  return { groups: apiKeyPermissionGroups, presets: apiKeyPresets };
+}
+
+function apiKeyFromRow(row: Record<string, unknown>): ApiKeyRecord {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    keyHash: String(row.key_hash),
+    keyPreview: String(row.key_preview),
+    permissions: parseJsonValue<ApiKeyPermission[]>(row.permissions, []).filter((item): item is ApiKeyPermission => apiKeyPermissionSet.has(item as ApiKeyPermission)),
+    lastUsedAt: row.last_used_at ? String(row.last_used_at) : null,
+    revokedAt: row.revoked_at ? String(row.revoked_at) : null,
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function publicApiKey(record: ApiKeyRecord): ApiKeySummary {
+  return {
+    id: record.id,
+    name: record.name,
+    permissions: record.permissions,
+    keyPreview: record.keyPreview,
+    lastUsedAt: record.lastUsedAt,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+    revokedAt: record.revokedAt,
+  };
+}
+
+function listApiKeys() {
+  return db.prepare("select * from api_keys order by created_at desc").all().map((row) => publicApiKey(apiKeyFromRow(row as Record<string, unknown>)));
+}
+
+function createApiKey(body: CreateApiKeyRequest): ApiKeyDetailResponse {
+  const name = body.name.trim();
+  const permissions = Array.from(new Set((body.permissions ?? []).filter((item): item is ApiKeyPermission => apiKeyPermissionSet.has(item))));
+  if (!name || !permissions.length) throw new Error("invalid_api_key");
+  const id = `key-${randomUUID()}`;
+  const secret = `cwk_${randomBytes(24).toString("base64url")}`;
+  const now = new Date().toISOString();
+  const preview = `${secret.slice(0, 10)}...${secret.slice(-4)}`;
+  db.prepare(`
+    insert into api_keys (id, name, key_hash, key_preview, permissions, created_at, updated_at)
+    values (?, ?, ?, ?, ?, ?, ?)
+  `).run(id, name, hashToken(secret), preview, JSON.stringify(permissions), now, now);
+  const record = apiKeyFromRow(db.prepare("select * from api_keys where id = ?").get(id) as Record<string, unknown>);
+  return { ...publicApiKey(record), key: secret };
+}
+
+function updateApiKey(id: string, body: UpdateApiKeyRequest) {
+  const name = body.name.trim();
+  const permissions = Array.from(new Set((body.permissions ?? []).filter((item): item is ApiKeyPermission => apiKeyPermissionSet.has(item))));
+  if (!name || !permissions.length) throw new Error("invalid_api_key");
+  const now = new Date().toISOString();
+  const result = db.prepare(`
+    update api_keys
+    set name = ?, permissions = ?, updated_at = ?
+    where id = ?
+  `).run(name, JSON.stringify(permissions), now, id);
+  if (!result.changes) throw new Error("api_key_not_found");
+  const row = db.prepare("select * from api_keys where id = ?").get(id) as Record<string, unknown> | undefined;
+  if (!row) throw new Error("api_key_not_found");
+  return publicApiKey(apiKeyFromRow(row));
+}
+
+function revokeApiKey(id: string) {
+  const now = new Date().toISOString();
+  db.prepare("update api_keys set revoked_at = ?, updated_at = ? where id = ? and revoked_at is null").run(now, now, id);
+  const row = db.prepare("select * from api_keys where id = ?").get(id) as Record<string, unknown> | undefined;
+  if (!row) throw new Error("api_key_not_found");
+  return publicApiKey(apiKeyFromRow(row));
+}
+
+function deleteRevokedApiKey(id: string) {
+  const row = db.prepare("select * from api_keys where id = ?").get(id) as Record<string, unknown> | undefined;
+  if (!row) throw new Error("api_key_not_found");
+  const record = apiKeyFromRow(row);
+  if (!record.revokedAt) throw new Error("api_key_not_revoked");
+  db.prepare("delete from api_keys where id = ?").run(id);
+  return publicApiKey(record);
+}
+
+function findApiKeyByToken(token: string): ApiKeyRecord | null {
+  const row = db.prepare("select * from api_keys where key_hash = ? and revoked_at is null").get(hashToken(token)) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  return apiKeyFromRow(row);
+}
+
+function touchApiKeyLastUsed(id: string) {
+  const nowMs = Date.now();
+  if (nowMs - (apiKeyLastUsedWrites.get(id) ?? 0) < 60_000) return;
+  apiKeyLastUsedWrites.set(id, nowMs);
+  db.prepare("update api_keys set last_used_at = ?, updated_at = ? where id = ?").run(new Date(nowMs).toISOString(), new Date(nowMs).toISOString(), id);
+}
+
+function resolveAuthPrincipalFromBearer(token: string | null): AuthPrincipal | null {
+  if (!token) return null;
+  if (verifySessionToken(token)) return { type: "session", userId: "local-admin" };
+  const key = findApiKeyByToken(token);
+  if (!key) return null;
+  touchApiKeyLastUsed(key.id);
+  return { type: "api_key", key };
+}
+
+function requireSessionPrincipal(c: unknown) {
+  const principal = (c as { get: (name: string) => AuthPrincipal | undefined }).get("authPrincipal");
+  if (!principal || principal.type !== "session") throw new Error("session_auth_required");
+  return principal;
+}
+
+function hasApiKeyPermission(principal: AuthPrincipal, permission: ApiKeyPermission) {
+  return principal.type === "session" || principal.key.permissions.includes(permission);
+}
+
+function routePermissionForRequest(method: string, path: string): ApiKeyPermission | null {
+  if (path.startsWith("/api/auth/api-key-permissions")) return "auth.read";
+  if (path.startsWith("/api/auth/api-keys")) return "auth.manage";
+  if (path.startsWith("/api/providers")) return method === "GET" ? "providers.read" : "providers.manage";
+  if (path.startsWith("/api/sessions") || path.startsWith("/api/codex/tasks") || path.startsWith("/api/task-runs") || path.startsWith("/api/execution-contexts")) {
+    if (method === "GET") return "sessions.read";
+    return path.includes("/messages") || path.includes("/queue") || path.includes("/stop") || path.includes("/recover") || path.includes("/compact") ? "sessions.run" : "sessions.manage";
+  }
+  if (path.startsWith("/api/rooms")) {
+    if (method === "GET") return "rooms.read";
+    return path.includes("/messages") || path.includes("/runs/") || path.includes("/tasks") || path.includes("/retry-failed") ? "rooms.run" : "rooms.manage";
+  }
+  if (path.startsWith("/api/agents") || path.startsWith("/api/agent-roles") || path.startsWith("/api/agent-role-templates") || path.startsWith("/api/agent-groups") || path.startsWith("/api/agent-circles") || path.startsWith("/api/permission-profiles")) return method === "GET" ? "agents.read" : "agents.manage";
+  if (path.startsWith("/api/automations")) return method === "GET" ? "automations.read" : path.includes("/run") || path.includes("/stop-running") || path.includes("/cancel-queued") ? "automations.run" : "automations.manage";
+  if (path.startsWith("/api/goals")) return method === "GET" ? "goals.read" : path.includes("/plan") || path.includes("/orchestrate") ? "goals.run" : "goals.manage";
+  if (path.startsWith("/api/projects")) return method === "GET" ? "projects.read" : path.includes("/git") || path.includes("/check") || path.includes("/changes/") ? "projects.git" : "projects.manage";
+  if (path.startsWith("/api/previews")) return method === "GET" ? "previews.read" : "previews.manage";
+  if (path.startsWith("/api/files") || path.startsWith("/api/file-mounts")) return method === "GET" ? "files.read" : "files.write";
+  if (path.startsWith("/api/terminal")) return path.includes("/exec") ? "terminal.exec" : method === "GET" ? "terminal.exec" : "terminal.exec";
+  if (path.startsWith("/api/extensions")) {
+    if (method === "GET") return "extensions.read";
+    return path.includes("/import") || path.includes("/install") ? "extensions.install" : "extensions.manage";
+  }
+  if (path.startsWith("/api/settings/environment/restore")) return "environment.restore";
+  if (path.startsWith("/api/settings/environment")) return method === "GET" ? "environment.read" : "environment.manage";
+  if (path.startsWith("/api/notifications") || path.startsWith("/api/app-notifications")) return method === "GET" ? "notifications.read" : "notifications.manage";
+  if (path.startsWith("/api/approval-grants") || path.startsWith("/api/approvals")) return method === "GET" ? "approvals.read" : "approvals.decide";
+  if (path.startsWith("/api/settings/storage")) return method === "GET" ? "storage.read" : "storage.manage";
+  if (path.startsWith("/api/settings/backup")) return "backup.read";
+  if (path.startsWith("/api/settings/restore")) return "backup.restore";
+  if (path.startsWith("/api/settings")) return method === "GET" ? "settings.read" : "settings.manage";
+  return null;
+}
+
 function approvalFromRow(row: Record<string, unknown>): ApprovalRecord {
   let payload: unknown = null;
   try {
@@ -1705,25 +1927,12 @@ function loadFileMounts() {
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
     };
+    if (mount.id === "default" && (!existsSync(mount.rootPath) || !statSync(mount.rootPath).isDirectory())) {
+      mount.rootPath = workspaceRoot;
+      mount.updatedAt = new Date().toISOString();
+      db.prepare("update file_mounts set root_path = ?, updated_at = ? where id = ?").run(mount.rootPath, mount.updatedAt, mount.id);
+    }
     fileMounts.set(mount.id, mount);
-  }
-  if (!fileMounts.size) {
-    const mount: FileMountRecord = {
-      id: "default",
-      name: "Project Root",
-      rootPath: workspaceRoot,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    fileMounts.set(mount.id, mount);
-    db.prepare(`
-      insert into file_mounts (id, name, root_path, created_at, updated_at)
-      values (?, ?, ?, ?, ?)
-      on conflict(id) do update set
-        name = excluded.name,
-        root_path = excluded.root_path,
-        updated_at = excluded.updated_at
-    `).run(mount.id, mount.name, mount.rootPath, mount.createdAt, mount.updatedAt);
   }
 }
 
@@ -2301,6 +2510,26 @@ function saveMarketplaceCatalog(response: MarketplaceCatalogResponse) {
   };
   saveJsonSetting(marketplaceCatalogSettingsKey, catalog);
   return response;
+}
+
+function deleteMarketplaceCatalogItems(ids: string[]): MarketplaceCatalogResponse {
+  const idSet = new Set(ids.map((value) => value.trim()).filter(Boolean));
+  if (!idSet.size) return loadMarketplaceCatalog();
+  const catalog = loadMarketplaceCatalog();
+  return saveMarketplaceCatalog({
+    ...catalog,
+    items: catalog.items.filter((item) => !idSet.has(item.id)),
+    fetchedAt: new Date().toISOString(),
+  });
+}
+
+function clearMarketplaceCatalogItems(): MarketplaceCatalogResponse {
+  const catalog = loadMarketplaceCatalog();
+  return saveMarketplaceCatalog({
+    ...catalog,
+    items: [],
+    fetchedAt: new Date().toISOString(),
+  });
 }
 
 function normalizeMarketplaceMcpConfig(config: unknown): CreateMcpServerRequest[] {
@@ -3874,6 +4103,7 @@ function nextAutomationRunAt(automation: AutomationSummary, from = new Date()) {
   if (automation.status !== "active") return null;
   const schedule = automation.schedule.trim().toLowerCase();
   if (schedule === "manual") return null;
+  if (schedule === "startup") return null;
   const next = new Date(from);
   next.setSeconds(0, 0);
   next.setMinutes(next.getMinutes() + 1);
@@ -3911,7 +4141,7 @@ function nextAutomationRunAt(automation: AutomationSummary, from = new Date()) {
 function shouldRunAutomationNow(automation: AutomationSummary, now = new Date()) {
   if (automation.status !== "active") return false;
   const schedule = automation.schedule.trim().toLowerCase();
-  if (!schedule || schedule === "manual") return false;
+  if (!schedule || schedule === "manual" || schedule === "startup") return false;
   const minuteKey = now.toISOString().slice(0, 16);
   if (automationRanInMinute(automation.id, minuteKey)) return false;
   if (schedule === "hourly") return now.getMinutes() === 0;
@@ -3929,6 +4159,7 @@ function shouldRunAutomationNow(automation: AutomationSummary, now = new Date())
 function isValidAutomationSchedule(schedule: string) {
   const value = schedule.trim().toLowerCase();
   return value === "manual"
+    || value === "startup"
     || value === "hourly"
     || /^daily\s+[0-2]\d:[0-5]\d$/.test(value)
     || /^weekly\s+[0-7]\s+[0-2]\d:[0-5]\d$/.test(value)
@@ -4166,6 +4397,17 @@ function checkScheduledAutomations() {
   }
 }
 
+function runStartupAutomations() {
+  for (const automation of appData.automations) {
+    if (automation.status !== "active" || automation.schedule.trim().toLowerCase() !== "startup") continue;
+    try {
+      runAutomationNow(automation);
+    } catch (error) {
+      console.error("automation startup failed", automation.id, error);
+    }
+  }
+}
+
 function checkDueRoomSchedules() {
   const nowDate = new Date();
   const now = nowDate.toISOString();
@@ -4267,7 +4509,10 @@ function appendSessionMessage(sessionId: string, role: SessionMessage["role"], c
     message.createdAt,
   );
   const session = appData.sessions.find((item) => item.id === sessionId);
-  if (session && role === "assistant") appendUrlCardsForMessage(session, message.id, content);
+  if (session && role === "assistant") {
+    appendUrlCardsForMessage(session, message.id, content);
+    forwardAssistantMessageToTelegram(session, message);
+  }
   return message;
 }
 
@@ -6781,6 +7026,173 @@ function buildEnvironmentRestorePreview(toolRecord: EnvironmentToolRecord, packa
   return items;
 }
 
+function summarizeEnvironmentRestoreRun(status: EnvironmentRestoreRun["status"], lines: string[]) {
+  const content = lines.filter(Boolean).join("; ").trim();
+  return content || (status === "success" ? "Environment restore completed" : status === "partial" ? "Environment restore partially completed" : "Environment restore failed");
+}
+
+function environmentRestoreSelectionMatches(mode: "all" | "auto", autoRestore: boolean) {
+  return mode === "all" || autoRestore;
+}
+
+function buildEnvironmentRestoreExecutionPlan(body?: EnvironmentRestoreMissingRequest): EnvironmentRestorePreviewResponse {
+  const mode = body?.mode === "all" ? "all" : "auto";
+  const includeTools = body?.includeTools !== false;
+  const includePackages = body?.includePackages !== false;
+  const overview = buildEnvironmentOverview();
+  const items: EnvironmentRestorePreviewItem[] = [];
+  let tools = 0;
+  let packages = 0;
+  if (includeTools) {
+    for (const tool of overview.tools.filter((item) => item.status === "missing" && environmentRestoreSelectionMatches(mode, item.autoRestore))) {
+      tools += 1;
+      items.push({
+        id: `restore-tool-${tool.id}`,
+        kind: "tool",
+        action: tool.source === "mise" ? "install" : "manual",
+        title: `${tool.tool}@${tool.requestedVersion}`,
+        detail: tool.source === "mise"
+          ? "Missing runtime will be installed."
+          : `Missing runtime is tracked as ${tool.source} and requires manual restore.`,
+        command: tool.source === "mise" ? `mise use -g ${tool.tool}@${tool.requestedVersion}` : null,
+        toolRecordId: tool.id,
+      });
+    }
+  }
+  if (includePackages) {
+    for (const pkg of overview.packageRecords.filter((item) => item.status === "missing" && environmentRestoreSelectionMatches(mode, item.autoRestore))) {
+      packages += 1;
+      const tool = pkg.toolRecordId ? overview.tools.find((entry) => entry.id === pkg.toolRecordId) ?? null : null;
+      const runtimeMissing = tool?.status === "missing";
+      const commandSpec = packageInstallCommandSpec(pkg.manager, pkg.packageName, pkg.versionSpec ?? null);
+      const action: EnvironmentRestorePreviewItem["action"] = runtimeMissing || !commandSpec || environmentPackageManualCleanup(pkg.manager) ? "manual" : "install";
+      items.push({
+        id: `restore-package-${pkg.id}`,
+        kind: "package",
+        action,
+        title: `${pkg.packageName} · ${pkg.manager}`,
+        detail: runtimeMissing
+          ? `Runtime ${tool?.tool ?? pkg.tool} is missing and must be restored first.`
+          : !commandSpec || environmentPackageManualCleanup(pkg.manager)
+            ? `Package manager ${pkg.manager} requires manual restore handling.`
+            : `Missing package will be installed into ${pkg.targetLabel}.`,
+        command: action === "install" && commandSpec ? commandSpec.text : null,
+        toolRecordId: pkg.toolRecordId ?? null,
+        packageRecordId: pkg.id,
+      });
+    }
+  }
+  return { items, tools, packages };
+}
+
+function runEnvironmentRestoreMissing(body?: EnvironmentRestoreMissingRequest) {
+  const mode = body?.mode === "all" ? "all" : "auto";
+  const includeTools = body?.includeTools !== false;
+  const includePackages = body?.includePackages !== false;
+  const now = new Date().toISOString();
+  const startedOverview = buildEnvironmentOverview();
+  const summaryLines: string[] = [];
+  let successCount = 0;
+  let failureCount = 0;
+
+  if (includeTools) {
+    const tools = startedOverview.tools.filter((item) => item.status === "missing" && environmentRestoreSelectionMatches(mode, item.autoRestore));
+    let installedTools = 0;
+    let skippedTools = 0;
+    let failedTools = 0;
+    for (const tool of tools) {
+      if (tool.source !== "mise") {
+        skippedTools += 1;
+        continue;
+      }
+      const result = runMiseUseGlobal(tool.tool, `${tool.tool}@${tool.requestedVersion}`);
+      if (result.status === 0) {
+        installedTools += 1;
+        successCount += 1;
+      } else {
+        failedTools += 1;
+        failureCount += 1;
+      }
+    }
+    if (tools.length) {
+      summaryLines.push(`runtimes ${installedTools}/${tools.length} restored${skippedTools ? `, ${skippedTools} manual` : ""}${failedTools ? `, ${failedTools} failed` : ""}`);
+    }
+  }
+
+  let refreshedOverview = buildEnvironmentOverview();
+  if (includePackages) {
+    const packages = refreshedOverview.packageRecords.filter((item) => item.status === "missing" && environmentRestoreSelectionMatches(mode, item.autoRestore));
+    let installedPackages = 0;
+    let skippedPackages = 0;
+    let failedPackages = 0;
+    const updatedRecords = [...refreshedOverview.packageRecords];
+    for (const pkg of packages) {
+      const tool = pkg.toolRecordId ? refreshedOverview.tools.find((entry) => entry.id === pkg.toolRecordId) ?? null : null;
+      if (tool?.status === "missing") {
+        skippedPackages += 1;
+        continue;
+      }
+      const commandSpec = packageInstallCommandSpec(pkg.manager, pkg.packageName, pkg.versionSpec ?? null);
+      if (!commandSpec || environmentPackageManualCleanup(pkg.manager)) {
+        skippedPackages += 1;
+        continue;
+      }
+      const probe = environmentPackageRegistry.inspectEnvironmentPackage(pkg.manager, pkg.packageName);
+      const result = probe.installed ? { status: 0, stdout: "already installed", stderr: "" } : spawnSync(commandSpec.command, commandSpec.args, { encoding: "utf8" });
+      const index = updatedRecords.findIndex((item) => item.id === pkg.id);
+      if (result.status === 0) {
+        installedPackages += 1;
+        successCount += 1;
+        if (index >= 0) {
+          updatedRecords[index] = {
+            ...updatedRecords[index],
+            persisted: true,
+            status: "installed",
+            installedVersion: probe.version ?? pkg.versionSpec ?? updatedRecords[index].installedVersion ?? null,
+            updatedAt: now,
+          };
+        }
+      } else {
+        failedPackages += 1;
+        failureCount += 1;
+        if (index >= 0) updatedRecords[index] = { ...updatedRecords[index], status: "failed", updatedAt: now };
+      }
+    }
+    refreshedOverview = {
+      ...refreshedOverview,
+      packageRecords: updatedRecords,
+      updatedAt: now,
+    };
+    saveEnvironmentOverview(refreshedOverview);
+    if (packages.length) {
+      summaryLines.push(`packages ${installedPackages}/${packages.length} restored${skippedPackages ? `, ${skippedPackages} manual` : ""}${failedPackages ? `, ${failedPackages} failed` : ""}`);
+    }
+  }
+
+  const finalOverview = buildEnvironmentOverview();
+  const status: EnvironmentRestoreRun["status"] = failureCount === 0
+    ? "success"
+    : successCount > 0
+      ? "partial"
+      : "failed";
+  const nextOverview: EnvironmentOverview = {
+    ...finalOverview,
+    restoreRuns: [
+      {
+        id: `env-restore-${randomUUID()}`,
+        status,
+        summary: summarizeEnvironmentRestoreRun(status, summaryLines),
+        createdAt: now,
+      },
+      ...finalOverview.restoreRuns,
+    ].slice(0, 20),
+    updatedAt: now,
+  };
+  saveEnvironmentOverview(nextOverview);
+  environmentOverview = nextOverview;
+  return nextOverview;
+}
+
 function dataBackupEntries(rootName: string) {
   const entries: Array<{ name: string; data: Buffer; modifiedAt?: Date }> = [];
   const rootPath = resolve(dataDir);
@@ -8082,7 +8494,6 @@ function upsertFileMount(mount: FileMountRecord) {
 }
 
 function deleteFileMount(id: string) {
-  if (id === "default" && fileMounts.size <= 1) throw new Error("cannot_delete_last_mount");
   db.prepare("delete from file_mounts where id = ?").run(id);
   fileMounts.delete(id);
 }
@@ -11153,17 +11564,49 @@ function telegramRouteSession(account: NotificationAccountRecord, chatId: string
 }
 
 function telegramSessionChoices(limit = 8) {
+  const categoryOrder = new Map<string, number>([
+    ["Codex", 0],
+    ["Agent", 1],
+    ["Room", 2],
+    ["Automation", 3],
+  ]);
   return appData.sessions
     .slice()
     .filter((session) => !(session.conversationType === "agent" && session.roomId))
-    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .sort((a, b) => {
+      const categoryDiff = (categoryOrder.get(telegramSessionCategory(a)) ?? 99) - (categoryOrder.get(telegramSessionCategory(b)) ?? 99);
+      if (categoryDiff !== 0) return categoryDiff;
+      return b.updatedAt.localeCompare(a.updatedAt);
+    })
     .slice(0, limit);
+}
+
+function telegramSessionCategory(session: SessionSummary) {
+  if (session.conversationType === "automation") return "Automation";
+  if (session.conversationType === "room") return "Room";
+  if (session.conversationType === "agent") return "Agent";
+  return "Codex";
 }
 
 function telegramSessionLabel(session: SessionSummary, index?: number) {
   const prefix = index === undefined ? "" : `${index + 1}. `;
   const shortId = session.id.length > 12 ? `${session.id.slice(0, 12)}...` : session.id;
-  return `${prefix}${session.title} (${shortId})`;
+  return `${prefix}[${telegramSessionCategory(session)}] ${session.title} (${shortId})`;
+}
+
+function telegramGroupedSessionText(limit = 12) {
+  const order = ["Codex", "Agent", "Room", "Automation"] as const;
+  const choices = telegramSessionChoices(limit);
+  const sections = order
+    .map((category) => {
+      const rows = choices
+        .map((session, index) => ({ session, index }))
+        .filter(({ session }) => telegramSessionCategory(session) === category)
+        .map(({ session, index }) => `${telegramSessionLabel(session, index)}\n${session.status} · ${session.updatedAt}\n${session.id}`);
+      return rows.length ? [`${category}:`, ...rows].join("\n\n") : "";
+    })
+    .filter(Boolean);
+  return sections.length ? sections.join("\n\n") : "No sessions yet.";
 }
 
 function telegramAgentChoices(limit = 8) {
@@ -11259,6 +11702,100 @@ function setTelegramRouteSession(accountId: string, chatId: string, sessionId: s
 
 function clearTelegramRouteSession(accountId: string, chatId: string) {
   db.prepare("delete from telegram_chat_routes where account_id = ? and chat_id = ?").run(accountId, chatId);
+}
+
+function appendTelegramReplyTarget(
+  current: Array<{ accountId: string; chatId: string; createdAt: number }> | undefined,
+  accountId: string,
+  chatId: string,
+) {
+  const createdAt = Date.now();
+  const filtered = (current ?? []).filter((item) => createdAt - item.createdAt < 30 * 60 * 1000);
+  if (!filtered.some((item) => item.accountId === accountId && item.chatId === chatId)) {
+    filtered.push({ accountId, chatId, createdAt });
+  }
+  return filtered;
+}
+
+function queueTelegramQueuedReplyTarget(queueId: string, accountId: string, chatId: string) {
+  telegramQueuedReplyTargets.set(queueId, appendTelegramReplyTarget(telegramQueuedReplyTargets.get(queueId), accountId, chatId));
+}
+
+function queueTelegramActiveReplyTarget(sessionId: string, accountId: string, chatId: string) {
+  telegramActiveReplyTargets.set(sessionId, appendTelegramReplyTarget(telegramActiveReplyTargets.get(sessionId), accountId, chatId));
+}
+
+function activateTelegramReplyTargetFromQueue(sessionId: string, queueId: string) {
+  const pending = telegramQueuedReplyTargets.get(queueId) ?? [];
+  telegramQueuedReplyTargets.delete(queueId);
+  if (!pending.length) return;
+  const current = telegramActiveReplyTargets.get(sessionId) ?? [];
+  const now = Date.now();
+  telegramActiveReplyTargets.set(sessionId, [...current, ...pending].filter((item, index, items) => {
+    if (now - item.createdAt >= 30 * 60 * 1000) return false;
+    return items.findIndex((candidate) => candidate.accountId === item.accountId && candidate.chatId === item.chatId) === index;
+  }));
+}
+
+function boundTelegramReplyTargets(sessionId: string) {
+  return (db.prepare("select account_id, chat_id from telegram_chat_routes where session_id = ?").all(sessionId) as Array<{ account_id?: string; chat_id?: string }>)
+    .map((row) => ({ accountId: String(row.account_id ?? ""), chatId: String(row.chat_id ?? "") }))
+    .filter((item) => item.accountId && item.chatId);
+}
+
+function telegramReplyDestinations(sessionId: string) {
+  const deduped = new Map<string, { accountId: string; chatId: string }>();
+  const active = telegramActiveReplyTargets.get(sessionId) ?? [];
+  const now = Date.now();
+  for (const item of [...boundTelegramReplyTargets(sessionId), ...active.filter((entry) => now - entry.createdAt < 30 * 60 * 1000)]) {
+    deduped.set(`${item.accountId}:${item.chatId}`, item);
+  }
+  return [...deduped.values()];
+}
+
+function clearTelegramActiveReplyTargets(sessionId: string) {
+  telegramActiveReplyTargets.delete(sessionId);
+}
+
+function telegramOutboundQueueKey(accountId: string, chatId: string) {
+  return `${accountId}:${chatId}`;
+}
+
+function formatTelegramSessionReply(session: SessionSummary, content: string) {
+  const title = session.title?.trim() || session.id;
+  const body = content.trim();
+  return body ? `[${title}]\n\n${body}` : `[${title}]`;
+}
+
+function forwardAssistantMessageToTelegram(session: SessionSummary, message: SessionMessage) {
+  if (message.role !== "assistant") return;
+  const destinations = telegramReplyDestinations(session.id);
+  if (!destinations.length) return;
+  const accounts = new Map(
+    listNotificationAccounts(true)
+      .filter((account) => account.enabled && account.channelKind === "telegram")
+      .map((account) => [account.id, account]),
+  );
+  const text = formatTelegramSessionReply(session, message.content);
+  for (const destination of destinations) {
+    const account = accounts.get(destination.accountId);
+    if (!account) continue;
+    void enqueueTelegramText(account, destination.chatId, text).catch((error) => {
+      console.warn("telegram reply forward failed", destination.accountId, destination.chatId, error instanceof Error ? error.message : error);
+    });
+  }
+}
+
+function enqueueTelegramText(account: NotificationAccountRecord, chatId: string, text: string) {
+  const key = telegramOutboundQueueKey(account.id, chatId);
+  const previous = telegramOutboundQueues.get(key) ?? Promise.resolve();
+  const next = previous
+    .catch(() => {})
+    .then(() => sendTelegramText(account, chatId, text));
+  telegramOutboundQueues.set(key, next.finally(() => {
+    if (telegramOutboundQueues.get(key) === next) telegramOutboundQueues.delete(key);
+  }));
+  return next;
 }
 
 async function sendTelegramText(account: NotificationAccountRecord, chatId: string, text: string) {
@@ -11536,13 +12073,13 @@ async function routeTelegramSendMessage(account: NotificationAccountRecord, chat
     return;
   }
   const result = dispatchMessageToSession(target, `Telegram message from chat ${chatId}:\n\n${message}`);
+  if (result.mode === "queued" && result.queuedId) queueTelegramQueuedReplyTarget(result.queuedId, account.id, chatId);
+  else queueTelegramActiveReplyTarget(target.id, account.id, chatId);
   await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
 }
 
 function telegramRecentSessionsText() {
-  const rows = telegramSessionChoices(12)
-    .map((session, index) => `${telegramSessionLabel(session, index)}\n${session.status} · ${session.updatedAt}\n${session.id}`);
-  return rows.length ? rows.join("\n\n") : "No sessions yet.";
+  return telegramGroupedSessionText(12);
 }
 
 function resolveTelegramTargetSession(raw: string) {
@@ -11593,6 +12130,8 @@ async function handleTelegramUpdate(account: NotificationAccountRecord, update: 
       }
       telegramPendingSends.delete(pendingKey);
       const result = dispatchMessageToSession(target, `Telegram message from chat ${chatId}:\n\n${pending.message}`);
+      if (result.mode === "queued" && result.queuedId) queueTelegramQueuedReplyTarget(result.queuedId, account.id, chatId);
+      else queueTelegramActiveReplyTarget(target.id, account.id, chatId);
       await answerTelegramCallback(account, update.callback_query.id, `Sent to ${target.title}`);
       await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
       return;
@@ -11733,6 +12272,10 @@ async function handleTelegramUpdate(account: NotificationAccountRecord, update: 
       "/unbind - clear the bound session",
       "/send <index, title, or sessionId> | <message> - send to a session",
       "/send <message> - choose a session when no session is bound",
+      "",
+      "Reply behavior:",
+      "- Bound/default session: plain text goes into that session and assistant replies are sent back here.",
+      "- /send: sends one message to the chosen session and the assistant reply for that round is sent back here.",
       "Plain text is sent to the bound/default session, or asks you to choose one.",
     ].join("\n"));
     return;
@@ -11808,6 +12351,8 @@ async function handleTelegramUpdate(account: NotificationAccountRecord, update: 
       return;
     }
     const result = dispatchMessageToSession(target, `Telegram message from chat ${chatId}:\n\n${message}`);
+    if (result.mode === "queued" && result.queuedId) queueTelegramQueuedReplyTarget(result.queuedId, account.id, chatId);
+    else queueTelegramActiveReplyTarget(target.id, account.id, chatId);
     await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
     return;
   }
@@ -11817,6 +12362,8 @@ async function handleTelegramUpdate(account: NotificationAccountRecord, update: 
     return;
   }
   const result = dispatchMessageToSession(target, `Telegram message from chat ${chatId}:\n\n${text}`);
+  if (result.mode === "queued" && result.queuedId) queueTelegramQueuedReplyTarget(result.queuedId, account.id, chatId);
+  else queueTelegramActiveReplyTarget(target.id, account.id, chatId);
   await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
 }
 
@@ -12118,6 +12665,7 @@ function finalizeCodexRunnerTask(session: SessionSummary, exitCode: number | nul
   const wasStopped = codexTaskStopRequested.has(session.id) || Boolean((running as { stop_requested?: unknown } | undefined)?.stop_requested);
   flushCodexTaskLog(session);
   backfillSessionFromTaskLog(session);
+  clearTelegramActiveReplyTargets(session.id);
   codexTaskProcesses.delete(session.id);
   codexTaskStdoutBuffers.delete(session.id);
   stopCodexTaskTailer(session.id);
@@ -12309,6 +12857,7 @@ function runQueuedMessageIfIdle(session: SessionSummary) {
   if (codexTaskProcesses.has(session.id)) return false;
   const item = popNextQueuedMessage(session.id);
   if (!item) return false;
+  activateTelegramReplyTargetFromQueue(session.id, item.id);
   restoreCodexSessionIdFromLog(session);
   const providerId = item.providerId ?? session.providerId ?? null;
   const provider = providerId ? appData.providers.find((providerItem) => providerItem.id === providerId) : appData.providers[0];
@@ -13275,9 +13824,19 @@ app.get("/api/app-notifications/events", (c) => {
   });
 });
 
-app.use("/api/*", requireAuth);
+app.use("/api/*", async (c, next) => {
+  const principal = resolveAuthPrincipalFromBearer(getBearerToken(c.req.header("authorization")));
+  if (!principal) return c.json({ error: "unauthorized" }, 401);
+  (c as unknown as { set: (name: string, value: AuthPrincipal) => void }).set("authPrincipal", principal);
+  if (principal.type === "api_key") {
+    const permission = routePermissionForRequest(c.req.method, new URL(c.req.url).pathname);
+    if (!permission || !hasApiKeyPermission(principal, permission)) return c.json({ error: "forbidden" }, 403);
+  }
+  return next();
+});
 
 app.post("/api/auth/access-token", async (c) => {
+  requireSessionPrincipal(c);
   if (!authConfig) return c.json({ error: "setup_required" }, 409);
   const body = await c.req.json<UpdateAccessTokenRequest>().catch(() => null);
   if (!body?.currentAccessToken?.trim() || !body.accessToken?.trim()) return c.json({ error: "access_token_required" }, 400);
@@ -13289,6 +13848,7 @@ app.post("/api/auth/access-token", async (c) => {
 });
 
 app.post("/api/auth/otp/reset", (c) => {
+  requireSessionPrincipal(c);
   if (!authConfig) return c.json({ error: "setup_required" }, 409);
   pendingResetOtpSecret = generateSecret();
   const response: ResetOtpResponse = {
@@ -13299,6 +13859,7 @@ app.post("/api/auth/otp/reset", (c) => {
 });
 
 app.post("/api/auth/otp/reset/confirm", async (c) => {
+  requireSessionPrincipal(c);
   if (!authConfig) return c.json({ error: "setup_required" }, 409);
   if (!pendingResetOtpSecret) return c.json({ error: "otp_reset_not_started" }, 400);
   const body = await c.req.json<ConfirmOtpResetRequest>().catch(() => null);
@@ -13313,6 +13874,58 @@ app.post("/api/auth/otp/reset/confirm", async (c) => {
   saveAuthConfig(authConfig);
   const response: LoginResponse = { ok: true, sessionToken: signSessionToken(), auth: authenticatedAuthState() };
   return c.json(response);
+});
+
+app.get("/api/auth/api-key-permissions", (c) => {
+  requireSessionPrincipal(c);
+  return c.json(apiKeyPermissionsResponse());
+});
+
+app.get("/api/auth/api-keys", (c) => {
+  requireSessionPrincipal(c);
+  return c.json(listApiKeys());
+});
+
+app.post("/api/auth/api-keys", async (c) => {
+  requireSessionPrincipal(c);
+  const body = await c.req.json<CreateApiKeyRequest>().catch(() => null);
+  if (!body?.name?.trim() || !Array.isArray(body.permissions) || !body.permissions.length) return c.json({ error: "invalid_api_key" }, 400);
+  try {
+    return c.json(createApiKey(body), 201);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "api_key_create_failed" }, 400);
+  }
+});
+
+app.patch("/api/auth/api-keys/:id", async (c) => {
+  requireSessionPrincipal(c);
+  const body = await c.req.json<UpdateApiKeyRequest>().catch(() => null);
+  if (!body?.name?.trim() || !Array.isArray(body.permissions) || !body.permissions.length) return c.json({ error: "invalid_api_key" }, 400);
+  try {
+    return c.json(updateApiKey(c.req.param("id"), body));
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "api_key_update_failed";
+    return c.json({ error: reason }, reason === "api_key_not_found" ? 404 : 400);
+  }
+});
+
+app.delete("/api/auth/api-keys/:id", (c) => {
+  requireSessionPrincipal(c);
+  try {
+    return c.json(revokeApiKey(c.req.param("id")));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "api_key_not_found" }, 404);
+  }
+});
+
+app.delete("/api/auth/api-keys/:id/record", (c) => {
+  requireSessionPrincipal(c);
+  try {
+    return c.json(deleteRevokedApiKey(c.req.param("id")));
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "api_key_delete_failed";
+    return c.json({ error: reason }, reason === "api_key_not_revoked" ? 409 : 404);
+  }
 });
 
 app.post("/api/settings/maintenance/cleanup", async (c) => {
@@ -13395,6 +14008,16 @@ app.post("/api/settings/environment/scan", (c) => {
   environmentOverview = buildEnvironmentOverview();
   saveEnvironmentOverview(environmentOverview);
   return c.json(environmentOverview);
+});
+
+app.post("/api/settings/environment/restore-preview", async (c) => {
+  const body = await c.req.json<EnvironmentRestoreMissingRequest>().catch(() => ({}));
+  return c.json(buildEnvironmentRestoreExecutionPlan(body));
+});
+
+app.post("/api/settings/environment/restore-missing", async (c) => {
+  const body = await c.req.json<EnvironmentRestoreMissingRequest>().catch(() => ({}));
+  return c.json(runEnvironmentRestoreMissing(body));
 });
 
 app.post("/api/settings/environment/mise/install", (c) => {
@@ -13635,7 +14258,7 @@ app.get("/api/settings/environment/tools/:id/packages", (c) => {
     toolRecord,
     packages: [...recordedPackages, ...detectedPackages],
     managers: environmentPackageRegistry.listEnvironmentPackageManagers(toolRecord),
-    restorePreview: buildEnvironmentRestorePreview(toolRecord, [...recordedPackages, ...detectedPackages]),
+    restorePreview: buildEnvironmentRestorePreview(toolRecord, recordedPackages),
   };
   return c.json(response);
 });
@@ -13705,9 +14328,9 @@ app.post("/api/settings/environment/bulk", async (c) => {
     let successCount = 0;
     const updatedRecords = [...environmentOverview.packageRecords];
     for (const pkg of targets) {
-      const commandArgs = packageInstallCommandArgs(pkg.manager, pkg.packageName, pkg.versionSpec ?? null);
-      if (!commandArgs) continue;
-      const result = spawnSync(resolveMiseCommand(), commandArgs, { encoding: "utf8" });
+      const commandSpec = packageInstallCommandSpec(pkg.manager, pkg.packageName, pkg.versionSpec ?? null);
+      if (!commandSpec) continue;
+      const result = spawnSync(commandSpec.command, commandSpec.args, { encoding: "utf8" });
       if (result.status === 0) {
         successCount += 1;
         const index = updatedRecords.findIndex((item) => item.id === pkg.id);
@@ -13745,9 +14368,9 @@ app.post("/api/settings/environment/packages/install", async (c) => {
   const versionSpec = body.versionSpec?.trim() || null;
   const spec = versionSpec ? `${packageName}@${versionSpec}` : packageName;
   const probe = environmentPackageRegistry.inspectEnvironmentPackage(manager, packageName);
-  const commandArgs = packageInstallCommandArgs(manager, packageName, versionSpec);
-  if (!commandArgs) return c.json({ error: "environment_package_manager_not_supported" }, 400);
-  const result = probe.installed ? { status: 0, stdout: "already installed", stderr: "" } : spawnSync(resolveMiseCommand(), commandArgs, { encoding: "utf8" });
+  const commandSpec = packageInstallCommandSpec(manager, packageName, versionSpec);
+  if (!commandSpec) return c.json({ error: "environment_package_manager_not_supported" }, 400);
+  const result = probe.installed ? { status: 0, stdout: "already installed", stderr: "" } : spawnSync(commandSpec.command, commandSpec.args, { encoding: "utf8" });
   const now = new Date().toISOString();
   const record: EnvironmentPackageRecord = {
     id: `env-pkg-${randomUUID()}`,
@@ -13759,7 +14382,7 @@ app.post("/api/settings/environment/packages/install", async (c) => {
     packageName,
     versionSpec,
     installedVersion: probe.version ?? versionSpec,
-    installCommand: `mise ${commandArgs.join(" ")}`,
+    installCommand: commandSpec.text,
     uninstallCommand: packageUninstallCommandText(manager, packageName),
     targetLabel: `${toolRecord.tool}@${toolRecord.requestedVersion}`,
     scope: "global",
@@ -13802,9 +14425,9 @@ app.delete("/api/settings/environment/packages/:id", async (c) => {
   const pkg = environmentOverview.packageRecords.find((item) => item.id === id) ?? null;
   if (!pkg) return c.json({ error: "environment_package_not_found" }, 404);
   const manager = body?.manager?.trim() || pkg.manager;
-  const commandArgs = packageUninstallCommandArgs(manager, pkg.packageName);
-  if (!commandArgs) return c.json({ error: "environment_package_manager_not_supported" }, 400);
-  const result = spawnSync(resolveMiseCommand(), commandArgs, { encoding: "utf8" });
+  const commandSpec = packageUninstallCommandSpec(manager, pkg.packageName);
+  if (!commandSpec) return c.json({ error: "environment_package_manager_not_supported" }, 400);
+  const result = spawnSync(commandSpec.command, commandSpec.args, { encoding: "utf8" });
   const now = new Date().toISOString();
   environmentOverview = {
     ...buildEnvironmentOverview(),
@@ -17203,6 +17826,14 @@ app.post("/api/extensions/marketplace/install", async (c) => {
     return c.json({ error: message }, message.endsWith("_exists") ? 409 : 400);
   }
 });
+app.delete("/api/extensions/marketplace", async (c) => {
+  const body = await c.req.json<DeleteMarketplaceItemsRequest>().catch(() => null);
+  if (!body?.ids || !Array.isArray(body.ids)) return c.json({ error: "invalid_marketplace_item_ids" }, 400);
+  return c.json(deleteMarketplaceCatalogItems(body.ids));
+});
+app.delete("/api/extensions/marketplace/all", (c) => {
+  return c.json(clearMarketplaceCatalogItems());
+});
 app.get("/api/extensions/detail", (c) => {
   try {
     const type = c.req.query("type") as ExtensionSummary["type"] | undefined;
@@ -17459,6 +18090,8 @@ const terminalApiWsServer = startTerminalApiWebSocket(apiServer);
 const previewWsServer = startPreviewWebSocketProxy(apiServer);
 const automationTimer = setInterval(checkScheduledWork, 60_000);
 automationTimer.unref();
+const startupAutomationTimer = setTimeout(runStartupAutomations, 2_000);
+startupAutomationTimer.unref();
 const telegramInboundTimer = setInterval(pollTelegramInboundBots, 10_000);
 telegramInboundTimer.unref();
 let shuttingDown = false;
@@ -17466,6 +18099,7 @@ function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
   clearInterval(automationTimer);
+  clearTimeout(startupAutomationTimer);
   clearInterval(telegramInboundTimer);
   console.log(`Codex Web API shutting down after ${signal}`);
   for (const child of codexTaskProcesses.values()) child.kill("SIGTERM");
