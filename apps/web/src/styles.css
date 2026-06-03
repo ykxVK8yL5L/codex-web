@@ -554,8 +554,7 @@ button:disabled {
 }
 
 .session-mobile-more,
-.session-mobile-progress,
-.session-mobile-delete {
+.session-mobile-progress {
   display: none;
 }
 
@@ -6826,7 +6825,7 @@ button:disabled {
 
   .session-actions .session-primary-action,
   .session-actions .session-mobile-progress,
-  .session-actions .session-mobile-delete,
+  .session-actions .session-delete-action,
   .session-actions .session-mobile-more {
     display: inline-flex;
     flex: 0 0 40px;
