@@ -1004,6 +1004,7 @@ function App() {
   }, [applyAppNotifications, pushBrowserNotification, rememberPendingApprovalId, sessionToken, shouldSuppressAppNotification]);
 
   const resetToLogin = useCallback((nextAuth?: AuthState) => {
+    void fetch("/api/auth/logout", { method: "POST" }).catch(() => undefined);
     localStorage.removeItem("codex-web-session");
     setSessionToken("");
     setAuth(nextAuth ?? {
@@ -4177,6 +4178,8 @@ function QueuedMessageRow({
 }
 
 function ActivityPanel({ items, hasMore, onLoadMore, t }: { items: ActivityItem[]; hasMore?: boolean; onLoadMore?: () => void; t: TFunction }) {
+  const [detailItem, setDetailItem] = useState<ActivityItem | null>(null);
+
   return (
     <section className="activity-panel">
       <div className="activity-head">
@@ -4186,14 +4189,45 @@ function ActivityPanel({ items, hasMore, onLoadMore, t }: { items: ActivityItem[
       {items.map((item) => (
         <div className={`activity-item ${item.kind}`} key={`${item.at}-${item.label}-${item.detail ?? ""}`}>
           <span className="activity-dot" />
-          <div>
+          <div title={[item.label, item.detail].filter(Boolean).join("\n")}>
             <strong>{item.label}</strong>
             {item.detail && <code>{item.detail}</code>}
           </div>
+          <button className="ghost-button icon-only activity-detail-button" type="button" title={t("session.activityDetails")} aria-label={t("session.activityDetails")} onClick={() => setDetailItem(item)}>
+            <IconText icon={Info}>{t("session.activityDetails")}</IconText>
+          </button>
           <em>{readableActivityStatus(item.status, item.kind, t)}</em>
         </div>
       ))}
       {hasMore && <button className="ghost-button load-more" type="button" onClick={onLoadMore}>{t("session.loadMore")}</button>}
+      {detailItem && (
+        <div className="dialog-layer activity-detail-layer" role="presentation">
+          <button className="dialog-backdrop" type="button" aria-label={t("action.close")} onClick={() => setDetailItem(null)} />
+          <div className="dialog-card activity-detail-card" role="dialog" aria-modal="true" aria-labelledby="activity-detail-title">
+            <div className="dialog-head">
+              <div>
+                <strong id="activity-detail-title">{t("session.activityDetails")}</strong>
+                <p>{readableActivityStatus(detailItem.status, detailItem.kind, t)}</p>
+              </div>
+              <button className="drawer-close" type="button" onClick={() => setDetailItem(null)} title={t("action.close")} aria-label={t("action.close")}>
+                <X size={16} />
+              </button>
+            </div>
+            <div className="activity-detail-content">
+              <label>
+                <span>{t("session.activityLabel")}</span>
+                <pre>{detailItem.label}</pre>
+              </label>
+              {detailItem.detail && (
+                <label>
+                  <span>{t("session.activityDetail")}</span>
+                  <pre>{detailItem.detail}</pre>
+                </label>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

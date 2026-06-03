@@ -352,6 +352,7 @@ const {
   verifyProviderProxyToken,
   verifySessionToken,
 } = createAuthHelpers(() => authConfig, sessionTtlMs);
+const sessionCookieName = "codex_web_session";
 let pendingOtpSecret = generateSecret();
 let pendingResetOtpSecret: string | null = null;
 let codexRuntimeSettings = runtimeSettingsStore.codexRuntime.load();
@@ -8310,10 +8311,22 @@ function previewAccessCookie(preview: PreviewRecord, ttlMs = previewAccessTtlMs)
   return `${previewAccessCookieName(preview.id)}=${encodeURIComponent(signPreviewAccessToken(preview, ttlMs))}; Path=/; Max-Age=${Math.max(1, Math.floor(ttlMs / 1000))}; HttpOnly; SameSite=Lax`;
 }
 
+function sessionCookie(token: string) {
+  return `${sessionCookieName}=${encodeURIComponent(token)}; Path=/; Max-Age=${Math.max(1, Math.floor(sessionTtlMs / 1000))}; HttpOnly; SameSite=Lax`;
+}
+
+function clearSessionCookie() {
+  return `${sessionCookieName}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`;
+}
+
 function requestHasPreviewAccess(preview: PreviewRecord, request: Request | IncomingMessage) {
   if (preview.access === "public") return true;
   const cookieHeader = request instanceof Request ? request.headers.get("cookie") ?? undefined : request.headers.cookie;
-  return verifyPreviewAccessToken(preview, parseCookieHeader(cookieHeader).get(previewAccessCookieName(preview.id)));
+  const cookies = parseCookieHeader(cookieHeader);
+  if (verifyPreviewAccessToken(preview, cookies.get(previewAccessCookieName(preview.id)))) return true;
+  if (verifySessionToken(cookies.get(sessionCookieName) ?? null)) return true;
+  const authorization = request instanceof Request ? request.headers.get("authorization") ?? undefined : request.headers.authorization;
+  return verifySessionToken(getBearerToken(Array.isArray(authorization) ? authorization[0] : authorization));
 }
 
 function createPreviewAccessRequest(preview: PreviewRecord, sourceUrl: URL) {
@@ -13579,7 +13592,11 @@ app.all("*", async (c, next) => {
 app.get("/health", (c) => c.json({ ok: true }));
 app.get("/api/auth/state", (c) => {
   const token = getBearerToken(c.req.header("authorization"));
-  return c.json(verifySessionToken(token) ? authenticatedAuthState() : anonymousState());
+  if (token && verifySessionToken(token)) {
+    c.header("set-cookie", sessionCookie(token));
+    return c.json(authenticatedAuthState());
+  }
+  return c.json(anonymousState());
 });
 app.post("/provider-proxy/:providerId/:proxyToken/v1/responses", async (c) => {
   const provider = appData.providers.find((item) => item.id === c.req.param("providerId"));
@@ -13621,7 +13638,9 @@ app.post("/api/auth/setup/complete", async (c) => {
   }
   authConfig = { accessTokenHash: hashToken(body.accessToken), otpSecret: pendingOtpSecret };
   saveAuthConfig(authConfig);
-  const response: LoginResponse = { ok: true, sessionToken: signSessionToken(), auth: authenticatedAuthState() };
+  const sessionToken = signSessionToken();
+  c.header("set-cookie", sessionCookie(sessionToken));
+  const response: LoginResponse = { ok: true, sessionToken, auth: authenticatedAuthState() };
   emitExternalNotification({
     eventType: "auth_login",
     severity: "success",
@@ -13643,7 +13662,9 @@ app.post("/api/auth/login", async (c) => {
     const response: LoginResponse = { ok: false, sessionToken: null, auth: anonymousState(), error: "invalid_token_or_otp" };
     return c.json(response, 401);
   }
-  const response: LoginResponse = { ok: true, sessionToken: signSessionToken(), auth: authenticatedAuthState() };
+  const sessionToken = signSessionToken();
+  c.header("set-cookie", sessionCookie(sessionToken));
+  const response: LoginResponse = { ok: true, sessionToken, auth: authenticatedAuthState() };
   emitExternalNotification({
     eventType: "auth_login",
     severity: "success",
@@ -13654,6 +13675,11 @@ app.post("/api/auth/login", async (c) => {
     metadata: { action: "login", userAgent: c.req.header("user-agent") ?? null, ip: c.req.header("x-forwarded-for") ?? null },
   });
   return c.json(response);
+});
+
+app.post("/api/auth/logout", (c) => {
+  c.header("set-cookie", clearSessionCookie());
+  return c.json({ ok: true });
 });
 
 app.get("/api/codex/tasks/:id/events", (c) => {
@@ -13843,7 +13869,9 @@ app.post("/api/auth/access-token", async (c) => {
   if (hashToken(body.currentAccessToken) !== authConfig.accessTokenHash) return c.json({ error: "invalid_current_access_token" }, 401);
   authConfig = { ...authConfig, accessTokenHash: hashToken(body.accessToken) };
   saveAuthConfig(authConfig);
-  const response: LoginResponse = { ok: true, sessionToken: signSessionToken(), auth: authenticatedAuthState() };
+  const sessionToken = signSessionToken();
+  c.header("set-cookie", sessionCookie(sessionToken));
+  const response: LoginResponse = { ok: true, sessionToken, auth: authenticatedAuthState() };
   return c.json(response);
 });
 
@@ -13872,7 +13900,9 @@ app.post("/api/auth/otp/reset/confirm", async (c) => {
   authConfig = { ...authConfig, otpSecret: pendingResetOtpSecret };
   pendingResetOtpSecret = null;
   saveAuthConfig(authConfig);
-  const response: LoginResponse = { ok: true, sessionToken: signSessionToken(), auth: authenticatedAuthState() };
+  const sessionToken = signSessionToken();
+  c.header("set-cookie", sessionCookie(sessionToken));
+  const response: LoginResponse = { ok: true, sessionToken, auth: authenticatedAuthState() };
   return c.json(response);
 });
 

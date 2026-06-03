@@ -1136,10 +1136,57 @@ button:disabled {
   white-space: nowrap;
 }
 
+.activity-detail-button {
+  flex: 0 0 auto;
+}
+
 .activity-item em {
+  flex: 0 0 auto;
   color: var(--muted);
   font-size: 12px;
   font-style: normal;
+}
+
+.activity-detail-content {
+  display: grid;
+  gap: 14px;
+  min-height: 0;
+  padding: 14px;
+}
+
+.activity-detail-layer {
+  z-index: 130;
+}
+
+.activity-detail-card {
+  width: min(620px, calc(100vw - 32px));
+  max-height: min(720px, calc(100vh - 48px));
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+}
+
+.activity-detail-content label {
+  display: grid;
+  gap: 6px;
+}
+
+.activity-detail-content span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.activity-detail-content pre {
+  max-height: min(38vh, 360px);
+  overflow: auto;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #111714;
+  padding: 12px;
+  color: #e7f0ea;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .activity-dot {
