@@ -5,7 +5,7 @@ import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFile
 import { fork, spawn as spawnProcess, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import type { IncomingMessage } from "node:http";
-import { basename, delimiter, dirname, join, relative, resolve } from "node:path";
+import { basename, delimiter, dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn as spawnPty } from "node-pty";
 import { generateSecret, generateURI } from "otplib";
@@ -59,13 +59,28 @@ import type {
   CreateFileRequest,
   CreateProjectRequest,
   CreateFileMountRequest,
+  CreateMcpServerRequest,
+  CreatePluginRequest,
   CreateProviderRequest,
+  ImportSkillRequest,
+  ImportSkillResponse,
+  ImportMcpServerRequest,
+  ImportMcpServerResponse,
+  ImportMarketplaceCatalogRequest,
+  InstallMarketplaceItemRequest,
+  InstallMarketplaceItemResponse,
+  MarketplaceCatalog,
+  MarketplaceCatalogItem,
+  MarketplaceCatalogResponse,
   UpdateProjectRequest,
   CreateRoomRequest,
   CreateRoomMessageRequest,
   CreateSessionRequest,
   CreateSessionCompactionRequest,
+  CreateSkillRequest,
+  DeleteSkillRequest,
   UpdateSessionRequest,
+  UpdateSkillRequest,
   CreateTerminalSessionRequest,
   ExecutionContextSummary,
   EnvironmentOverview,
@@ -335,6 +350,7 @@ let sessionCompactionSettings = runtimeSettingsStore.sessionCompaction.load();
 let rateLimitSettings = rateLimitStore.load();
 let systemBackupSettings = loadSystemBackupSettings();
 const appData = loadAppData();
+pruneCodexSessionProjectTrustEntries();
 let environmentOverview = buildEnvironmentOverview();
 migrateRoomAgentSessionDataRoots();
 migrateRoomWorkspaceRoots();
@@ -1950,15 +1966,54 @@ function readJsonFile(path: string) {
   }
 }
 
-function readSkillDescription(path: string) {
+type SkillMetadata = { name?: string; description?: string };
+
+function readSkillMetadataFromContent(content: string): SkillMetadata {
+  const frontMatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---/m)?.[1] ?? "";
+  const frontMatterName = frontMatter.match(/^name:\s*["']?([^"'\n]+)["']?/m)?.[1]?.trim();
+  const frontMatterDescription = content.match(/^---[\s\S]*?\ndescription:\s*["']?([^"'\n]+)["']?/m)?.[1];
+  const title = content.match(/^#\s+(.+)$/m)?.[1]?.trim();
+  const description = frontMatterDescription?.trim()
+    ?? content.split(/\r?\n/).find((line) => line.trim() && !line.startsWith("---") && !line.startsWith("#"))?.trim();
+  return { name: frontMatterName ?? title, description };
+}
+
+function readSkillMetadata(path: string): SkillMetadata {
   try {
     const content = readFileSync(path, "utf8");
-    const frontMatterDescription = content.match(/^---[\s\S]*?\ndescription:\s*["']?([^"'\n]+)["']?/m)?.[1];
-    if (frontMatterDescription) return frontMatterDescription.trim();
-    return content.split(/\r?\n/).find((line) => line.trim() && !line.startsWith("---") && !line.startsWith("#"))?.trim();
+    return readSkillMetadataFromContent(content);
   } catch {
-    return undefined;
+    return {};
   }
+}
+
+function readSkillDescription(path: string) {
+  return readSkillMetadata(path).description;
+}
+
+function escapeSkillFrontMatter(value: string) {
+  return value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"").replaceAll(/\r?\n/g, " ").trim();
+}
+
+function renderSkillMarkdown(body: CreateSkillRequest) {
+  const name = body.name.trim();
+  const description = body.description.trim();
+  const instructions = body.instructions.trim();
+  return [
+    "---",
+    `name: "${escapeSkillFrontMatter(name)}"`,
+    `description: "${escapeSkillFrontMatter(description)}"`,
+    "---",
+    "",
+    `# ${name}`,
+    "",
+    description,
+    "",
+    "## Instructions",
+    "",
+    instructions,
+    "",
+  ].join("\n");
 }
 
 function findSkillFiles(root: string, depth = 3): string[] {
@@ -1976,21 +2031,130 @@ function findSkillFiles(root: string, depth = 3): string[] {
 function listSkills(): ExtensionSummary[] {
   const roots = [join(codexHome, "skills"), join(codexHome, "plugins", "cache")];
   const seen = new Set<string>();
+  const scannedAt = new Date().toISOString();
   return roots.flatMap((root) => findSkillFiles(root)).flatMap((skillPath) => {
     const folder = dirname(skillPath);
     if (seen.has(folder)) return [];
     seen.add(folder);
-    const name = basename(folder);
+    const metadata = readSkillMetadata(skillPath);
+    const isPluginCache = folder.includes(`${sep}plugins${sep}cache${sep}`);
+    const isWebManaged = folder.includes(`${sep}skills${sep}web${sep}`);
+    const name = metadata.name ?? basename(folder);
     return [{
       id: `skill:${folder}`,
       type: "skill" as const,
       name,
-      description: readSkillDescription(skillPath),
+      description: metadata.description,
       path: folder,
-      source: folder.includes("/plugins/cache/") ? "plugin cache" : "codex home",
+      source: isPluginCache ? "plugin cache" : isWebManaged ? "web local" : "codex home",
+      sourceType: isPluginCache ? "plugin_cache" as const : "codex_skill" as const,
+      managedBy: isWebManaged ? "web" as const : "codex_cli" as const,
+      syncStatus: "synced" as const,
+      scannedAt,
+      capabilityKinds: ["knowledge" as const],
+      permissions: ["read_context"],
       enabled: true,
     }];
   }).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function createLocalSkill(body: CreateSkillRequest): ExtensionSummary {
+  const name = body.name.trim().replaceAll(/\s+/g, " ");
+  const description = body.description.trim().replaceAll(/\s+/g, " ");
+  const instructions = body.instructions.trim();
+  if (!name || !description || !instructions) throw new Error("invalid_skill");
+  const folder = join(codexHome, "skills", "web", slugify(name));
+  const skillPath = join(folder, "SKILL.md");
+  if (existsSync(skillPath)) throw new Error("skill_exists");
+  mkdirSync(folder, { recursive: true });
+  writeFileSync(skillPath, renderSkillMarkdown({ name, description, instructions }), "utf8");
+  const scannedAt = new Date().toISOString();
+  return {
+    id: `skill:${folder}`,
+    type: "skill",
+    name,
+    description,
+    path: folder,
+    source: "web local",
+    sourceType: "codex_skill",
+    managedBy: "web",
+    syncStatus: "synced",
+    scannedAt,
+    capabilityKinds: ["knowledge"],
+    permissions: ["read_context"],
+    enabled: true,
+  };
+}
+
+function skillInstructionsFromContent(content: string) {
+  const withoutFrontMatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\s*/m, "").trim();
+  const instructionMatch = withoutFrontMatter.match(/(?:^|\n)## Instructions\s*\n([\s\S]*)/i);
+  if (instructionMatch?.[1]) return instructionMatch[1].trim();
+  return withoutFrontMatter.replace(/^# .*\n+/, "").trim();
+}
+
+function normalizeImportUrl(url: string) {
+  const githubBlob = url.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+)$/);
+  if (githubBlob) return `https://raw.githubusercontent.com/${githubBlob[1]}/${githubBlob[2]}/${githubBlob[3]}/${githubBlob[4]}`;
+  return url;
+}
+
+async function importSkill(body: ImportSkillRequest): Promise<ImportSkillResponse> {
+  const rawContent = body.content?.trim();
+  const url = body.url?.trim();
+  let content = rawContent ?? "";
+  if (!content && url) {
+    content = await fetch(normalizeImportUrl(url), { redirect: "follow" }).then((response) => {
+      if (!response.ok) throw new Error("skill_import_fetch_failed");
+      return response.text();
+    });
+  }
+  if (!content.trim()) throw new Error("skill_import_empty");
+  const metadata = readSkillMetadataFromContent(content);
+  const name = metadata.name?.trim() || (url ? basename(url).replace(/\.(md|markdown)$/i, "") : "");
+  const description = metadata.description?.trim() || "Imported Skill";
+  const instructions = skillInstructionsFromContent(content);
+  if (!name || !instructions) throw new Error("skill_import_invalid");
+  return { imported: createLocalSkill({ name, description, instructions }) };
+}
+
+function assertWebManagedSkillPath(path: string) {
+  const root = resolve(codexHome, "skills", "web");
+  const folder = resolve(path);
+  if (folder !== root && !folder.startsWith(`${root}${sep}`)) throw new Error("skill_not_web_managed");
+  const skillPath = join(folder, "SKILL.md");
+  if (!existsSync(skillPath)) throw new Error("skill_not_found");
+  return { folder, skillPath };
+}
+
+function updateLocalSkill(body: UpdateSkillRequest): ExtensionSummary {
+  const { folder, skillPath } = assertWebManagedSkillPath(body.path);
+  const name = body.name.trim().replaceAll(/\s+/g, " ");
+  const description = body.description.trim().replaceAll(/\s+/g, " ");
+  const instructions = body.instructions.trim();
+  if (!name || !description || !instructions) throw new Error("invalid_skill");
+  writeFileSync(skillPath, renderSkillMarkdown({ name, description, instructions }), "utf8");
+  return {
+    id: `skill:${folder}`,
+    type: "skill",
+    name,
+    description,
+    path: folder,
+    source: "web local",
+    sourceType: "codex_skill",
+    managedBy: "web",
+    syncStatus: "synced",
+    scannedAt: new Date().toISOString(),
+    capabilityKinds: ["knowledge"],
+    permissions: ["read_context"],
+    enabled: true,
+  };
+}
+
+function deleteLocalSkill(body: DeleteSkillRequest) {
+  const { folder } = assertWebManagedSkillPath(body.path);
+  rmSync(folder, { recursive: true, force: true });
+  return { ok: true, path: folder };
 }
 
 function findPluginManifests(root: string, depth = 4): string[] {
@@ -2025,19 +2189,287 @@ function listPlugins(): ExtensionSummary[] {
   }).sort((a, b) => a.name.localeCompare(b.name));
 }
 
+function createLocalPlugin(body: CreatePluginRequest): ExtensionSummary {
+  const name = body.name.trim().replaceAll(/\s+/g, " ");
+  if (!name) throw new Error("invalid_plugin");
+  const description = body.description?.trim() || "";
+  const pluginRoot = join(codexHome, "plugins", "web", slugify(name));
+  const manifestDir = join(pluginRoot, ".codex-plugin");
+  const manifestPath = join(manifestDir, "plugin.json");
+  if (existsSync(manifestPath)) throw new Error("plugin_exists");
+  mkdirSync(manifestDir, { recursive: true });
+  writeFileSync(manifestPath, JSON.stringify({
+    name,
+    version: "0.1.0",
+    description,
+  }, null, 2), "utf8");
+  return {
+    id: `plugin:${pluginRoot}`,
+    type: "plugin",
+    name,
+    description,
+    path: pluginRoot,
+    source: "web local",
+    sourceType: "codex_plugin",
+    managedBy: "web",
+    syncStatus: "synced",
+    scannedAt: new Date().toISOString(),
+    capabilityKinds: ["tool"],
+    enabled: true,
+  };
+}
+
 function listMcpServers(): ExtensionSummary[] {
   const configPath = join(codexHome, "config.toml");
   if (!existsSync(configPath)) return [];
   const content = readFileSync(configPath, "utf8");
-  const matches = Array.from(content.matchAll(/^\[mcp_servers\.([^\]]+)\]/gm));
+  const matches = Array.from(content.matchAll(/^\[mcp_servers\.(?:"((?:\\.|[^"])*)"|([^\]]+))\]/gm));
   return matches.map((match) => ({
-    id: `mcp:${match[1]}`,
+    id: `mcp:${match[1] ? JSON.parse(`"${match[1]}"`) : match[2]}`,
     type: "mcp" as const,
-    name: match[1],
+    name: match[1] ? JSON.parse(`"${match[1]}"`) : match[2],
     path: configPath,
     source: "config.toml",
     enabled: true,
   })).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function extensionTomlString(value: string) {
+  return JSON.stringify(value);
+}
+
+function extensionTomlArray(values: string[]) {
+  return `[${values.map(extensionTomlString).join(", ")}]`;
+}
+
+function renderMcpServerToml(body: CreateMcpServerRequest) {
+  const args = body.args ?? [];
+  const env = body.env ?? {};
+  const lines = [
+    `[mcp_servers.${extensionTomlString(body.name.trim())}]`,
+    `command = ${extensionTomlString(body.command.trim())}`,
+  ];
+  if (args.length) lines.push(`args = ${extensionTomlArray(args)}`);
+  if (Object.keys(env).length) {
+    lines.push("env = { " + Object.entries(env).map(([key, value]) => `${key} = ${extensionTomlString(value)}`).join(", ") + " }");
+  }
+  return lines.join("\n");
+}
+
+function decodeHtmlEntities(value: string) {
+  return value
+    .replaceAll("&quot;", "\"")
+    .replaceAll("&#34;", "\"")
+    .replaceAll("&apos;", "'")
+    .replaceAll("&#39;", "'")
+    .replaceAll("&amp;", "&")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">");
+}
+
+const builtInMarketplaceCatalog: MarketplaceCatalog = {
+  schemaVersion: 1,
+  source: {
+    id: "agentim-built-in",
+    name: "AgentIM Built-in Catalog",
+  },
+  items: [],
+};
+const marketplaceCatalogSettingsKey = "marketplace_catalog";
+
+function loadMarketplaceCatalog(): MarketplaceCatalogResponse {
+  const catalog = loadJsonSetting<MarketplaceCatalog>(marketplaceCatalogSettingsKey, builtInMarketplaceCatalog);
+  if (catalog?.schemaVersion !== 1 || !catalog.source?.id || !catalog.source?.name || !Array.isArray(catalog.items)) {
+    return {
+      source: builtInMarketplaceCatalog.source,
+      items: builtInMarketplaceCatalog.items,
+      fetchedAt: new Date().toISOString(),
+    };
+  }
+  return {
+    source: catalog.source,
+    items: catalog.items.map(assertMarketplaceItem),
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+function saveMarketplaceCatalog(response: MarketplaceCatalogResponse) {
+  const catalog: MarketplaceCatalog = {
+    schemaVersion: 1,
+    source: response.source,
+    items: response.items.map(assertMarketplaceItem),
+  };
+  saveJsonSetting(marketplaceCatalogSettingsKey, catalog);
+  return response;
+}
+
+function normalizeMarketplaceMcpConfig(config: unknown): CreateMcpServerRequest[] {
+  if (!config || typeof config !== "object") return [];
+  const root = config as Record<string, unknown>;
+  const servers = root.mcpServers && typeof root.mcpServers === "object" ? root.mcpServers as Record<string, unknown> : root;
+  return Object.entries(servers).flatMap(([name, raw]) => {
+    if (!raw || typeof raw !== "object") return [];
+    const server = raw as Record<string, unknown>;
+    const command = typeof server.command === "string" ? server.command.trim() : "";
+    if (!command) return [];
+    const args = Array.isArray(server.args) ? server.args.map(String) : [];
+    const env = server.env && typeof server.env === "object"
+      ? Object.fromEntries(Object.entries(server.env as Record<string, unknown>).map(([key, value]) => [key, String(value)]))
+      : {};
+    return [{ name, command, args, env }];
+  });
+}
+
+function assertMarketplaceItem(value: unknown): MarketplaceCatalogItem {
+  if (!value || typeof value !== "object") throw new Error("invalid_marketplace_item");
+  const item = value as MarketplaceCatalogItem;
+  if (!item.id || !item.name || !item.description || !item.type || !item.install) throw new Error("invalid_marketplace_item");
+  if (item.type !== "skill" && item.type !== "mcp" && item.type !== "plugin") throw new Error("invalid_marketplace_type");
+  return item;
+}
+
+function parseMarketplaceCatalog(content: string): MarketplaceCatalogResponse {
+  const parsed = JSON.parse(content) as MarketplaceCatalog;
+  if (parsed?.schemaVersion !== 1 || !parsed.source?.id || !parsed.source?.name || !Array.isArray(parsed.items)) throw new Error("invalid_marketplace_catalog");
+  const items = parsed.items.map(assertMarketplaceItem);
+  return {
+    source: parsed.source,
+    items,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+async function importMarketplaceCatalog(body: ImportMarketplaceCatalogRequest): Promise<MarketplaceCatalogResponse> {
+  const rawContent = body.content?.trim();
+  const url = body.url?.trim();
+  let content = rawContent ?? "";
+  if (!content && url) {
+    content = await fetch(url, { redirect: "follow" }).then((response) => {
+      if (!response.ok) throw new Error("marketplace_catalog_fetch_failed");
+      return response.text();
+    });
+  }
+  if (!content.trim()) throw new Error("marketplace_catalog_empty");
+  return parseMarketplaceCatalog(content);
+}
+
+async function installMarketplaceItem(body: InstallMarketplaceItemRequest): Promise<InstallMarketplaceItemResponse> {
+  const item = assertMarketplaceItem(body.item);
+  const install = item.install;
+  if (item.type === "skill" && install.kind === "skill") return { installed: [createLocalSkill(install.skill)] };
+  if (item.type === "skill" && install.kind === "skillUrl") {
+    const result = await importSkill({ url: install.url });
+    return { installed: [result.imported] };
+  }
+  if (item.type === "mcp" && install.kind === "mcpServers") {
+    const candidates = normalizeMarketplaceMcpConfig(install.config);
+    if (!candidates.length) throw new Error("marketplace_mcp_empty");
+    return { installed: candidates.map((candidate) => createMcpServer(candidate)) };
+  }
+  if (item.type === "plugin" && install.kind === "plugin") return { installed: [createLocalPlugin(install.manifest)] };
+  throw new Error("marketplace_install_mismatch");
+}
+
+function mcpCandidatesFromConfig(value: unknown): CreateMcpServerRequest[] {
+  if (!value || typeof value !== "object") return [];
+  const root = value as Record<string, unknown>;
+  const servers = root.mcpServers && typeof root.mcpServers === "object" ? root.mcpServers as Record<string, unknown> : null;
+  if (!servers) return [];
+  return Object.entries(servers).flatMap(([name, raw]) => {
+    if (!raw || typeof raw !== "object") return [];
+    const server = raw as Record<string, unknown>;
+    const command = typeof server.command === "string" ? server.command : "";
+    if (!command.trim()) return [];
+    const args = Array.isArray(server.args) ? server.args.map(String) : [];
+    const env = server.env && typeof server.env === "object"
+      ? Object.fromEntries(Object.entries(server.env as Record<string, unknown>).map(([key, val]) => [key, String(val)]))
+      : {};
+    return [{ name, command, args, env }];
+  });
+}
+
+function tryParseMcpJson(value: string) {
+  try {
+    return mcpCandidatesFromConfig(JSON.parse(value));
+  } catch {
+    return [];
+  }
+}
+
+function extractMcpCandidates(content: string): CreateMcpServerRequest[] {
+  const decoded = decodeHtmlEntities(content);
+  const candidates: CreateMcpServerRequest[] = [];
+  const seen = new Set<string>();
+  const push = (items: CreateMcpServerRequest[]) => {
+    for (const item of items) {
+      const key = `${item.name}\n${item.command}\n${(item.args ?? []).join("\n")}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push(item);
+    }
+  };
+  push(tryParseMcpJson(decoded));
+  for (const fence of decoded.matchAll(/```(?:json|jsonc)?\s*([\s\S]*?)```/gi)) push(tryParseMcpJson(fence[1].trim()));
+  for (const match of decoded.matchAll(/"mcpServers"\s*:/g)) {
+    const start = decoded.lastIndexOf("{", match.index);
+    if (start < 0) continue;
+    for (let end = decoded.indexOf("}", match.index); end > 0 && end < decoded.length; end = decoded.indexOf("}", end + 1)) {
+      const snippet = decoded.slice(start, end + 1);
+      const parsed = tryParseMcpJson(snippet);
+      if (parsed.length) {
+        push(parsed);
+        break;
+      }
+    }
+  }
+  return candidates;
+}
+
+function createMcpServer(body: CreateMcpServerRequest): ExtensionSummary {
+  const name = body.name.trim();
+  const command = body.command.trim();
+  if (!name || !/^[A-Za-z0-9_.-]+$/.test(name) || !command) throw new Error("invalid_mcp_server");
+  const configPath = join(codexHome, "config.toml");
+  mkdirSync(dirname(configPath), { recursive: true });
+  const current = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const escapedQuotedName = extensionTomlString(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const sectionPattern = new RegExp(`^\\[mcp_servers\\.(?:${escapedQuotedName}|${escapedName})\\][\\s\\S]*?(?=^\\[|\\s*$)`, "m");
+  const section = renderMcpServerToml({ ...body, name, command });
+  const next = sectionPattern.test(current)
+    ? current.replace(sectionPattern, section)
+    : [current.trimEnd(), section].filter(Boolean).join("\n\n");
+  writeFileSync(configPath, `${next.trimEnd()}\n`, "utf8");
+  return {
+    id: `mcp:${name}`,
+    type: "mcp",
+    name,
+    path: configPath,
+    source: "config.toml",
+    sourceType: "mcp_config",
+    managedBy: "web",
+    syncStatus: "synced",
+    scannedAt: new Date().toISOString(),
+    capabilityKinds: ["connector"],
+    enabled: true,
+  };
+}
+
+async function importMcpServers(body: ImportMcpServerRequest): Promise<ImportMcpServerResponse> {
+  const rawContent = body.content?.trim();
+  const url = body.url?.trim();
+  let content = rawContent ?? "";
+  if (!content && url) {
+    content = await fetch(url, { redirect: "follow" }).then((response) => {
+      if (!response.ok) throw new Error("mcp_import_fetch_failed");
+      return response.text();
+    });
+  }
+  if (!content.trim()) throw new Error("mcp_import_empty");
+  const candidates = extractMcpCandidates(content);
+  if (!candidates.length) throw new Error("mcp_import_no_candidates");
+  const imported = candidates.map((candidate) => createMcpServer(candidate));
+  return { imported, candidates };
 }
 
 function pageExtensions(items: ExtensionSummary[], limit = 20, cursorValue?: string | null, q = "") {
@@ -2061,7 +2493,8 @@ function readMcpConfigSection(name: string) {
   const configPath = join(codexHome, "config.toml");
   const content = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
   const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = content.match(new RegExp(`^\\[mcp_servers\\.${escapedName}\\][\\s\\S]*?(?=^\\[|\\s*$)`, "m"));
+  const escapedQuotedName = extensionTomlString(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = content.match(new RegExp(`^\\[mcp_servers\\.(?:${escapedQuotedName}|${escapedName})\\][\\s\\S]*?(?=^\\[|\\s*$)`, "m"));
   return match?.[0]?.trim() || "";
 }
 
@@ -2081,13 +2514,22 @@ function readExtensionDetail(type: ExtensionSummary["type"], name: string, path?
   const rootPath = assertInsideCodexHome(path);
   if (type === "skill") {
     const skillPath = join(rootPath, "SKILL.md");
+    const metadata = readSkillMetadata(skillPath);
+    const isPluginCache = rootPath.includes(`${sep}plugins${sep}cache${sep}`);
+    const isWebManaged = rootPath.includes(`${sep}skills${sep}web${sep}`);
     const item: ExtensionSummary = {
       id: `skill:${rootPath}`,
       type,
-      name: name || basename(rootPath),
-      description: readSkillDescription(skillPath),
+      name: name || metadata.name || basename(rootPath),
+      description: metadata.description,
       path: rootPath,
-      source: rootPath.includes("/plugins/cache/") ? "plugin cache" : "codex home",
+      source: isPluginCache ? "plugin cache" : isWebManaged ? "web local" : "codex home",
+      sourceType: isPluginCache ? "plugin_cache" : "codex_skill",
+      managedBy: isWebManaged ? "web" : "codex_cli",
+      syncStatus: "synced",
+      scannedAt: new Date().toISOString(),
+      capabilityKinds: ["knowledge"],
+      permissions: ["read_context"],
       enabled: true,
     };
     return { item, format: "markdown", content: readFileSync(skillPath, "utf8") };
@@ -3516,6 +3958,11 @@ function linkAutomationSession(automationId: string, sessionId: string) {
   db.prepare("update automations set session_id = ? where id = ?").run(sessionId, automationId);
 }
 
+function automationIdForSession(sessionId: string) {
+  const row = db.prepare("select id from automations where session_id = ?").get(sessionId) as { id?: string } | undefined;
+  return row?.id ?? null;
+}
+
 function ensureAutomationSession(automation: AutomationSummary) {
   const project = automation.projectId ? appData.projects.find((item) => item.id === automation.projectId) : null;
   const provider = automation.providerId
@@ -4192,6 +4639,41 @@ type CodexTaskContextInput = Partial<Pick<ExecutionContextSummary, "sourceType" 
   replyToMessageId?: string | null;
 };
 
+function assignedSkillMarkdown(capabilityId: string) {
+  if (!capabilityId.startsWith("skill:")) return "";
+  const folder = capabilityId.slice("skill:".length);
+  try {
+    const rootPath = assertInsideCodexHome(folder);
+    const skillPath = join(rootPath, "SKILL.md");
+    if (!existsSync(skillPath)) return "";
+    const metadata = readSkillMetadata(skillPath);
+    const content = readFileSync(skillPath, "utf8").replace(/^---\r?\n[\s\S]*?\r?\n---\s*/m, "").trim();
+    return [
+      `## ${metadata.name ?? basename(rootPath)}`,
+      metadata.description ? `Description: ${metadata.description}` : "",
+      `Path: ${rootPath}`,
+      "",
+      truncateContextText(content, 3200),
+    ].filter(Boolean).join("\n");
+  } catch {
+    return "";
+  }
+}
+
+function agentSkillsContext(session: SessionSummary, contextInput?: CodexTaskContextInput) {
+  const agentId = contextInput?.agentId ?? directAgentForSession(session.id)?.agent.id ?? null;
+  if (!agentId) return "";
+  const skillIds = listSkills().map((skill) => skill.id);
+  const sections = skillIds.map(assignedSkillMarkdown).filter(Boolean);
+  if (!sections.length) return "";
+  return [
+    "# Available Skills",
+    "Agents can use all currently discovered Skills by default. Use the relevant Skills when they fit the current task.",
+    "",
+    sections.join("\n\n"),
+  ].join("\n");
+}
+
 function writeExecutionContextPack(
   session: SessionSummary,
   prompt: string,
@@ -4206,6 +4688,7 @@ function writeExecutionContextPack(
   const roomContext = roomId ? roomBlackboardContext(roomId, agentId) : "";
   const notificationContext = notificationSkillContext(session);
   const crossSessionContext = crossSessionSkillContext(session);
+  const agentSkillContext = agentSkillsContext(session, contextInput);
   const goalContext = goalContextMarkdown(activeGoalForSession(session));
   const persistentMemory = latestSessionMemoryMarkdown(session.id);
   const workspaceState = workspaceStateMarkdown(cwd);
@@ -4265,6 +4748,7 @@ function writeExecutionContextPack(
     roomId ? "- decisions.md" : "",
     notificationContext ? "- notification-skill.md" : "",
     crossSessionContext ? "- cross-session-skill.md" : "",
+    agentSkillContext ? "- agent-skills.md" : "",
     "",
     persistentMemory,
     persistentMemory ? "" : "",
@@ -4276,6 +4760,8 @@ function writeExecutionContextPack(
     notificationContext,
     "",
     crossSessionContext,
+    "",
+    agentSkillContext,
     "",
     goalContext,
     "",
@@ -4299,6 +4785,7 @@ function writeExecutionContextPack(
   if (goalContext) writeSessionContextFile(session.id, "goal.md", goalContext);
   if (notificationContext) writeSessionContextFile(session.id, "notification-skill.md", notificationContext);
   if (crossSessionContext) writeSessionContextFile(session.id, "cross-session-skill.md", crossSessionContext);
+  if (agentSkillContext) writeSessionContextFile(session.id, "agent-skills.md", agentSkillContext);
   if (roomContext) writeSessionContextFile(session.id, "room-blackboard.md", roomContext);
   if (roomId) writeSessionContextFile(session.id, "decisions.md", roomDecisionsMarkdown(roomId));
   return { contextPackPath, pack };
@@ -5806,6 +6293,55 @@ function saveJsonSetting(key: string, value: unknown) {
     values (?, ?, ?)
     on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at
   `).run(key, JSON.stringify(value), updatedAt);
+}
+
+function decodeTomlQuotedKey(value: string) {
+  try {
+    return JSON.parse(`"${value}"`) as string;
+  } catch {
+    return value;
+  }
+}
+
+function shouldPruneCodexProjectTrustPath(value: string) {
+  const absolutePath = resolve(value);
+  const sessionRoot = resolve(sessionWorkspaceRoot);
+  return absolutePath === sessionRoot || absolutePath.startsWith(`${sessionRoot}${sep}`);
+}
+
+function pruneCodexSessionProjectTrustEntries() {
+  const configPath = join(codexHome, "config.toml");
+  if (!existsSync(configPath)) return 0;
+  const content = readFileSync(configPath, "utf8");
+  const lines = content.split(/\r?\n/);
+  const nextLines: string[] = [];
+  let pruned = 0;
+  for (let index = 0; index < lines.length;) {
+    const line = lines[index];
+    const match = line.match(/^\[projects\.(?:"((?:\\.|[^"])*)"|([^\]]+))\]\s*$/);
+    if (!match) {
+      nextLines.push(line);
+      index += 1;
+      continue;
+    }
+    const projectPath = match[1] ? decodeTomlQuotedKey(match[1]) : match[2];
+    const section: string[] = [line];
+    index += 1;
+    while (index < lines.length && !lines[index].startsWith("[")) {
+      section.push(lines[index]);
+      index += 1;
+    }
+    if (projectPath && shouldPruneCodexProjectTrustPath(projectPath)) {
+      pruned += 1;
+      continue;
+    }
+    nextLines.push(...section);
+  }
+  if (pruned) {
+    writeFileSync(`${configPath}.codex-web-prune.bak`, content, "utf8");
+    writeFileSync(configPath, nextLines.join("\n"), "utf8");
+  }
+  return pruned;
 }
 
 function commandVersion(command: string, args: string[]) {
@@ -11601,6 +12137,7 @@ function finalizeCodexRunnerTask(session: SessionSummary, exitCode: number | nul
   session.updatedAt = new Date().toISOString();
   writeTaskExitCode(session.id, exitCode);
   saveAppData();
+  pruneCodexSessionProjectTrustEntries();
   publishTaskEvent(session.id, { type: "workspace", session, reason: "done", at: new Date().toISOString() });
   publishTaskEvent(session.id, { type: "done", session, exitCode });
   const notificationScopes = [
@@ -12553,7 +13090,7 @@ app.post("/api/auth/login", async (c) => {
     return c.json(response, 409);
   }
   const body = await c.req.json<LoginRequest>().catch(() => null);
-  if (!body || hashToken(body.accessToken) !== authConfig.accessTokenHash || !(await verifyOtp(authConfig.otpSecret, body.otp))) {
+  if (!body?.accessToken || !body.otp || hashToken(body.accessToken) !== authConfig.accessTokenHash || !(await verifyOtp(authConfig.otpSecret, body.otp))) {
     const response: LoginResponse = { ok: false, sessionToken: null, auth: anonymousState(), error: "invalid_token_or_otp" };
     return c.json(response, 401);
   }
@@ -16566,15 +17103,105 @@ app.get("/api/extensions/skills", (c) => {
   if (!c.req.query("limit") && !c.req.query("cursor") && !c.req.query("q")) return c.json(items);
   return c.json(pageExtensions(items, parsePageLimit(c.req.query("limit"), 20), c.req.query("cursor"), c.req.query("q") ?? ""));
 });
+app.post("/api/extensions/skills", async (c) => {
+  const body = await c.req.json<CreateSkillRequest>().catch(() => null);
+  if (!body?.name || !body.description || !body.instructions) return c.json({ error: "invalid_skill" }, 400);
+  try {
+    return c.json(createLocalSkill(body), 201);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "skill_create_failed";
+    return c.json({ error: message }, message === "skill_exists" ? 409 : 400);
+  }
+});
+app.post("/api/extensions/skills/import", async (c) => {
+  const body = await c.req.json<ImportSkillRequest>().catch(() => null);
+  if (!body?.url && !body?.content) return c.json({ error: "skill_import_empty" }, 400);
+  try {
+    return c.json(await importSkill(body), 201);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "skill_import_failed";
+    return c.json({ error: message }, message === "skill_exists" ? 409 : 400);
+  }
+});
+app.put("/api/extensions/skills", async (c) => {
+  const body = await c.req.json<UpdateSkillRequest>().catch(() => null);
+  if (!body?.path || !body.name || !body.description || !body.instructions) return c.json({ error: "invalid_skill" }, 400);
+  try {
+    return c.json(updateLocalSkill(body));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "skill_update_failed";
+    return c.json({ error: message }, message === "skill_not_found" ? 404 : 400);
+  }
+});
+app.delete("/api/extensions/skills", async (c) => {
+  const body = await c.req.json<DeleteSkillRequest>().catch(() => null);
+  if (!body?.path) return c.json({ error: "invalid_skill" }, 400);
+  try {
+    return c.json(deleteLocalSkill(body));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "skill_delete_failed";
+    return c.json({ error: message }, message === "skill_not_found" ? 404 : 400);
+  }
+});
 app.get("/api/extensions/plugins", (c) => {
   const items = listPlugins();
   if (!c.req.query("limit") && !c.req.query("cursor") && !c.req.query("q")) return c.json(items);
   return c.json(pageExtensions(items, parsePageLimit(c.req.query("limit"), 20), c.req.query("cursor"), c.req.query("q") ?? ""));
 });
+app.post("/api/extensions/plugins", async (c) => {
+  const body = await c.req.json<CreatePluginRequest>().catch(() => null);
+  if (!body?.name) return c.json({ error: "invalid_plugin" }, 400);
+  try {
+    return c.json(createLocalPlugin(body), 201);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "plugin_create_failed";
+    return c.json({ error: message }, message === "plugin_exists" ? 409 : 400);
+  }
+});
 app.get("/api/extensions/mcp", (c) => {
   const items = listMcpServers();
   if (!c.req.query("limit") && !c.req.query("cursor") && !c.req.query("q")) return c.json(items);
   return c.json(pageExtensions(items, parsePageLimit(c.req.query("limit"), 20), c.req.query("cursor"), c.req.query("q") ?? ""));
+});
+app.post("/api/extensions/mcp", async (c) => {
+  const body = await c.req.json<CreateMcpServerRequest>().catch(() => null);
+  if (!body?.name || !body.command) return c.json({ error: "invalid_mcp_server" }, 400);
+  try {
+    return c.json(createMcpServer(body), 201);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "mcp_create_failed" }, 400);
+  }
+});
+app.post("/api/extensions/mcp/import", async (c) => {
+  const body = await c.req.json<ImportMcpServerRequest>().catch(() => null);
+  if (!body?.url && !body?.content) return c.json({ error: "mcp_import_empty" }, 400);
+  try {
+    return c.json(await importMcpServers(body), 201);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "mcp_import_failed" }, 400);
+  }
+});
+app.get("/api/extensions/marketplace", (c) => {
+  return c.json(loadMarketplaceCatalog());
+});
+app.post("/api/extensions/marketplace/import", async (c) => {
+  const body = await c.req.json<ImportMarketplaceCatalogRequest>().catch(() => null);
+  if (!body?.url && !body?.content) return c.json({ error: "marketplace_catalog_empty" }, 400);
+  try {
+    return c.json(saveMarketplaceCatalog(await importMarketplaceCatalog(body)));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : "marketplace_catalog_import_failed" }, 400);
+  }
+});
+app.post("/api/extensions/marketplace/install", async (c) => {
+  const body = await c.req.json<InstallMarketplaceItemRequest>().catch(() => null);
+  if (!body?.item) return c.json({ error: "invalid_marketplace_item" }, 400);
+  try {
+    return c.json(await installMarketplaceItem(body), 201);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "marketplace_install_failed";
+    return c.json({ error: message }, message.endsWith("_exists") ? 409 : 400);
+  }
 });
 app.get("/api/extensions/detail", (c) => {
   try {

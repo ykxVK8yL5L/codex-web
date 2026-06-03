@@ -1199,6 +1199,138 @@ export interface ExtensionSummary {
   path?: string;
   source?: string;
   enabled?: boolean;
+  sourceType?: "codex_skill" | "codex_plugin" | "plugin_cache" | "mcp_config" | "local" | "unknown";
+  managedBy?: "codex_cli" | "web" | "project" | "external" | "unknown";
+  syncStatus?: "synced" | "changed" | "missing" | "external" | "unknown";
+  scannedAt?: string;
+  capabilityKinds?: Array<"knowledge" | "tool" | "action" | "connector" | "provider" | "ui">;
+  permissions?: string[];
+  assignableTo?: Array<"agent" | "room" | "automation">;
+}
+
+export interface CreateSkillRequest {
+  name: string;
+  description: string;
+  instructions: string;
+}
+
+export interface UpdateSkillRequest extends CreateSkillRequest {
+  path: string;
+}
+
+export interface DeleteSkillRequest {
+  path: string;
+}
+
+export interface ImportSkillRequest {
+  url?: string;
+  content?: string;
+}
+
+export interface ImportSkillResponse {
+  imported: ExtensionSummary;
+}
+
+export interface CreatePluginRequest {
+  name: string;
+  description?: string;
+}
+
+export interface CreateMcpServerRequest {
+  name: string;
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
+export interface ImportMcpServerRequest {
+  url?: string;
+  content?: string;
+}
+
+export interface ImportMcpServerResponse {
+  imported: ExtensionSummary[];
+  candidates: CreateMcpServerRequest[];
+}
+
+export type MarketplaceCapabilityType = "skill" | "mcp" | "plugin";
+
+export interface MarketplaceCatalogSource {
+  id: string;
+  name: string;
+  homepage?: string;
+}
+
+export interface MarketplaceSkillInstall {
+  kind: "skill";
+  skill: CreateSkillRequest;
+}
+
+export interface MarketplaceSkillUrlInstall {
+  kind: "skillUrl";
+  url: string;
+}
+
+export interface MarketplaceMcpServersInstall {
+  kind: "mcpServers";
+  config: {
+    mcpServers: Record<string, Omit<CreateMcpServerRequest, "name">>;
+  } | Record<string, Omit<CreateMcpServerRequest, "name">>;
+}
+
+export interface MarketplacePluginInstall {
+  kind: "plugin";
+  manifest: CreatePluginRequest & { version?: string };
+}
+
+export type MarketplaceInstall =
+  | MarketplaceSkillInstall
+  | MarketplaceSkillUrlInstall
+  | MarketplaceMcpServersInstall
+  | MarketplacePluginInstall;
+
+export interface MarketplaceCatalogItem {
+  id: string;
+  type: MarketplaceCapabilityType;
+  name: string;
+  description: string;
+  category?: string;
+  tags?: string[];
+  homepage?: string;
+  author?: string;
+  version?: string;
+  source?: string;
+  requires?: {
+    runtimes?: string[];
+    commands?: string[];
+  };
+  install: MarketplaceInstall;
+}
+
+export interface MarketplaceCatalog {
+  schemaVersion: 1;
+  source: MarketplaceCatalogSource;
+  items: MarketplaceCatalogItem[];
+}
+
+export interface MarketplaceCatalogResponse {
+  source: MarketplaceCatalogSource;
+  items: MarketplaceCatalogItem[];
+  error?: string;
+  fetchedAt?: string;
+}
+
+export interface ImportMarketplaceCatalogRequest {
+  url?: string;
+  content?: string;
+}
+
+export interface InstallMarketplaceItemRequest {
+  item: MarketplaceCatalogItem;
+}
+
+export interface InstallMarketplaceItemResponse {
+  installed: ExtensionSummary[];
 }
 
 export interface ExtensionDetail {
