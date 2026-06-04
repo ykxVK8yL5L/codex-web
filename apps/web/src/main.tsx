@@ -742,7 +742,13 @@ function App() {
   const toastTimerRef = useRef<number | null>(null);
   const dialog = useAppDialog();
   const activeSession = activeSessionId ? sessions.find((session) => session.id === activeSessionId) : undefined;
-  const visibleSessions = sessions.filter((session) => session.conversationType !== "automation");
+  const visibleSessions = sessions.filter((session) => {
+    if (session.conversationType === "agent" && session.roomId) return false;
+    if (session.conversationType === "automation") {
+      return !automations.some((automation) => automation.sessionId === session.id);
+    }
+    return true;
+  });
   const routeSessionPending = page === "sessions" && Boolean(activeSessionId) && !activeSession;
 
   function navigate(pageName: Page) {
@@ -1037,7 +1043,7 @@ function App() {
       return response.json() as Promise<T>;
     }
     const [nextSessions, nextProjects, nextProviders, nextAutomations, nextApprovals] = await Promise.all([
-      getJson<PageResponse<SessionSummary>>("/api/sessions?limit=30"),
+      getJson<PageResponse<SessionSummary>>("/api/sessions?limit=30&includeAutomations=1"),
       getJson<ProjectSummary[]>("/api/projects"),
       getJson<ProviderSummary[]>("/api/providers"),
       getJson<AutomationSummary[]>("/api/automations"),
@@ -1083,6 +1089,7 @@ function App() {
     if (search.trim()) params.set("q", search.trim());
     if (projectId !== "all") params.set("projectId", projectId);
     if (status !== "all") params.set("status", status);
+    params.set("includeAutomations", "1");
     const response = await fetch(`/api/sessions?${params}`, {
       headers: { authorization: `Bearer ${sessionToken}` },
     });
@@ -9414,14 +9421,16 @@ function AutomationsPage({
   }
 
   async function deleteAutomation(automation: AutomationSummary) {
-    const confirmed = await dialog.confirm({
+    const decision = await dialog.confirmWithCheckbox({
       title: t("automation.deleteAutomation"),
       message: automation.name,
       confirmLabel: t("action.delete"),
+      checkboxLabel: t("automation.deleteSession"),
+      checkboxDefaultChecked: true,
       danger: true,
     });
-    if (!confirmed) return;
-    const response = await fetch(`/api/automations/${automation.id}`, {
+    if (!decision.confirmed) return;
+    const response = await fetch(`/api/automations/${automation.id}?${new URLSearchParams({ deleteSession: String(decision.checked) })}`, {
       method: "DELETE",
       headers: { authorization: `Bearer ${sessionToken}` },
     });

@@ -407,10 +407,13 @@ const appNotificationSubscribers = new Set<(event: AppNotificationStreamEvent) =
 const telegramPollingOffsets = new Map<string, number>();
 const telegramPollingBusy = new Set<string>();
 const telegramPendingSends = new Map<string, { message: string; sessionIds: string[]; createdAt: number }>();
+const telegramPendingBinds = new Map<string, { sessionIds: string[]; createdAt: number }>();
 const telegramQueuedReplyTargets = new Map<string, Array<{ accountId: string; chatId: string; createdAt: number }>>();
 const telegramActiveReplyTargets = new Map<string, Array<{ accountId: string; chatId: string; createdAt: number }>>();
 const telegramOutboundQueues = new Map<string, Promise<void>>();
+const telegramTypingTimers = new Map<string, { timeoutId: ReturnType<typeof setTimeout>; intervalId: ReturnType<typeof setInterval>; startedAt: number }>();
 const telegramPendingSelections = new Map<string, { ids: string[]; createdAt: number }>();
+const telegramPendingBrowse = new Map<string, { kind: "agent" | "room"; ids: string[]; page: number; pageSize: number; createdAt: number }>();
 const telegramPendingFileRoots = new Map<string, { roots: Array<{ label: string; root: string }>; createdAt: number }>();
 const telegramPendingFiles = new Map<string, { root: string; relPath: string; dirNames: string[]; createdAt: number }>();
 const telegramPendingTerminal = new Map<string, { command: string; roots: Array<{ label: string; root: string }>; createdAt: number }>();
@@ -2135,6 +2138,7 @@ function automationFromRow(row: Record<string, unknown>): AutomationSummary {
     retryMax: sanitizeAutomationRetryMax(row.retry_max),
     retryDelayMinutes: sanitizeAutomationRetryDelayMinutes(row.retry_delay_minutes),
     overlapPolicy: sanitizeAutomationOverlapPolicy(row.overlap_policy),
+    sessionId: row.session_id ? String(row.session_id) : null,
     schedule: String(row.schedule),
     status: row.status === "paused" ? "paused" : "active",
     createdAt: String(row.created_at),
@@ -11622,8 +11626,10 @@ function telegramGroupedSessionText(limit = 12) {
   return sections.length ? sections.join("\n\n") : "No sessions yet.";
 }
 
-function telegramAgentChoices(limit = 8) {
-  const rows = db.prepare("select * from agents where enabled = 1 order by updated_at desc, id desc limit ?").all(limit) as Array<Record<string, unknown>>;
+function telegramAgentChoices(limit?: number) {
+  const rows = limit === undefined
+    ? db.prepare("select * from agents where enabled = 1 order by updated_at desc, id desc").all() as Array<Record<string, unknown>>
+    : db.prepare("select * from agents where enabled = 1 order by updated_at desc, id desc limit ?").all(limit) as Array<Record<string, unknown>>;
   return rows.map(agentFromRow);
 }
 
@@ -11633,8 +11639,10 @@ function telegramAgentLabel(agent: AgentSummary, index?: number) {
   return `${prefix}${agent.name} (${shortId})`;
 }
 
-function telegramRoomChoices(limit = 8) {
-  const rows = db.prepare("select * from rooms order by updated_at desc, id desc limit ?").all(limit) as Array<Record<string, unknown>>;
+function telegramRoomChoices(limit?: number) {
+  const rows = limit === undefined
+    ? db.prepare("select * from rooms order by updated_at desc, id desc").all() as Array<Record<string, unknown>>
+    : db.prepare("select * from rooms order by updated_at desc, id desc limit ?").all(limit) as Array<Record<string, unknown>>;
   return rows.map(roomFromRow);
 }
 
@@ -11642,6 +11650,37 @@ function telegramRoomLabel(room: RoomSummary, index?: number) {
   const prefix = index === undefined ? "" : `${index + 1}. `;
   const shortId = room.id.length > 12 ? `${room.id.slice(0, 12)}...` : room.id;
   return `${prefix}${room.name} (${shortId})`;
+}
+
+function telegramPageCount(total: number, pageSize: number) {
+  return Math.max(1, Math.ceil(total / pageSize));
+}
+
+function telegramPageSlice<T>(items: T[], page = 0, pageSize = 10) {
+  const total = items.length;
+  const totalPages = telegramPageCount(total, pageSize);
+  const currentPage = Math.min(Math.max(page, 0), totalPages - 1);
+  const start = currentPage * pageSize;
+  const pageItems = items.slice(start, start + pageSize);
+  return { total, totalPages, page: currentPage, pageItems, start, end: Math.min(start + pageItems.length, total) };
+}
+
+function telegramAgentBrowseItems(ids: string[]) {
+  const rows = db.prepare("select * from agents where enabled = 1 order by updated_at desc, id desc").all() as Array<Record<string, unknown>>;
+  const rowsById = new Map(rows.map((row) => [String(row.id ?? ""), row] as const));
+  return ids
+    .map((id) => rowsById.get(id))
+    .filter((row): row is Record<string, unknown> => Boolean(row))
+    .map(agentFromRow);
+}
+
+function telegramRoomBrowseItems(ids: string[]) {
+  const rows = db.prepare("select * from rooms order by updated_at desc, id desc").all() as Array<Record<string, unknown>>;
+  const rowsById = new Map(rows.map((row) => [String(row.id ?? ""), row] as const));
+  return ids
+    .map((id) => rowsById.get(id))
+    .filter((row): row is Record<string, unknown> => Boolean(row))
+    .map(roomFromRow);
 }
 
 function telegramPendingKey(accountId: string, chatId: string) {
@@ -11774,6 +11813,34 @@ function telegramOutboundQueueKey(accountId: string, chatId: string) {
   return `${accountId}:${chatId}`;
 }
 
+function telegramTypingKey(accountId: string, chatId: string) {
+  return `${accountId}:${chatId}`;
+}
+
+function stopTelegramTyping(accountId: string, chatId: string) {
+  const key = telegramTypingKey(accountId, chatId);
+  const entry = telegramTypingTimers.get(key);
+  if (!entry) return;
+  clearTimeout(entry.timeoutId);
+  clearInterval(entry.intervalId);
+  telegramTypingTimers.delete(key);
+}
+
+function startTelegramTyping(account: NotificationAccountRecord, chatId: string) {
+  const key = telegramTypingKey(account.id, chatId);
+  stopTelegramTyping(account.id, chatId);
+  const sendTyping = () => {
+    void telegramBotApi(account, "sendChatAction", {
+      chat_id: chatId,
+      action: "typing",
+    }).catch(() => undefined);
+  };
+  sendTyping();
+  const intervalId = setInterval(sendTyping, 4000);
+  const timeoutId = setTimeout(() => stopTelegramTyping(account.id, chatId), 90_000);
+  telegramTypingTimers.set(key, { timeoutId, intervalId, startedAt: Date.now() });
+}
+
 function formatTelegramSessionReply(session: SessionSummary, content: string) {
   const title = session.title?.trim() || session.id;
   const body = content.trim();
@@ -11793,6 +11860,7 @@ function forwardAssistantMessageToTelegram(session: SessionSummary, message: Ses
   for (const destination of destinations) {
     const account = accounts.get(destination.accountId);
     if (!account) continue;
+    stopTelegramTyping(destination.accountId, destination.chatId);
     void enqueueTelegramText(account, destination.chatId, text).catch((error) => {
       console.warn("telegram reply forward failed", destination.accountId, destination.chatId, error instanceof Error ? error.message : error);
     });
@@ -11816,6 +11884,20 @@ async function sendTelegramText(account: NotificationAccountRecord, chatId: stri
     chat_id: chatId,
     text: text.slice(0, 3900),
     disable_web_page_preview: true,
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
+  }
+}
+
+async function editTelegramText(account: NotificationAccountRecord, chatId: string, messageId: number, text: string, replyMarkup?: Record<string, unknown>) {
+  const response = await telegramBotApi(account, "editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text: text.slice(0, 3900),
+    disable_web_page_preview: true,
+    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
   });
   if (!response.ok) {
     const body = await response.text().catch(() => "");
@@ -11859,29 +11941,54 @@ async function sendTelegramAgents(account: NotificationAccountRecord, chatId: st
     await sendTelegramText(account, chatId, "No enabled agents are available.");
     return;
   }
-  telegramPendingSelections.set(telegramSelectionKey(account.id, chatId, "agent"), {
+  const pageSize = 8;
+  const { page } = telegramPageSlice(choices, 0, pageSize);
+  telegramPendingBrowse.set(telegramPendingKey(account.id, chatId), {
+    kind: "agent",
     ids: choices.map((agent) => agent.id),
+    page,
+    pageSize,
     createdAt: Date.now(),
   });
-  const text = [
-    "Agents:",
-    "",
-    ...choices.map((agent, index) => `${telegramAgentLabel(agent, index)}\n${agent.description ?? "No description"}`),
-    "",
-    "Tap an agent to create and bind a new session.",
-  ].join("\n\n");
-  const response = await telegramBotApi(account, "sendMessage", {
-    chat_id: chatId,
-    text: text.slice(0, 3900),
+  await sendTelegramAgentsPage(account, chatId, 0);
+}
+
+async function sendTelegramAgentsPage(account: NotificationAccountRecord, chatId: string, page: number, messageId?: number) {
+  const pendingKey = telegramPendingKey(account.id, chatId);
+  const pending = telegramPendingBrowse.get(pendingKey);
+  if (!pending || pending.kind !== "agent") return;
+  const choices = telegramAgentBrowseItems(pending.ids);
+  if (!choices.length) {
+    telegramPendingBrowse.delete(pendingKey);
+    await sendTelegramText(account, chatId, "No enabled agents are available.");
+    return;
+  }
+  const pageSize = pending.pageSize || 8;
+  const { total, totalPages, page: currentPage, pageItems, start, end } = telegramPageSlice(choices, page, pageSize);
+  telegramPendingBrowse.set(pendingKey, { ...pending, page: currentPage, pageSize, createdAt: Date.now() });
+  const payload = {
+    text: `Select an agent to create and bind a new session.\nShowing ${start + 1}-${end} of ${total} (${currentPage + 1}/${totalPages})`,
     reply_markup: {
       inline_keyboard: [
-        ...choices.map((agent, index) => ([{
-        text: telegramAgentLabel(agent, index).slice(0, 64),
-        callback_data: `agent:${index}`,
+        ...pageItems.map((agent, index) => ([{
+          text: telegramAgentLabel(agent, start + index).slice(0, 64),
+          callback_data: `agent:${start + index}`,
         }])),
+        ...(totalPages > 1 ? [[
+          ...(currentPage > 0 ? [{ text: "Prev", callback_data: `agentpage:${currentPage - 1}` }] : []),
+          ...(currentPage < totalPages - 1 ? [{ text: "Next", callback_data: `agentpage:${currentPage + 1}` }] : []),
+        ]] : []),
         [{ text: "Cancel", callback_data: "cancel" }],
       ],
     },
+  };
+  if (messageId !== undefined) {
+    await editTelegramText(account, chatId, messageId, payload.text, payload.reply_markup);
+    return;
+  }
+  const response = await telegramBotApi(account, "sendMessage", {
+    chat_id: chatId,
+    ...payload,
   });
   if (!response.ok) {
     const body = await response.text().catch(() => "");
@@ -11895,29 +12002,54 @@ async function sendTelegramRooms(account: NotificationAccountRecord, chatId: str
     await sendTelegramText(account, chatId, "No rooms are available.");
     return;
   }
-  telegramPendingSelections.set(telegramSelectionKey(account.id, chatId, "room"), {
+  const pageSize = 8;
+  const { page } = telegramPageSlice(choices, 0, pageSize);
+  telegramPendingBrowse.set(telegramPendingKey(account.id, chatId), {
+    kind: "room",
     ids: choices.map((room) => room.id),
+    page,
+    pageSize,
     createdAt: Date.now(),
   });
-  const text = [
-    "Rooms:",
-    "",
-    ...choices.map((room, index) => `${telegramRoomLabel(room, index)}\n${room.status}${room.sessionId ? ` · ${room.sessionId}` : ""}`),
-    "",
-    "Tap a room to bind this chat to its session.",
-  ].join("\n\n");
-  const response = await telegramBotApi(account, "sendMessage", {
-    chat_id: chatId,
-    text: text.slice(0, 3900),
+  await sendTelegramRoomsPage(account, chatId, 0);
+}
+
+async function sendTelegramRoomsPage(account: NotificationAccountRecord, chatId: string, page: number, messageId?: number) {
+  const pendingKey = telegramPendingKey(account.id, chatId);
+  const pending = telegramPendingBrowse.get(pendingKey);
+  if (!pending || pending.kind !== "room") return;
+  const choices = telegramRoomBrowseItems(pending.ids);
+  if (!choices.length) {
+    telegramPendingBrowse.delete(pendingKey);
+    await sendTelegramText(account, chatId, "No rooms are available.");
+    return;
+  }
+  const pageSize = pending.pageSize || 8;
+  const { total, totalPages, page: currentPage, pageItems, start, end } = telegramPageSlice(choices, page, pageSize);
+  telegramPendingBrowse.set(pendingKey, { ...pending, page: currentPage, pageSize, createdAt: Date.now() });
+  const payload = {
+    text: `Select a room to bind this chat to its session.\nShowing ${start + 1}-${end} of ${total} (${currentPage + 1}/${totalPages})`,
     reply_markup: {
       inline_keyboard: [
-        ...choices.map((room, index) => ([{
-        text: telegramRoomLabel(room, index).slice(0, 64),
-        callback_data: `room:${index}`,
+        ...pageItems.map((room, index) => ([{
+          text: telegramRoomLabel(room, start + index).slice(0, 64),
+          callback_data: `room:${start + index}`,
         }])),
+        ...(totalPages > 1 ? [[
+          ...(currentPage > 0 ? [{ text: "Prev", callback_data: `roompage:${currentPage - 1}` }] : []),
+          ...(currentPage < totalPages - 1 ? [{ text: "Next", callback_data: `roompage:${currentPage + 1}` }] : []),
+        ]] : []),
         [{ text: "Cancel", callback_data: "cancel" }],
       ],
     },
+  };
+  if (messageId !== undefined) {
+    await editTelegramText(account, chatId, messageId, payload.text, payload.reply_markup);
+    return;
+  }
+  const response = await telegramBotApi(account, "sendMessage", {
+    chat_id: chatId,
+    ...payload,
   });
   if (!response.ok) {
     const body = await response.text().catch(() => "");
@@ -12063,6 +12195,35 @@ async function answerTelegramCallback(account: NotificationAccountRecord, callba
   });
 }
 
+async function sendTelegramBindPicker(account: NotificationAccountRecord, chatId: string) {
+  const choices = telegramSessionChoices();
+  if (!choices.length) {
+    await sendTelegramText(account, chatId, "No sessions are available. Create a session first.");
+    return;
+  }
+  telegramPendingBinds.set(telegramPendingKey(account.id, chatId), {
+    sessionIds: choices.map((session) => session.id),
+    createdAt: Date.now(),
+  });
+  const response = await telegramBotApi(account, "sendMessage", {
+    chat_id: chatId,
+    text: "Select a session to bind this chat to:",
+    reply_markup: {
+      inline_keyboard: [
+        ...choices.map((session, index) => ([{
+          text: telegramSessionLabel(session, index).slice(0, 64),
+          callback_data: `bind:${index}`,
+        }])),
+        [{ text: "Cancel", callback_data: "cancel" }],
+      ],
+    },
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
+  }
+}
+
 async function sendTelegramInputPrompt(account: NotificationAccountRecord, chatId: string, kind: "send" | "terminal") {
   telegramPendingInputs.set(telegramPendingKey(account.id, chatId), { kind, createdAt: Date.now() });
   const text = kind === "send"
@@ -12085,6 +12246,7 @@ async function routeTelegramSendMessage(account: NotificationAccountRecord, chat
     await sendTelegramSessionPicker(account, chatId, message);
     return;
   }
+  startTelegramTyping(account, chatId);
   const result = dispatchMessageToSession(target, `Telegram message from chat ${chatId}:\n\n${message}`);
   if (result.mode === "queued" && result.queuedId) queueTelegramQueuedReplyTarget(result.queuedId, account.id, chatId);
   else queueTelegramActiveReplyTarget(target.id, account.id, chatId);
@@ -12116,6 +12278,8 @@ async function handleTelegramUpdate(account: NotificationAccountRecord, update: 
     if (!chatId) return;
     if (data === "cancel") {
       telegramPendingSends.delete(telegramPendingKey(account.id, chatId));
+      telegramPendingBinds.delete(telegramPendingKey(account.id, chatId));
+      telegramPendingBrowse.delete(telegramPendingKey(account.id, chatId));
       telegramPendingSelections.delete(telegramSelectionKey(account.id, chatId, "agent"));
       telegramPendingSelections.delete(telegramSelectionKey(account.id, chatId, "room"));
       telegramPendingFileRoots.delete(telegramPendingKey(account.id, chatId));
@@ -12142,52 +12306,97 @@ async function handleTelegramUpdate(account: NotificationAccountRecord, update: 
         return;
       }
       telegramPendingSends.delete(pendingKey);
+      await answerTelegramCallback(account, update.callback_query.id, "Working...");
+      startTelegramTyping(account, chatId);
       const result = dispatchMessageToSession(target, `Telegram message from chat ${chatId}:\n\n${pending.message}`);
       if (result.mode === "queued" && result.queuedId) queueTelegramQueuedReplyTarget(result.queuedId, account.id, chatId);
       else queueTelegramActiveReplyTarget(target.id, account.id, chatId);
-      await answerTelegramCallback(account, update.callback_query.id, `Sent to ${target.title}`);
-      await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
+      // await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
+      return;
+    }
+    if (data.startsWith("bind:")) {
+      const pendingKey = telegramPendingKey(account.id, chatId);
+      const pending = telegramPendingBinds.get(pendingKey);
+      if (!pending || Date.now() - pending.createdAt > 10 * 60 * 1000) {
+        telegramPendingBinds.delete(pendingKey);
+        await answerTelegramCallback(account, update.callback_query.id, "This bind list expired.");
+        return;
+      }
+      const index = Number(data.slice("bind:".length));
+      const sessionId = Number.isInteger(index) ? pending.sessionIds[index] : "";
+      const target = sessionId ? appData.sessions.find((session) => session.id === sessionId) ?? null : null;
+      if (!target) {
+        await answerTelegramCallback(account, update.callback_query.id, "Session is no longer available.");
+        return;
+      }
+      telegramPendingBinds.delete(pendingKey);
+      await answerTelegramCallback(account, update.callback_query.id, "Working...");
+      setTelegramRouteSession(account.id, chatId, target.id);
+      await sendTelegramText(account, chatId, `Bound to: ${target.title}\n${target.id}`);
+      return;
+    }
+    if (data.startsWith("agentpage:") || data.startsWith("roompage:")) {
+      const pendingKey = telegramPendingKey(account.id, chatId);
+      const pending = telegramPendingBrowse.get(pendingKey);
+      const kind = data.startsWith("agentpage:") ? "agent" : "room";
+      if (!pending || pending.kind !== kind || Date.now() - pending.createdAt > 10 * 60 * 1000) {
+        telegramPendingBrowse.delete(pendingKey);
+        await answerTelegramCallback(account, update.callback_query.id, "This list expired.");
+        return;
+      }
+      const nextPage = Number(data.split(":")[1]);
+      if (!Number.isInteger(nextPage) || nextPage < 0) {
+        await answerTelegramCallback(account, update.callback_query.id, "Invalid page.");
+        return;
+      }
+      await answerTelegramCallback(account, update.callback_query.id, "Working...");
+      const messageId = update.callback_query.message?.message_id;
+      if (kind === "agent") {
+        await sendTelegramAgentsPage(account, chatId, nextPage, messageId);
+      } else {
+        await sendTelegramRoomsPage(account, chatId, nextPage, messageId);
+      }
       return;
     }
     if (data.startsWith("agent:")) {
-      const selectionKey = telegramSelectionKey(account.id, chatId, "agent");
-      const selection = telegramPendingSelections.get(selectionKey);
-      if (!selection || Date.now() - selection.createdAt > 10 * 60 * 1000) {
-        telegramPendingSelections.delete(selectionKey);
+      const pendingKey = telegramPendingKey(account.id, chatId);
+      const pending = telegramPendingBrowse.get(pendingKey);
+      if (!pending || pending.kind !== "agent" || Date.now() - pending.createdAt > 10 * 60 * 1000) {
+        telegramPendingBrowse.delete(pendingKey);
         await answerTelegramCallback(account, update.callback_query.id, "This agent list expired.");
         return;
       }
       const index = Number(data.slice("agent:".length));
-      const agentId = Number.isInteger(index) ? selection.ids[index] : "";
+      const agentId = Number.isInteger(index) ? pending.ids[index] : "";
       const row = agentId ? db.prepare("select * from agents where id = ?").get(agentId) as Record<string, unknown> | undefined : undefined;
       if (!row) {
         await answerTelegramCallback(account, update.callback_query.id, "Agent is no longer available.");
         return;
       }
+      await answerTelegramCallback(account, update.callback_query.id, "Working...");
       const session = createTelegramAgentSession(agentFromRow(row));
       setTelegramRouteSession(account.id, chatId, session.id);
-      await answerTelegramCallback(account, update.callback_query.id, `Created ${session.title}`);
       await sendTelegramText(account, chatId, `Created and bound session:\n${telegramSessionLabel(session)}\n${session.id}`);
       return;
     }
     if (data.startsWith("room:")) {
-      const selectionKey = telegramSelectionKey(account.id, chatId, "room");
-      const selection = telegramPendingSelections.get(selectionKey);
-      if (!selection || Date.now() - selection.createdAt > 10 * 60 * 1000) {
-        telegramPendingSelections.delete(selectionKey);
+      const pendingKey = telegramPendingKey(account.id, chatId);
+      const pending = telegramPendingBrowse.get(pendingKey);
+      if (!pending || pending.kind !== "room" || Date.now() - pending.createdAt > 10 * 60 * 1000) {
+        telegramPendingBrowse.delete(pendingKey);
         await answerTelegramCallback(account, update.callback_query.id, "This room list expired.");
         return;
       }
       const index = Number(data.slice("room:".length));
-      const roomId = Number.isInteger(index) ? selection.ids[index] : "";
+      const roomId = Number.isInteger(index) ? pending.ids[index] : "";
       const row = roomId ? db.prepare("select * from rooms where id = ?").get(roomId) as Record<string, unknown> | undefined : undefined;
       const room = row ? roomFromRow(row) : null;
       if (!room?.sessionId) {
         await answerTelegramCallback(account, update.callback_query.id, "Room session is no longer available.");
         return;
       }
+      await answerTelegramCallback(account, update.callback_query.id, "Working...");
       setTelegramRouteSession(account.id, chatId, room.sessionId);
-      await answerTelegramCallback(account, update.callback_query.id, `Bound ${room.name}`);
       await sendTelegramText(account, chatId, `Bound room session:\n${telegramRoomLabel(room)}\n${room.sessionId}`);
       return;
     }
@@ -12206,7 +12415,7 @@ async function handleTelegramUpdate(account: NotificationAccountRecord, update: 
         return;
       }
       telegramPendingFileRoots.delete(rootKey);
-      await answerTelegramCallback(account, update.callback_query.id, "Opened.");
+      await answerTelegramCallback(account, update.callback_query.id, "Working...");
       await sendTelegramFiles(account, chatId, root);
       return;
     }
@@ -12221,7 +12430,7 @@ async function handleTelegramUpdate(account: NotificationAccountRecord, update: 
       const nextRel = data === "fileup"
         ? dirname(pending.relPath) === "." ? "" : dirname(pending.relPath)
         : join(pending.relPath, pending.dirNames[Number(data.slice("file:".length))] ?? "");
-      await answerTelegramCallback(account, update.callback_query.id, "Opened.");
+      await answerTelegramCallback(account, update.callback_query.id, "Working...");
       await sendTelegramFiles(account, chatId, pending.root, nextRel);
       return;
     }
@@ -12240,7 +12449,7 @@ async function handleTelegramUpdate(account: NotificationAccountRecord, update: 
         return;
       }
       telegramPendingTerminal.delete(terminalKey);
-      await answerTelegramCallback(account, update.callback_query.id, "Running.");
+      await answerTelegramCallback(account, update.callback_query.id, "Working...");
       await runTelegramTerminal(account, chatId, root, pending.command);
       return;
     }
@@ -12281,7 +12490,7 @@ async function handleTelegramUpdate(account: NotificationAccountRecord, update: 
       "/rooms - list rooms and bind a room session",
       "/files - browse bound or system files",
       "/terminal <command> - run in bound or selected workspace",
-      "/bind <index, title, or sessionId> - bind this chat to a session",
+      "/bind - pick a session to bind this chat to, or /bind <index, title, or sessionId>",
       "/unbind - clear the bound session",
       "/send <index, title, or sessionId> | <message> - send to a session",
       "/send <message> - choose a session when no session is bound",
@@ -12328,6 +12537,10 @@ async function handleTelegramUpdate(account: NotificationAccountRecord, update: 
     return;
   }
   if (command === "/bind") {
+    if (!rest) {
+      await sendTelegramBindPicker(account, chatId);
+      return;
+    }
     const target = resolveTelegramTargetSession(rest);
     if (!target) {
       await sendTelegramText(account, chatId, "Session not found. Use /sessions to view recent sessions.");
@@ -12363,10 +12576,11 @@ async function handleTelegramUpdate(account: NotificationAccountRecord, update: 
       }
       return;
     }
+    startTelegramTyping(account, chatId);
     const result = dispatchMessageToSession(target, `Telegram message from chat ${chatId}:\n\n${message}`);
     if (result.mode === "queued" && result.queuedId) queueTelegramQueuedReplyTarget(result.queuedId, account.id, chatId);
     else queueTelegramActiveReplyTarget(target.id, account.id, chatId);
-    await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
+    // await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
     return;
   }
   const target = telegramRouteSession(account, chatId);
@@ -12374,10 +12588,11 @@ async function handleTelegramUpdate(account: NotificationAccountRecord, update: 
     await sendTelegramSessionPicker(account, chatId, text);
     return;
   }
+  startTelegramTyping(account, chatId);
   const result = dispatchMessageToSession(target, `Telegram message from chat ${chatId}:\n\n${text}`);
   if (result.mode === "queued" && result.queuedId) queueTelegramQueuedReplyTarget(result.queuedId, account.id, chatId);
   else queueTelegramActiveReplyTarget(target.id, account.id, chatId);
-  await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
+  // await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
 }
 
 async function pollTelegramAccount(account: NotificationAccountRecord) {
@@ -16426,8 +16641,16 @@ app.delete("/api/automations/:id", (c) => {
   const index = appData.automations.findIndex((item) => item.id === c.req.param("id"));
   if (index === -1) return c.json({ error: "automation_not_found" }, 404);
   const [automation] = appData.automations.splice(index, 1);
+  const session = latestAutomationSession(automation.id);
+  const deleteSession = c.req.query("deleteSession") !== "false";
   db.prepare("delete from automations where id = ?").run(automation.id);
   db.prepare("delete from automation_runs where automation_id = ?").run(automation.id);
+  if (deleteSession && session) {
+    clearCodexTaskRuntime(session.id, true);
+    appData.sessions = appData.sessions.filter((item) => item.id !== session.id);
+    deleteSessionDatabaseRows(session.id);
+    deleteSessionData(session, true, true);
+  }
   return c.json({ ok: true, id: automation.id });
 });
 app.get("/api/automations/:id/runs", (c) => {

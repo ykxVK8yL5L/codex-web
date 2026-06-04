@@ -1610,6 +1610,7 @@ export interface AutomationSummary {
   retryMax?: number | null;
   retryDelayMinutes?: number | null;
   overlapPolicy?: "queue" | "skip";
+  sessionId?: string | null;
   runningRuns?: number;
   queuedRuns?: number;
   lastRunStatus?: AutomationRunSummary["status"] | null;
