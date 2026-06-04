@@ -57,6 +57,9 @@ import { CodeEditor, preferredCodeEditorMode, type CodeEditorMode } from "@/comp
 import { FilterSearchInput, FilterToolbar } from "@/components/FilterControls";
 import { IconText } from "@/components/IconText";
 import { Input } from "@/components/ui/input";
+import { NotificationPlatformsPanel } from "@/components/settings/NotificationPlatformsPanel";
+import { WebhookNotificationAccountPanel } from "@/components/settings/platforms/WebhookNotificationAccountPanel";
+import { EmailNotificationAccountPanel, TelegramNotificationAccountPanel, WeixinNotificationAccountPanel } from "@/components/settings/platforms";
 import { Switch } from "@/components/ui/switch";
 import { PreviewDirectoryPicker } from "@/components/PreviewDirectoryPicker";
 import { ToastViewport } from "@/components/ToastViewport";
@@ -158,6 +161,7 @@ import type {
   NotificationSettingsResponse,
   PageResponse,
   PermissionProfileId,
+  PlatformSettingsResponse,
   ProjectCheckRunSummary,
   ProjectGitOperationRequest,
   ProjectGitOperationSummary,
@@ -1477,7 +1481,7 @@ function App() {
       {page === "automations" && <AutomationsPage sessionToken={sessionToken} automations={automations} projects={projects} providers={providers} onChange={loadAppData} onOpenSession={navigateSession} title={t("nav.automations")} t={t} notify={notify} onOpenMainNav={() => setMainNavOpen(true)} />}
       {page === "providers" && <ProvidersPage sessionToken={sessionToken} providers={providers} onChange={loadAppData} t={t} notify={notify} onOpenMainNav={() => setMainNavOpen(true)} />}
       {page === "approvals" && <ApprovalsPage sessionToken={sessionToken} t={t} notify={notify} onPendingChange={setPendingApprovalsCount} onOpenMainNav={() => setMainNavOpen(true)} />}
-      {page === "settings" && <SettingsPage sessionToken={sessionToken} t={t} onOpenSession={navigateSession} onOpenMainNav={() => setMainNavOpen(true)} onSessionRefresh={(token, nextAuth) => {
+      {page === "settings" && <SettingsPage sessionToken={sessionToken} t={t} locale={locale} onOpenSession={navigateSession} onOpenMainNav={() => setMainNavOpen(true)} onSessionRefresh={(token, nextAuth) => {
         localStorage.setItem("codex-web-session", token);
         setSessionToken(token);
         setAuth(nextAuth);
@@ -12918,6 +12922,7 @@ function ApprovalsPage({
 function SettingsPage({
   sessionToken,
   t,
+  locale,
   onOpenSession,
   onOpenMainNav,
   onSessionRefresh,
@@ -12927,6 +12932,7 @@ function SettingsPage({
 }: {
   sessionToken: string;
   t: TFunction;
+  locale: Locale;
   onOpenSession: (sessionId: string) => void;
   onOpenMainNav?: () => void;
   onSessionRefresh: (token: string, auth: AuthState) => void;
@@ -13030,7 +13036,8 @@ function SettingsPage({
     providerProxyMaxConcurrent: "5",
   });
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettingsResponse | null>(null);
-  const [notificationView, setNotificationView] = useState<"senders" | "recipients" | "rules" | "logs">("senders");
+  const [platformSettings, setPlatformSettings] = useState<PlatformSettingsResponse | null>(null);
+  const [notificationView, setNotificationView] = useState<"platforms" | "senders" | "recipients" | "rules" | "logs">("platforms");
   const [notificationRuleEnabledFilter, setNotificationRuleEnabledFilter] = useState("");
   const [notificationRuleCursor, setNotificationRuleCursor] = useState<string | null>(null);
   const [notificationRuleLoading, setNotificationRuleLoading] = useState(false);
@@ -13045,6 +13052,7 @@ function SettingsPage({
     name: "",
     channelId: "email",
     channelKind: "email" as NotificationAccountSummary["channelKind"],
+    language: locale,
     enabled: true,
     customConfig: {} as Record<string, string>,
     webhookUrl: "",
@@ -13065,6 +13073,15 @@ function SettingsPage({
     emailFromName: "Codex Web",
     emailFromEmail: "",
     emailCreateRecipient: true,
+    emailInboundEnabled: false,
+    emailImapHost: "",
+    emailImapPort: "993",
+    emailImapSecure: true,
+    emailImapUsername: "",
+    emailImapPassword: "",
+    emailInboundMailbox: "INBOX",
+    emailAllowedSenderEmails: "",
+    emailDefaultSessionId: "",
     telegramBotToken: "",
     telegramProxyUrl: "",
     telegramTestChatId: "",
@@ -13072,6 +13089,15 @@ function SettingsPage({
     telegramAllowedChatIds: "",
     telegramAllowedUserIds: "",
     telegramDefaultSessionId: "",
+    weixinBotToken: "",
+    weixinBaseUrl: "https://ilinkai.weixin.qq.com",
+    weixinAccountId: "",
+    weixinUserId: "",
+    weixinTestChatId: "",
+    weixinInboundEnabled: false,
+    weixinAllowedChatIds: "",
+    weixinAllowedUserIds: "",
+    weixinDefaultSessionId: "",
     testEmailTo: "",
     permissionAgentIds: "",
     permissionRoomIds: "",
@@ -13103,6 +13129,8 @@ function SettingsPage({
     barkGroup: "Codex Web",
     telegramChatId: "",
     telegramSenderAccountId: "",
+    weixinChatId: "",
+    weixinSenderAccountId: "",
     customConfig: {} as Record<string, string>,
     permissionAgentIds: "",
     permissionRoomIds: "",
@@ -13236,9 +13264,15 @@ function SettingsPage({
 
   async function loadNotifications() {
     const headers = { authorization: `Bearer ${sessionToken}` };
-    const response = await fetch("/api/notifications", { headers });
-    if (!response.ok) return;
-    const result = await response.json() as NotificationSettingsResponse;
+    const [notificationsResponse, platformsResponse] = await Promise.all([
+      fetch("/api/notifications", { headers }),
+      fetch("/api/notifications/platforms", { headers }),
+    ]);
+    if (!notificationsResponse.ok) return;
+    const result = await notificationsResponse.json() as NotificationSettingsResponse;
+    if (platformsResponse.ok) {
+      setPlatformSettings(await platformsResponse.json() as PlatformSettingsResponse);
+    }
     const ruleParams = new URLSearchParams({ limit: "20" });
     if (notificationRuleEnabledFilter) ruleParams.set("enabled", notificationRuleEnabledFilter);
     const deliveryParams = new URLSearchParams({ limit: "20" });
@@ -13332,6 +13366,10 @@ function SettingsPage({
     return (notificationSettings?.accounts ?? []).filter((account) => account.enabled && account.channelKind === "telegram");
   }
 
+  function weixinNotificationSenders() {
+    return (notificationSettings?.accounts ?? []).filter((account) => account.enabled && account.channelKind === "weixin");
+  }
+
   function csvIds(value: string) {
     return value.split(",").map((item) => item.trim()).filter(Boolean);
   }
@@ -13339,6 +13377,18 @@ function SettingsPage({
   function configListToCsv(value: unknown) {
     if (Array.isArray(value)) return value.map(String).join(", ");
     return String(value ?? "").split(",").map((item) => item.trim()).filter(Boolean).join(", ");
+  }
+
+  function notificationFieldLabel(field: string) {
+    if (field === "url") return t("settings.notificationWebhookUrl");
+    if (field === "serverUrl") return t("settings.notificationBarkServer");
+    if (field === "deviceKey") return t("settings.notificationBarkDeviceKey");
+    if (field === "group") return t("settings.notificationBarkGroup");
+    if (field === "sound") return t("settings.notificationBarkSound");
+    if (field === "icon") return t("settings.notificationBarkIcon");
+    if (field === "botToken") return t("settings.notificationTelegramBotToken");
+    if (field === "baseUrl") return t("settings.notificationWeixinBaseUrl");
+    return field;
   }
 
   function notificationPermissionsFromForm(form: { permissionAgentIds: string; permissionRoomIds: string; permissionProjectIds: string }) {
@@ -13362,6 +13412,10 @@ function SettingsPage({
     return count ? t("settings.notificationPermissionRestricted") : t("settings.notificationPermissionUnrestricted");
   }
 
+  function notificationAccountKind(account: NotificationAccountSummary) {
+    return notificationSettings?.channels.find((channel) => channel.id === account.channelId)?.kind ?? account.channelKind;
+  }
+
   function notificationAccountConfig() {
     const selectedChannel = selectedNotificationChannel();
     if (selectedChannel && selectedChannel.builtin === false) return notificationAccountForm.customConfig;
@@ -13374,6 +13428,15 @@ function SettingsPage({
         password: notificationAccountForm.emailPassword,
         fromName: notificationAccountForm.emailFromName,
         fromEmail: notificationAccountForm.emailFromEmail,
+        inboundEnabled: notificationAccountForm.emailInboundEnabled,
+        imapHost: notificationAccountForm.emailImapHost,
+        imapPort: Number(notificationAccountForm.emailImapPort) || 993,
+        imapSecure: notificationAccountForm.emailImapSecure,
+        imapUsername: notificationAccountForm.emailImapUsername,
+        imapPassword: notificationAccountForm.emailImapPassword,
+        inboundMailbox: notificationAccountForm.emailInboundMailbox,
+        allowedSenderEmails: csvIds(notificationAccountForm.emailAllowedSenderEmails),
+        defaultSessionId: notificationAccountForm.emailDefaultSessionId,
         testEmailTo: csvIds(notificationAccountForm.testEmailTo),
       };
     }
@@ -13381,11 +13444,26 @@ function SettingsPage({
       return {
         botToken: notificationAccountForm.telegramBotToken,
         proxyUrl: notificationAccountForm.telegramProxyUrl,
+        language: notificationAccountForm.language,
         inboundEnabled: notificationAccountForm.telegramInboundEnabled,
         allowedChatIds: csvIds(notificationAccountForm.telegramAllowedChatIds),
         allowedUserIds: csvIds(notificationAccountForm.telegramAllowedUserIds),
         defaultSessionId: notificationAccountForm.telegramDefaultSessionId,
         testChatId: notificationAccountForm.telegramTestChatId,
+      };
+    }
+    if (notificationAccountForm.channelKind === "weixin") {
+      return {
+        botToken: notificationAccountForm.weixinBotToken,
+        baseUrl: notificationAccountForm.weixinBaseUrl,
+        accountId: notificationAccountForm.weixinAccountId,
+        userId: notificationAccountForm.weixinUserId,
+        language: notificationAccountForm.language,
+        inboundEnabled: notificationAccountForm.weixinInboundEnabled,
+        allowedChatIds: csvIds(notificationAccountForm.weixinAllowedChatIds),
+        allowedUserIds: csvIds(notificationAccountForm.weixinAllowedUserIds),
+        defaultSessionId: notificationAccountForm.weixinDefaultSessionId,
+        testChatId: notificationAccountForm.weixinTestChatId,
       };
     }
     if (notificationAccountForm.channelKind === "webhook") {
@@ -13416,6 +13494,7 @@ function SettingsPage({
       name: "",
       channelId: "email",
       channelKind: "email",
+      language: locale,
       enabled: true,
       customConfig: {},
       webhookUrl: "",
@@ -13436,6 +13515,15 @@ function SettingsPage({
       emailFromName: "Codex Web",
       emailFromEmail: "",
       emailCreateRecipient: true,
+      emailInboundEnabled: false,
+      emailImapHost: "",
+      emailImapPort: "993",
+      emailImapSecure: true,
+      emailImapUsername: "",
+      emailImapPassword: "",
+      emailInboundMailbox: "INBOX",
+      emailAllowedSenderEmails: "",
+      emailDefaultSessionId: "",
       telegramBotToken: "",
       telegramProxyUrl: "",
       telegramTestChatId: "",
@@ -13443,6 +13531,15 @@ function SettingsPage({
       telegramAllowedChatIds: "",
       telegramAllowedUserIds: "",
       telegramDefaultSessionId: "",
+      weixinBotToken: "",
+      weixinBaseUrl: "https://ilinkai.weixin.qq.com",
+      weixinAccountId: "",
+      weixinUserId: "",
+      weixinTestChatId: "",
+      weixinInboundEnabled: false,
+      weixinAllowedChatIds: "",
+      weixinAllowedUserIds: "",
+      weixinDefaultSessionId: "",
       testEmailTo: "",
       permissionAgentIds: "",
       permissionRoomIds: "",
@@ -13452,11 +13549,13 @@ function SettingsPage({
 
   function editNotificationAccount(account: NotificationAccountSummary) {
     const config = account.config as Record<string, unknown>;
+    const channelKind = notificationAccountKind(account);
     setNotificationEditingAccountId(account.id);
     setNotificationAccountForm({
       name: account.name,
-      channelId: account.channelId ?? account.channelKind,
-      channelKind: account.channelKind,
+      channelId: account.channelId ?? channelKind,
+      channelKind,
+      language: (String(config.language ?? "") === "en-US" ? "en-US" : "zh-CN"),
       enabled: account.enabled,
       customConfig: Object.fromEntries(Object.entries(config).map(([key, value]) => [key, String(value ?? "")])),
       webhookUrl: String(config.url ?? ""),
@@ -13479,6 +13578,15 @@ function SettingsPage({
       emailFromName: String(config.fromName ?? "Codex Web"),
       emailFromEmail: String(config.fromEmail ?? ""),
       emailCreateRecipient: false,
+      emailInboundEnabled: config.inboundEnabled === true,
+      emailImapHost: String(config.imapHost ?? config.host ?? ""),
+      emailImapPort: String(config.imapPort ?? "993"),
+      emailImapSecure: config.imapSecure === true,
+      emailImapUsername: String(config.imapUsername ?? config.username ?? ""),
+      emailImapPassword: String(config.imapPassword ?? config.password ?? ""),
+      emailInboundMailbox: String(config.inboundMailbox ?? "INBOX"),
+      emailAllowedSenderEmails: configListToCsv(config.allowedSenderEmails),
+      emailDefaultSessionId: String(config.defaultSessionId ?? ""),
       testEmailTo: configListToCsv(config.testEmailTo),
       telegramBotToken: String(config.botToken ?? ""),
       telegramProxyUrl: String(config.proxyUrl ?? ""),
@@ -13487,6 +13595,15 @@ function SettingsPage({
       telegramAllowedChatIds: configListToCsv(config.allowedChatIds),
       telegramAllowedUserIds: configListToCsv(config.allowedUserIds),
       telegramDefaultSessionId: String(config.defaultSessionId ?? ""),
+      weixinBotToken: String(config.botToken ?? ""),
+      weixinBaseUrl: String(config.baseUrl ?? "https://ilinkai.weixin.qq.com"),
+      weixinAccountId: String(config.accountId ?? ""),
+      weixinUserId: String(config.userId ?? ""),
+      weixinTestChatId: String(config.testChatId ?? ""),
+      weixinInboundEnabled: config.inboundEnabled === true,
+      weixinAllowedChatIds: configListToCsv(config.allowedChatIds),
+      weixinAllowedUserIds: configListToCsv(config.allowedUserIds),
+      weixinDefaultSessionId: String(config.defaultSessionId ?? ""),
       ...notificationPermissionsToForm(account.permissions),
     });
   }
@@ -13633,6 +13750,7 @@ function SettingsPage({
   function notificationRecipientConfig() {
     if (notificationRecipientForm.kind === "email") return { email: notificationRecipientForm.email };
     if (notificationRecipientForm.kind === "telegram") return { chatId: notificationRecipientForm.telegramChatId };
+    if (notificationRecipientForm.kind === "weixin") return { chatId: notificationRecipientForm.weixinChatId };
     const channel = notificationSettings?.channels.find((item) => item.id === notificationRecipientForm.channelId);
     if (channel?.id && channel.id !== "webhook") return notificationRecipientForm.customConfig;
     return { url: notificationRecipientForm.webhookUrl, method: "POST", headers: {} };
@@ -13653,6 +13771,8 @@ function SettingsPage({
       barkGroup: "Codex Web",
       telegramChatId: "",
       telegramSenderAccountId: "",
+      weixinChatId: "",
+      weixinSenderAccountId: "",
       customConfig: {},
       permissionAgentIds: "",
       permissionRoomIds: "",
@@ -13676,6 +13796,8 @@ function SettingsPage({
       barkGroup: String(config.group ?? "Codex Web"),
       telegramChatId: String(config.chatId ?? ""),
       telegramSenderAccountId: recipient.senderAccountId ?? "",
+      weixinChatId: String(config.chatId ?? ""),
+      weixinSenderAccountId: recipient.senderAccountId ?? "",
       customConfig: Object.fromEntries(Object.entries(config).map(([key, value]) => [key, String(value ?? "")])),
       ...notificationPermissionsToForm(recipient.permissions),
     });
@@ -13696,6 +13818,8 @@ function SettingsPage({
             ? notificationRecipientForm.senderAccountId || (emailNotificationSenders().length === 1 ? emailNotificationSenders()[0].id : null)
             : notificationRecipientForm.kind === "telegram"
               ? notificationRecipientForm.telegramSenderAccountId || (telegramNotificationSenders().length === 1 ? telegramNotificationSenders()[0].id : null)
+              : notificationRecipientForm.kind === "weixin"
+                ? notificationRecipientForm.weixinSenderAccountId || (weixinNotificationSenders().length === 1 ? weixinNotificationSenders()[0].id : null)
               : null,
           channelId: notificationRecipientForm.kind === "webhook" ? notificationRecipientForm.channelId : null,
           config: notificationRecipientConfig(),
@@ -13789,10 +13913,16 @@ function SettingsPage({
     setBusy(`notification-test:${account.id}`);
     try {
       const emailTo = notificationAccountForm.testEmailTo.split(",").map((item) => item.trim()).filter(Boolean);
+      const chatId = notificationAccountForm.channelKind === "weixin"
+        ? notificationAccountForm.weixinTestChatId.trim()
+        : notificationAccountForm.telegramTestChatId.trim();
       const response = await fetch(`/api/notifications/accounts/${account.id}/test`, {
         method: "POST",
         headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
-        body: JSON.stringify({ emailTo, chatId: notificationAccountForm.telegramTestChatId.trim() || undefined }),
+        body: JSON.stringify({
+          emailTo,
+          chatId: chatId || undefined,
+        }),
       });
       await loadNotifications();
       notify(response.ok ? t("settings.notificationTestSent") : t("settings.notificationTestFailed"), response.ok ? "success" : "error");
@@ -15867,12 +15997,13 @@ function SettingsPage({
         </TabsContent>
         <TabsContent className="settings-list" value="notifications">
           <div className="settings-tabs notification-inner-tabs">
-            {(["senders", "recipients", "rules", "logs"] as const).map((view) => (
+            {(["platforms", "senders", "recipients", "rules", "logs"] as const).map((view) => (
               <button className={`settings-tab ${notificationView === view ? "active" : ""}`} type="button" key={view} onClick={() => setNotificationView(view)}>
-                {t(`settings.notificationTab${view === "senders" ? "Senders" : view === "recipients" ? "Recipients" : view === "rules" ? "Rules" : "Logs"}`)}
+                {t(`settings.notificationTab${view === "platforms" ? "Platforms" : view === "senders" ? "Senders" : view === "recipients" ? "Recipients" : view === "rules" ? "Rules" : "Logs"}`)}
               </button>
             ))}
           </div>
+          {notificationView === "platforms" && <NotificationPlatformsPanel platformSettings={platformSettings} t={t} />}
           {notificationView === "senders" && (
             <>
           <form className="notification-card" onSubmit={createNotificationAccount}>
@@ -15890,6 +16021,8 @@ function SettingsPage({
               }}>
                 <option value="email">Email SMTP</option>
                 <option value="telegram">Telegram Bot</option>
+                <option value="weixin">Weixin Bot</option>
+                <option value="webhook">Webhook</option>
               </select>
             </label>
             <label className="checkbox-row">
@@ -15904,83 +16037,36 @@ function SettingsPage({
               <span>{t("settings.notificationAllowedRooms")}</span>
               <input name="notification-account-allowed-rooms" className="search-input" value={notificationAccountForm.permissionRoomIds} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, permissionRoomIds: event.target.value }))} placeholder="room-id-1, room-id-2" />
             </label>
-            <label>
-              <span>{t("settings.notificationAllowedProjects")}</span>
-              <input name="notification-account-allowed-projects" className="search-input" value={notificationAccountForm.permissionProjectIds} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, permissionProjectIds: event.target.value }))} placeholder="project-id-1, project-id-2" />
-            </label>
+      <label>
+        <span>{t("settings.notificationAllowedProjects")}</span>
+        <input name="notification-account-allowed-projects" className="search-input" value={notificationAccountForm.permissionProjectIds} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, permissionProjectIds: event.target.value }))} placeholder="project-id-1, project-id-2" />
+      </label>
+      {(notificationAccountForm.channelKind === "telegram" || notificationAccountForm.channelKind === "weixin") && (
+        <label>
+          <span>{t("common.language")}</span>
+          <select name="notification-account-language" className="search-input" value={notificationAccountForm.language} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, language: event.target.value as Locale }))}>
+            {(Object.keys(localeLabels) as Locale[]).map((item) => <option key={item} value={item}>{localeLabels[item]}</option>)}
+          </select>
+        </label>
+      )}
             {notificationAccountForm.channelKind === "email" && (
-              <>
-                <label>
-                  <span>{t("settings.notificationEmailHost")}</span>
-                  <input name="notification-email-host" className="search-input" value={notificationAccountForm.emailHost} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, emailHost: event.target.value }))} />
-                </label>
-                <label>
-                  <span>{t("settings.notificationEmailPort")}</span>
-                  <input name="notification-email-port" className="search-input" type="number" min="1" value={notificationAccountForm.emailPort} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, emailPort: event.target.value }))} />
-                </label>
-                <label className="checkbox-row">
-                  <input name="notification-email-secure" type="checkbox" checked={notificationAccountForm.emailSecure} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, emailSecure: event.target.checked }))} />
-                  <span>{t("settings.notificationEmailSecure")}</span>
-                </label>
-                <label>
-                  <span>{t("settings.notificationEmailUsername")}</span>
-                  <input name="notification-email-username" className="search-input" value={notificationAccountForm.emailUsername} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, emailUsername: event.target.value }))} />
-                </label>
-                <label>
-                  <span>{t("settings.notificationEmailPassword")}</span>
-                  <input name="notification-email-password" className="search-input" type="password" value={notificationAccountForm.emailPassword} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, emailPassword: event.target.value }))} />
-                </label>
-                <label>
-                  <span>{t("settings.notificationEmailFromName")}</span>
-                  <input name="notification-email-from-name" className="search-input" value={notificationAccountForm.emailFromName} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, emailFromName: event.target.value }))} />
-                </label>
-                <label>
-                  <span>{t("settings.notificationEmailFromEmail")}</span>
-                  <input name="notification-email-from-email" className="search-input" value={notificationAccountForm.emailFromEmail} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, emailFromEmail: event.target.value }))} />
-                </label>
-                {!notificationEditingAccountId && <label className="checkbox-row">
-                  <input name="notification-email-create-recipient" type="checkbox" checked={notificationAccountForm.emailCreateRecipient} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, emailCreateRecipient: event.target.checked }))} />
-                  <span>{t("settings.notificationEmailCreateRecipient")}</span>
-                </label>}
-              </>
+              <EmailNotificationAccountPanel form={notificationAccountForm} setForm={setNotificationAccountForm} t={t} showCreateRecipient={!notificationEditingAccountId} />
             )}
             {notificationAccountForm.channelKind === "telegram" && (
-              <>
-                <label>
-                  <span>{t("settings.notificationTelegramBotToken")}</span>
-                  <input name="notification-telegram-bot-token" className="search-input" type="password" value={notificationAccountForm.telegramBotToken} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, telegramBotToken: event.target.value }))} />
-                </label>
-                <label>
-                  <span>{t("settings.notificationTelegramProxyUrl")}</span>
-                  <input name="notification-telegram-proxy-url" className="search-input" value={notificationAccountForm.telegramProxyUrl} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, telegramProxyUrl: event.target.value }))} placeholder="https://proxy.example.com/" />
-                </label>
-                <label className="dialog-checkbox">
-                  <input name="notification-telegram-inbound-enabled" type="checkbox" checked={notificationAccountForm.telegramInboundEnabled} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, telegramInboundEnabled: event.target.checked }))} />
-                  <span>{t("settings.notificationTelegramInboundEnabled")}</span>
-                </label>
-                <label>
-                  <span>{t("settings.notificationTelegramAllowedChatIds")}</span>
-                  <input name="notification-telegram-allowed-chat-ids" className="search-input" value={notificationAccountForm.telegramAllowedChatIds} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, telegramAllowedChatIds: event.target.value }))} placeholder="-100123,123456" />
-                </label>
-                <label>
-                  <span>{t("settings.notificationTelegramAllowedUserIds")}</span>
-                  <input name="notification-telegram-allowed-user-ids" className="search-input" value={notificationAccountForm.telegramAllowedUserIds} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, telegramAllowedUserIds: event.target.value }))} placeholder="123456,789012" />
-                </label>
-                <label>
-                  <span>{t("settings.notificationTelegramDefaultSessionId")}</span>
-                  <input name="notification-telegram-default-session-id" className="search-input" value={notificationAccountForm.telegramDefaultSessionId} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, telegramDefaultSessionId: event.target.value }))} placeholder="task-..." />
-                </label>
-                <label>
-                  <span>{t("settings.notificationTelegramTestChatId")}</span>
-                  <input name="notification-telegram-test-chat-id" className="search-input" value={notificationAccountForm.telegramTestChatId} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, telegramTestChatId: event.target.value }))} />
-                </label>
-              </>
+              <TelegramNotificationAccountPanel form={notificationAccountForm} setForm={setNotificationAccountForm} t={t} />
             )}
-            {notificationAccountForm.channelKind === "email" && (
-              <label>
-                <span>{t("settings.notificationTestEmailTo")}</span>
-                <input name="notification-test-email" className="search-input" value={notificationAccountForm.testEmailTo} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, testEmailTo: event.target.value }))} placeholder="a@example.com,b@example.com" />
-              </label>
+            {notificationAccountForm.channelKind === "weixin" && (
+              <WeixinNotificationAccountPanel
+                accountId={notificationEditingAccountId}
+                form={notificationAccountForm}
+                setForm={setNotificationAccountForm}
+                sessionToken={sessionToken}
+                t={t}
+                loadNotifications={loadNotifications}
+              />
+            )}
+            {notificationAccountForm.channelKind === "webhook" && (
+              <WebhookNotificationAccountPanel form={notificationAccountForm} setForm={setNotificationAccountForm} t={t} />
             )}
             <div className="settings-actions">
               <button className="ghost-button" type="submit" disabled={busy === "notification-account"}><IconText icon={notificationEditingAccountId ? Save : Plus}>{notificationEditingAccountId ? t("action.saveChanges") : t("settings.notificationAddAccount")}</IconText></button>
@@ -16031,6 +16117,7 @@ function SettingsPage({
               <select name="notification-recipient-kind" className="search-input" value={notificationRecipientForm.kind} disabled={Boolean(notificationEditingRecipientId)} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, kind: event.target.value as NotificationRecipientSummary["kind"] }))}>
                 <option value="email">Email</option>
                 <option value="telegram">Telegram</option>
+                <option value="weixin">Weixin</option>
                 <option value="webhook">Webhook</option>
               </select>
             </label>
@@ -16087,13 +16174,13 @@ function SettingsPage({
                     <button className="ghost-button icon-only" type="button" title={t("settings.notificationManageChannels")} aria-label={t("settings.notificationManageChannels")} onClick={() => setNotificationChannelManagerOpen(true)}><IconText icon={Plus}>{t("settings.notificationManageChannels")}</IconText></button>
                   </div>
                 </label>
-                {(notificationSettings?.channels.find((channel) => channel.id === notificationRecipientForm.channelId)?.id !== "webhook")
-                  ? (notificationSettings?.channels.find((channel) => channel.id === notificationRecipientForm.channelId)?.accountFields ?? []).map((field) => (
-                    <label key={field}>
-                      <span>{field}</span>
-                      <input name={`notification-recipient-field-${field}`} className="search-input" type={/key|token|secret|password/i.test(field) ? "password" : "text"} value={notificationRecipientForm.customConfig[field] ?? ""} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, customConfig: { ...current.customConfig, [field]: event.target.value } }))} />
-                    </label>
-                  ))
+                    {(notificationSettings?.channels.find((channel) => channel.id === notificationRecipientForm.channelId)?.id !== "webhook")
+                      ? (notificationSettings?.channels.find((channel) => channel.id === notificationRecipientForm.channelId)?.accountFields ?? []).map((field) => (
+                      <label key={field}>
+                        <span>{notificationFieldLabel(field)}</span>
+                        <input name={`notification-recipient-field-${field}`} className="search-input" type={/key|token|secret|password/i.test(field) ? "password" : "text"} value={notificationRecipientForm.customConfig[field] ?? ""} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, customConfig: { ...current.customConfig, [field]: event.target.value } }))} />
+                      </label>
+                    ))
                   : (
                     <label>
                       <span>{t("settings.notificationWebhookUrl")}</span>
@@ -16118,6 +16205,25 @@ function SettingsPage({
                   </label>
                 ) : (
                   <span className="subtle">{telegramNotificationSenders().length === 1 ? t("settings.notificationTelegramSenderAuto") : t("settings.notificationTelegramSenderMissing")}</span>
+                )}
+              </>
+            )}
+            {notificationRecipientForm.kind === "weixin" && (
+              <>
+                <label>
+                  <span>{t("settings.notificationWeixinChatId")}</span>
+                  <input name="notification-recipient-weixin-chat-id" className="search-input" value={notificationRecipientForm.weixinChatId} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, weixinChatId: event.target.value }))} />
+                </label>
+                {weixinNotificationSenders().length > 1 ? (
+                  <label>
+                    <span>{t("settings.notificationDefaultWeixinSender")}</span>
+                    <select name="notification-recipient-weixin-sender" className="search-input" value={notificationRecipientForm.weixinSenderAccountId} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, weixinSenderAccountId: event.target.value }))}>
+                      <option value="">{t("settings.notificationChooseSender")}</option>
+                      {weixinNotificationSenders().map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
+                    </select>
+                  </label>
+                ) : (
+                  <span className="subtle">{weixinNotificationSenders().length === 1 ? t("settings.notificationWeixinSenderAuto") : t("settings.notificationWeixinSenderMissing")}</span>
                 )}
               </>
             )}

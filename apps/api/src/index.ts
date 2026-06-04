@@ -9,8 +9,11 @@ import { basename, delimiter, dirname, join, relative, resolve, sep } from "node
 import { fileURLToPath } from "node:url";
 import { spawn as spawnPty } from "node-pty";
 import { generateSecret, generateURI } from "otplib";
-import nodemailer from "nodemailer";
 import { WebSocketServer, WebSocket } from "ws";
+import { createEmailPlatform } from "./platforms/email.js";
+import { createTelegramPlatform } from "./platforms/telegram.js";
+import { createWeixinPlatform } from "./platforms/weixin.js";
+import { platformOverview } from "./platforms.js";
 import type {
   ApprovalActionType,
   ApprovalDecisionResponse,
@@ -135,6 +138,8 @@ import type {
   TestNotificationAccountRequest,
   PageResponse,
   PermissionProfileId,
+  PlatformSettingsResponse,
+  WebhookRouteSummary,
   CreatePreviewRequest,
   ProjectCheckRunSummary,
   ProjectGitOperationRequest,
@@ -361,6 +366,64 @@ let sessionCompactionSettings = runtimeSettingsStore.sessionCompaction.load();
 let rateLimitSettings = rateLimitStore.load();
 let systemBackupSettings = loadSystemBackupSettings();
 const appData = loadAppData();
+const emailPlatform = createEmailPlatform({
+  db,
+  sessions: appData.sessions,
+  listNotificationAccounts,
+  dispatchMessageToSession,
+  createInboundSession: createInboundEmailSession,
+});
+const telegramPlatform = createTelegramPlatform({
+  db,
+  sessions: appData.sessions,
+  providers: appData.providers,
+  listNotificationAccounts,
+  dispatchMessageToSession,
+  workspaceRoot,
+  resolveShellPath,
+  managedChildEnv,
+  spawnProcess,
+  pathWithinRoot,
+  resolveTerminalCwd,
+  ensureScratchSessionWorkspace,
+  resolveAgentProject,
+  upsertSession,
+  agentFromRow,
+  roomFromRow,
+});
+const {
+  start: startEmailPlatform,
+  shutdown: shutdownEmailPlatform,
+  forwardAssistantMessageToEmail,
+  sendNotification: sendEmailNotification,
+} = emailPlatform;
+const {
+  start: startTelegramPlatform,
+  shutdown: shutdownTelegramPlatform,
+  forwardAssistantMessageToTelegram,
+  resolveTelegramTargetSession,
+  telegramSessionChoices,
+  telegramSessionLabel,
+  telegramGroupedSessionText,
+  telegramRecentSessionsText,
+  clearTelegramRouteSession,
+  setTelegramRouteSession,
+  activateTelegramReplyTargetFromQueue,
+  clearTelegramActiveReplyTargets,
+} = telegramPlatform;
+const weixinPlatform = createWeixinPlatform({
+  db,
+  sessions: appData.sessions,
+  listNotificationAccounts,
+  dispatchMessageToSession,
+  resolveTelegramTargetSession,
+  telegramSessionChoices,
+  telegramSessionLabel,
+  telegramGroupedSessionText,
+});
+startEmailPlatform();
+weixinPlatform.start();
+startTelegramPlatform();
 pruneCodexSessionProjectTrustEntries();
 let environmentOverview = buildEnvironmentOverview();
 migrateRoomAgentSessionDataRoots();
@@ -404,20 +467,6 @@ const finalizedRecoveredTasks = new Set<string>();
 const codexTaskSubscribers = new Map<string, Set<(event: TaskEvent) => void>>();
 const roomEventSubscribers = new Map<string, Set<(event: RoomStreamEvent) => void>>();
 const appNotificationSubscribers = new Set<(event: AppNotificationStreamEvent) => void>();
-const telegramPollingOffsets = new Map<string, number>();
-const telegramPollingBusy = new Set<string>();
-const telegramPendingSends = new Map<string, { message: string; sessionIds: string[]; createdAt: number }>();
-const telegramPendingBinds = new Map<string, { sessionIds: string[]; createdAt: number }>();
-const telegramQueuedReplyTargets = new Map<string, Array<{ accountId: string; chatId: string; createdAt: number }>>();
-const telegramActiveReplyTargets = new Map<string, Array<{ accountId: string; chatId: string; createdAt: number }>>();
-const telegramOutboundQueues = new Map<string, Promise<void>>();
-const telegramTypingTimers = new Map<string, { timeoutId: ReturnType<typeof setTimeout>; intervalId: ReturnType<typeof setInterval>; startedAt: number }>();
-const telegramPendingSelections = new Map<string, { ids: string[]; createdAt: number }>();
-const telegramPendingBrowse = new Map<string, { kind: "agent" | "room"; ids: string[]; page: number; pageSize: number; createdAt: number }>();
-const telegramPendingFileRoots = new Map<string, { roots: Array<{ label: string; root: string }>; createdAt: number }>();
-const telegramPendingFiles = new Map<string, { root: string; relPath: string; dirNames: string[]; createdAt: number }>();
-const telegramPendingTerminal = new Map<string, { command: string; roots: Array<{ label: string; root: string }>; createdAt: number }>();
-const telegramPendingInputs = new Map<string, { kind: "send" | "terminal"; createdAt: number }>();
 pauseStaleRunningSessions();
 recoverInterruptedRoomAgentRunsFromLogs();
 closePersistedRunningTerminals();
@@ -690,6 +739,36 @@ function openDatabase() {
       updated_at text not null,
       primary key (account_id, chat_id)
     );
+    create table if not exists weixin_chat_routes (
+      account_id text not null,
+      chat_id text not null,
+      session_id text not null,
+      context_token text,
+      updated_at text not null,
+      primary key (account_id, chat_id)
+    );
+    create table if not exists email_chat_routes (
+      account_id text not null,
+      chat_id text not null,
+      session_id text not null,
+      subject text,
+      inbound_message_id text,
+      last_message_id text,
+      updated_at text not null,
+      primary key (account_id, chat_id)
+    );
+    create table if not exists webhook_routes (
+      id text primary key,
+      route_key text not null unique,
+      name text not null,
+      enabled integer not null,
+      secret text not null,
+      session_id text,
+      prompt_template text not null,
+      created_at text not null,
+      updated_at text not null
+    );
+    create index if not exists webhook_routes_updated_idx on webhook_routes(updated_at desc, id desc);
     create table if not exists app_notifications (
       id text primary key,
       event_type text not null,
@@ -1612,6 +1691,7 @@ function routePermissionForRequest(method: string, path: string): ApiKeyPermissi
   }
   if (path.startsWith("/api/settings/environment/restore")) return "environment.restore";
   if (path.startsWith("/api/settings/environment")) return method === "GET" ? "environment.read" : "environment.manage";
+  if (path.startsWith("/api/webhook-routes")) return method === "GET" ? "settings.read" : "settings.manage";
   if (path.startsWith("/api/notifications") || path.startsWith("/api/app-notifications")) return method === "GET" ? "notifications.read" : "notifications.manage";
   if (path.startsWith("/api/approval-grants") || path.startsWith("/api/approvals")) return method === "GET" ? "approvals.read" : "approvals.decide";
   if (path.startsWith("/api/settings/storage")) return method === "GET" ? "storage.read" : "storage.manage";
@@ -2819,6 +2899,150 @@ function upsertSession(session: SessionSummary) {
   writeSessionMetadata(session);
 }
 
+function createInboundEmailSession(senderEmail: string, senderName: string, subject?: string | null) {
+  const id = `task-${randomUUID()}`;
+  const now = new Date().toISOString();
+  const title = subject?.trim()
+    ? `Email: ${subject.trim().slice(0, 60)}`
+    : senderName && senderName !== senderEmail
+      ? `Email: ${senderName} <${senderEmail}>`
+      : `Email: ${senderEmail}`;
+  const session: SessionSummary = {
+    id,
+    kind: "scratch",
+    conversationType: "codex",
+    roomId: null,
+    title,
+    projectId: null,
+    workspacePath: ensureScratchSessionWorkspace(id),
+    status: "running",
+    createdAt: now,
+    updatedAt: now,
+  };
+  appData.sessions.unshift(session);
+  saveAppData();
+  return session;
+}
+
+function listWebhookSessionSummaries(limit = 20) {
+  return appData.sessions.slice(0, limit).map((session) => ({
+    id: session.id,
+    title: session.title,
+    status: session.status,
+    conversationType: session.conversationType,
+    roomId: session.roomId ?? null,
+    projectId: session.projectId ?? null,
+    updatedAt: session.updatedAt,
+  }));
+}
+
+function listWebhookAgentSummaries(limit = 20) {
+  return listAgents(limit).items.map((agent) => ({
+    id: agent.id,
+    name: agent.name,
+    enabled: agent.enabled,
+    roleId: agent.roleId,
+    model: agent.model ?? null,
+    workspaceMode: agent.workspaceMode,
+    projectAccessMode: agent.projectAccessMode,
+    updatedAt: agent.updatedAt,
+  }));
+}
+
+function listWebhookRoomSummaries(limit = 20) {
+  return listRooms(undefined, limit).items.map((room) => ({
+    id: room.id,
+    name: room.name,
+    status: room.status,
+    sessionId: room.sessionId ?? null,
+    groupId: room.groupId ?? null,
+    circleId: room.circleId ?? null,
+    updatedAt: room.updatedAt,
+  }));
+}
+
+function slugifyWebhookRouteName(value: string) {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 24) || "webhook";
+}
+
+function webhookSecretIsSafe(secret: string) {
+  return secret !== "INSECURE_NO_AUTH" || host === "127.0.0.1" || host === "localhost" || host === "::1";
+}
+
+function normalizeWebhookRouteSecret(secret?: string | null) {
+  const value = String(secret ?? "").trim();
+  if (value) return value;
+  return `whsec_${randomBytes(18).toString("base64url")}`;
+}
+
+function webhookRouteFromRow(row: Record<string, unknown>): WebhookRouteSummary {
+  const sessionId = row.session_id ? String(row.session_id) : null;
+  const session = sessionId ? appData.sessions.find((item) => item.id === sessionId) ?? null : null;
+  const routeKey = String(row.route_key);
+  const secret = String(row.secret ?? "");
+  const publicBaseUrl = host.startsWith("0.0.0.0") || host === "127.0.0.1" || host === "::1"
+    ? "http://localhost:5173"
+    : `http://${host}:5173`;
+  return {
+    id: String(row.id),
+    routeKey,
+    name: String(row.name),
+    enabled: Boolean(row.enabled),
+    secret,
+    curlExample: `curl "${publicBaseUrl}/api/webhook/${routeKey}?command=sessions" -H "X-Webhook-Token: ${secret}"`,
+    sessionId,
+    sessionTitle: session?.title ?? null,
+    commandTemplate: String(row.prompt_template ?? ""),
+    promptTemplate: String(row.prompt_template ?? ""),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  };
+}
+
+function listWebhookRoutes() {
+  return (db.prepare("select * from webhook_routes order by updated_at desc, id desc").all() as Array<Record<string, unknown>>).map(webhookRouteFromRow);
+}
+
+function upsertWebhookRoute(route: {
+  id: string;
+  routeKey: string;
+  name: string;
+  enabled: boolean;
+  secret: string;
+  sessionId?: string | null;
+  promptTemplate: string;
+  createdAt: string;
+  updatedAt: string;
+}) {
+  db.prepare(`
+    insert into webhook_routes (id, route_key, name, enabled, secret, session_id, prompt_template, created_at, updated_at)
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    on conflict(id) do update set
+      route_key = excluded.route_key,
+      name = excluded.name,
+      enabled = excluded.enabled,
+      secret = excluded.secret,
+      session_id = excluded.session_id,
+      prompt_template = excluded.prompt_template,
+      updated_at = excluded.updated_at
+  `).run(
+    route.id,
+    route.routeKey,
+    route.name,
+    route.enabled ? 1 : 0,
+    route.secret,
+    route.sessionId ?? null,
+    route.promptTemplate,
+    route.createdAt,
+    route.updatedAt,
+  );
+}
+
 function upsertProject(project: ProjectSummary) {
   db.prepare(`
     insert into projects (id, name, workspace_path, runner, check_command, changed_files)
@@ -3275,8 +3499,42 @@ function recordProviderHealthCheck(providerId: string, kind: ProviderHealthCheck
   );
 }
 
+function builtinWebhookChannel(
+  id: string,
+  name: string,
+  description: string,
+  bodyTemplate: string,
+  accountFields: string[] = ["url"],
+): NotificationChannelDefinition {
+  return {
+    id,
+    kind: "webhook",
+    adapter: "webhook",
+    authType: "none",
+    name,
+    description,
+    builtin: true,
+    method: "POST",
+    urlTemplate: "{{url}}",
+    bodyTemplate,
+    accountFields,
+  };
+}
+
 const notificationChannels: NotificationChannelDefinition[] = [
-  { id: "webhook", kind: "webhook", adapter: "webhook", authType: "none", name: "Webhook", description: "Send a JSON or templated HTTP request.", builtin: true, method: "POST", accountFields: ["url"] },
+  builtinWebhookChannel(
+    "webhook",
+    "Webhook",
+    "Send a JSON or templated HTTP request.",
+    JSON.stringify({
+      title: "{{title}}",
+      message: "{{message}}",
+      severity: "{{severity}}",
+      eventType: "{{eventType}}",
+      sourceType: "{{sourceType}}",
+      sourceId: "{{sourceId}}",
+    }),
+  ),
   {
     id: "bark",
     kind: "webhook",
@@ -3298,8 +3556,50 @@ const notificationChannels: NotificationChannelDefinition[] = [
     }),
     accountFields: ["serverUrl", "deviceKey", "group", "sound", "icon", "url"],
   },
+  builtinWebhookChannel(
+    "weixin-webhook",
+    "Weixin Bot",
+    "Send notifications to a Weixin-compatible webhook bridge.",
+    JSON.stringify({
+      msgtype: "text",
+      text: {
+        content: "{{title}}\n\n{{message}}",
+      },
+    }),
+  ),
+  builtinWebhookChannel(
+    "wecom",
+    "WeCom Bot",
+    "Send notifications to a WeCom robot webhook.",
+    JSON.stringify({
+      msgtype: "text",
+      text: {
+        content: "{{title}}\n\n{{message}}",
+      },
+    }),
+  ),
+  builtinWebhookChannel(
+    "feishu",
+    "Feishu / Lark Bot",
+    "Send notifications to a Feishu or Lark bot webhook.",
+    JSON.stringify({
+      msg_type: "text",
+      content: {
+        text: "{{title}}\n\n{{message}}",
+      },
+    }),
+  ),
+  builtinWebhookChannel(
+    "qq",
+    "QQ Bot",
+    "Send notifications to a QQ-compatible webhook bridge.",
+    JSON.stringify({
+      content: "{{title}}\n\n{{message}}",
+    }),
+  ),
   { id: "email", kind: "email", adapter: "email", authType: "none", name: "Email SMTP", description: "Send email through an SMTP sender account.", builtin: true, accountFields: ["host", "port", "username", "password", "fromEmail"] },
   { id: "telegram", kind: "telegram", adapter: "telegram", authType: "none", name: "Telegram Bot", description: "Send Telegram messages through a bot token.", builtin: true, accountFields: ["botToken", "proxyUrl"] },
+  { id: "weixin", kind: "weixin", adapter: "weixin", authType: "none", name: "Weixin Bot", description: "Send personal Weixin messages through iLink Bot.", builtin: true, accountFields: ["botToken", "baseUrl"] },
 ];
 const notificationSeverityRank: Record<NotificationSeverity, number> = { info: 0, success: 1, warning: 2, error: 3 };
 const notificationEventTypes: NotificationEventType[] = ["task_completed", "task_failed", "task_interrupted", "needs_approval", "task_health_issue", "provider_check_failed", "backup_failed", "restore_failed", "auth_login"];
@@ -3356,7 +3656,7 @@ function parseJsonValue<T>(value: unknown, fallback: T): T {
 
 function publicNotificationConfig(kind: NotificationAccountSummary["channelKind"], config: Record<string, unknown>) {
   const copy: Record<string, unknown> = { ...config };
-  for (const key of ["password", "deviceKey", "token", "secret", "botToken", "corpSecret", "accessToken", "bearerToken"]) {
+  for (const key of ["password", "imapPassword", "deviceKey", "token", "secret", "botToken", "corpSecret", "accessToken", "bearerToken"]) {
     if (copy[key]) copy[key] = "********";
   }
   if (kind === "webhook" && copy.headers && typeof copy.headers === "object") {
@@ -3366,6 +3666,14 @@ function publicNotificationConfig(kind: NotificationAccountSummary["channelKind"
     ]));
   }
   return copy;
+}
+
+function notificationLanguageFromConfig(config?: Record<string, unknown> | null): "zh-CN" | "en-US" {
+  return String(config?.language ?? "").trim() === "en-US" ? "en-US" : "zh-CN";
+}
+
+function notificationLocaleText(language: "zh-CN" | "en-US", zh: string, en: string) {
+  return language === "en-US" ? en : zh;
 }
 
 function sanitizeNotificationPermissions(input?: NotificationPermissionPolicy | Record<string, unknown> | null): NotificationPermissionPolicy {
@@ -3378,12 +3686,15 @@ function sanitizeNotificationPermissions(input?: NotificationPermissionPolicy | 
 }
 
 function notificationAccountFromRow(row: Record<string, unknown>, exposeSecrets = false): NotificationAccountRecord {
-  const channelKind = notificationChannels.some((channel) => channel.kind === row.channel_kind) ? row.channel_kind as NotificationAccountSummary["channelKind"] : "webhook";
+  const channelId = row.channel_id ? String(row.channel_id) : null;
+  const channelFromId = channelId ? getNotificationChannel(channelId) : null;
+  const channelKind = channelFromId?.kind
+    ?? (notificationChannels.some((channel) => channel.kind === row.channel_kind) ? row.channel_kind as NotificationAccountSummary["channelKind"] : "webhook");
   const config = parseJsonValue<Record<string, unknown>>(row.config, {});
   return {
     id: String(row.id),
     name: String(row.name),
-    channelId: row.channel_id ? String(row.channel_id) : null,
+    channelId,
     channelKind,
     enabled: Boolean(row.enabled),
     config: exposeSecrets ? config : publicNotificationConfig(channelKind, config),
@@ -3396,7 +3707,7 @@ function notificationAccountFromRow(row: Record<string, unknown>, exposeSecrets 
 }
 
 function notificationRecipientFromRow(row: Record<string, unknown>, exposeSecrets = false): NotificationRecipientSummary {
-  const kind = ["email", "webhook", "bark", "telegram"].includes(String(row.kind)) ? String(row.kind) as NotificationRecipientSummary["kind"] : "webhook";
+  const kind = ["email", "webhook", "bark", "telegram", "weixin"].includes(String(row.kind)) ? String(row.kind) as NotificationRecipientSummary["kind"] : "webhook";
   const config = parseJsonValue<Record<string, unknown>>(row.config, {});
   return {
     id: String(row.id),
@@ -3405,7 +3716,7 @@ function notificationRecipientFromRow(row: Record<string, unknown>, exposeSecret
     enabled: Boolean(row.enabled),
     senderAccountId: row.sender_account_id ? String(row.sender_account_id) : null,
     channelId: row.channel_id ? String(row.channel_id) : null,
-    config: exposeSecrets ? config : publicNotificationConfig(kind === "email" ? "email" : kind === "bark" ? "bark" : kind === "telegram" ? "telegram" : "webhook", config),
+    config: exposeSecrets ? config : publicNotificationConfig(kind === "email" ? "email" : kind === "bark" ? "bark" : kind === "telegram" ? "telegram" : kind === "weixin" ? "weixin" : "webhook", config),
     permissions: sanitizeNotificationPermissions(parseJsonValue<NotificationPermissionPolicy>(row.permissions, {})),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
@@ -3627,6 +3938,7 @@ function sanitizeNotificationConfig(kind: NotificationAccountSummary["channelKin
     : String(value ?? "").split(",").map((item) => item.trim()).filter(Boolean);
   if (kind === "email") {
     const password = String(config.password ?? "").trim();
+    const imapPassword = String(config.imapPassword ?? "").trim();
     return {
       host: String(config.host ?? previous?.host ?? "").trim(),
       port: Number(config.port ?? previous?.port ?? 587) || 587,
@@ -3636,6 +3948,15 @@ function sanitizeNotificationConfig(kind: NotificationAccountSummary["channelKin
       fromName: String(config.fromName ?? previous?.fromName ?? "Codex Web").trim(),
       fromEmail: String(config.fromEmail ?? previous?.fromEmail ?? "").trim(),
       testEmailTo: list(config.testEmailTo ?? previous?.testEmailTo),
+      inboundEnabled: config.inboundEnabled === true,
+      imapHost: String(config.imapHost ?? previous?.imapHost ?? config.host ?? previous?.host ?? "").trim(),
+      imapPort: Number(config.imapPort ?? previous?.imapPort ?? 993) || 993,
+      imapSecure: config.imapSecure === true || (config.imapSecure === undefined && Number(config.imapPort ?? previous?.imapPort ?? 993) === 993),
+      imapUsername: String(config.imapUsername ?? previous?.imapUsername ?? config.username ?? previous?.username ?? "").trim(),
+      imapPassword: imapPassword && imapPassword !== "********" ? imapPassword : String(previous?.imapPassword ?? previous?.password ?? ""),
+      inboundMailbox: String(config.inboundMailbox ?? previous?.inboundMailbox ?? "INBOX").trim() || "INBOX",
+      allowedSenderEmails: list(config.allowedSenderEmails ?? previous?.allowedSenderEmails),
+      defaultSessionId: String(config.defaultSessionId ?? previous?.defaultSessionId ?? "").trim(),
     };
   }
   if (kind === "telegram") {
@@ -3643,6 +3964,22 @@ function sanitizeNotificationConfig(kind: NotificationAccountSummary["channelKin
     return {
       botToken: botToken && botToken !== "********" ? botToken : String(previous?.botToken ?? ""),
       proxyUrl: String(config.proxyUrl ?? previous?.proxyUrl ?? "").trim(),
+      language: String(config.language ?? previous?.language ?? "zh-CN").trim() === "en-US" ? "en-US" : "zh-CN",
+      inboundEnabled: config.inboundEnabled === true,
+      allowedChatIds: list(config.allowedChatIds ?? previous?.allowedChatIds),
+      allowedUserIds: list(config.allowedUserIds ?? previous?.allowedUserIds),
+      defaultSessionId: String(config.defaultSessionId ?? previous?.defaultSessionId ?? "").trim(),
+      testChatId: String(config.testChatId ?? previous?.testChatId ?? "").trim(),
+    };
+  }
+  if (kind === "weixin") {
+    const botToken = String(config.botToken ?? "").trim();
+    return {
+      botToken: botToken && botToken !== "********" ? botToken : String(previous?.botToken ?? ""),
+      baseUrl: String(config.baseUrl ?? previous?.baseUrl ?? "https://ilinkai.weixin.qq.com").trim(),
+      accountId: String(config.accountId ?? previous?.accountId ?? "").trim(),
+      userId: String(config.userId ?? previous?.userId ?? "").trim(),
+      language: String(config.language ?? previous?.language ?? "zh-CN").trim() === "en-US" ? "en-US" : "zh-CN",
       inboundEnabled: config.inboundEnabled === true,
       allowedChatIds: list(config.allowedChatIds ?? previous?.allowedChatIds),
       allowedUserIds: list(config.allowedUserIds ?? previous?.allowedUserIds),
@@ -3659,6 +3996,14 @@ function sanitizeNotificationConfig(kind: NotificationAccountSummary["channelKin
       group: String(config.group ?? previous?.group ?? "Codex Web").trim(),
       icon: String(config.icon ?? previous?.icon ?? "").trim(),
       url: String(config.url ?? previous?.url ?? "").trim(),
+    };
+  }
+  if (["webhook", "weixin", "wecom", "feishu", "qq"].includes(kind)) {
+    return {
+      url: String(config.url ?? previous?.url ?? "").trim(),
+      method: String(config.method ?? previous?.method ?? "POST").trim().toUpperCase() || "POST",
+      headers: typeof config.headers === "object" && config.headers && !Array.isArray(config.headers) ? config.headers : previous?.headers ?? {},
+      bodyTemplate: String(config.bodyTemplate ?? previous?.bodyTemplate ?? "").trim(),
     };
   }
   return {
@@ -3705,6 +4050,33 @@ function parseNotificationHeaders(template: string, event: NotificationEventInpu
     const index = rendered.indexOf(":");
     return index > 0 ? [rendered.slice(0, index).trim(), rendered.slice(index + 1).trim()] : ["", ""];
   }).filter(([key]) => key));
+}
+
+function parseWebhookPayload(request: Request, rawBody: Buffer) {
+  const contentType = request.headers.get("content-type")?.toLowerCase() ?? "";
+  const text = rawBody.toString("utf8");
+  if (contentType.includes("application/json") || text.trim().startsWith("{") || text.trim().startsWith("[")) {
+    try {
+      return JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      return { body: text };
+    }
+  }
+  if (contentType.includes("application/x-www-form-urlencoded")) {
+    const params = new URLSearchParams(text);
+    return Object.fromEntries(params.entries());
+  }
+  return { body: text };
+}
+
+function validateWebhookToken(secret: string, request: Request) {
+  if (secret === "INSECURE_NO_AUTH") return host === "127.0.0.1" || host === "localhost" || host === "::1";
+  const provided = [
+    request.headers.get("x-webhook-token"),
+    request.headers.get("authorization")?.replace(/^Bearer\s+/i, ""),
+    new URL(request.url).searchParams.get("token"),
+  ].find((value) => Boolean(value))?.trim();
+  return Boolean(provided && provided === secret);
 }
 
 function normalizeWebhookConfig(config: Record<string, unknown>) {
@@ -3756,24 +4128,7 @@ async function sendNotificationToAccount(account: NotificationAccountRecord, eve
   const config = account.config;
   const customChannel = account.channelId ? getNotificationChannel(account.channelId) : null;
   if (account.channelKind === "webhook" && customChannel?.id && customChannel.id !== "webhook") return sendWebhookNotification(customChannel, config, event);
-  if (account.channelKind === "email") {
-    const to = target?.emailTo?.length ? target.emailTo : [];
-    if (!to.length) throw new Error("email_recipients_required");
-    if (!config.host || !config.fromEmail) throw new Error("email_smtp_config_required");
-    const transporter = nodemailer.createTransport({
-      host: String(config.host),
-      port: Number(config.port) || 587,
-      secure: config.secure === true,
-      auth: config.username || config.password ? { user: String(config.username ?? ""), pass: String(config.password ?? "") } : undefined,
-    });
-    await transporter.sendMail({
-      from: config.fromName ? `"${String(config.fromName).replace(/"/g, "'")}" <${String(config.fromEmail)}>` : String(config.fromEmail),
-      to,
-      subject: event.title,
-      text: `${event.message}\n\n事件：${event.eventType}\n等级：${event.severity}`,
-    });
-    return { responseStatus: null };
-  }
+  if (account.channelKind === "email") return sendEmailNotification(account, event, target);
   if (account.channelKind === "telegram") {
     if (!config.botToken) throw new Error("telegram_bot_token_required");
     if (!target?.chatId) throw new Error("telegram_chat_id_required");
@@ -3786,6 +4141,7 @@ async function sendNotificationToAccount(account: NotificationAccountRecord, eve
     if (!response.ok) throw new Error(text.slice(0, 500) || `telegram_http_${response.status}`);
     return { responseStatus: response.status };
   }
+  if (account.channelKind === "weixin") return weixinPlatform.sendNotification(account, event, target);
   if (account.channelKind === "bark") return sendWebhookNotification(getNotificationChannel("bark"), config, event);
   return sendWebhookNotification(customChannel, config, event);
 }
@@ -3810,20 +4166,33 @@ async function syncTelegramBotCommands(account: NotificationAccountRecord) {
   if (account.channelKind !== "telegram") return;
   const config = account.config as Record<string, unknown>;
   if (!config.botToken || config.botToken === "********") return;
+  const language = notificationLanguageFromConfig(config);
+  const commands = language === "en-US" ? [
+    { command: "start", description: "Show bot help" },
+    { command: "sessions", description: "List recent sessions" },
+    { command: "agents", description: "List agents" },
+    { command: "rooms", description: "List rooms" },
+    { command: "files", description: "Browse files" },
+    { command: "terminal", description: "Run a terminal command" },
+    { command: "bind", description: "Bind this chat to a session" },
+    { command: "unbind", description: "Clear the bound session" },
+    { command: "send", description: "Send a message to a session" },
+    { command: "help", description: "Show help" },
+  ] : [
+    { command: "start", description: "显示机器人帮助" },
+    { command: "sessions", description: "列出最近会话" },
+    { command: "agents", description: "列出代理" },
+    { command: "rooms", description: "列出 Room" },
+    { command: "files", description: "浏览文件" },
+    { command: "terminal", description: "运行终端命令" },
+    { command: "bind", description: "把当前聊天绑定到会话" },
+    { command: "unbind", description: "清除绑定的会话" },
+    { command: "send", description: "向会话发送消息" },
+    { command: "help", description: "显示帮助" },
+  ];
   if (account.enabled && config.inboundEnabled === true) {
     await telegramBotApi(account, "setMyCommands", {
-      commands: [
-        { command: "start", description: "Show bot help" },
-        { command: "sessions", description: "List recent sessions" },
-        { command: "agents", description: "List agents" },
-        { command: "rooms", description: "List rooms" },
-        { command: "files", description: "Browse files" },
-        { command: "terminal", description: "Run a terminal command" },
-        { command: "bind", description: "Bind this chat to a session" },
-        { command: "unbind", description: "Clear the bound session" },
-        { command: "send", description: "Send a message to a session" },
-        { command: "help", description: "Show help" },
-      ],
+      commands,
     });
     await telegramBotApi(account, "setChatMenuButton", {
       menu_button: { type: "commands" },
@@ -3896,6 +4265,13 @@ function chooseTelegramNotificationSender(recipient: NotificationRecipientSummar
     ?? (telegramSenders.length === 1 ? telegramSenders[0] : null);
 }
 
+function chooseWeixinNotificationSender(recipient: NotificationRecipientSummary, target?: NotificationRuleTarget) {
+  const weixinSenders = listNotificationAccounts(true).filter((account) => account.enabled && account.channelKind === "weixin");
+  return (target?.senderAccountId ? weixinSenders.find((account) => account.id === target.senderAccountId) : null)
+    ?? (recipient.senderAccountId ? weixinSenders.find((account) => account.id === recipient.senderAccountId) : null)
+    ?? (weixinSenders.length === 1 ? weixinSenders[0] : null);
+}
+
 async function deliverNotificationToRecipient(recipient: NotificationRecipientSummary, event: NotificationEventInput, ruleId: string | null, target?: NotificationRuleTarget) {
   if (recipient.kind === "email") {
     const sender = chooseEmailNotificationSender(recipient, target);
@@ -3905,6 +4281,11 @@ async function deliverNotificationToRecipient(recipient: NotificationRecipientSu
   if (recipient.kind === "telegram") {
     const sender = chooseTelegramNotificationSender(recipient, target);
     if (!sender) throw new Error("telegram_sender_required");
+    return deliverNotification(sender, event, ruleId, { recipientId: recipient.id, accountId: sender.id, chatId: String(recipient.config.chatId ?? "") }, recipient);
+  }
+  if (recipient.kind === "weixin") {
+    const sender = chooseWeixinNotificationSender(recipient, target);
+    if (!sender) throw new Error("weixin_sender_required");
     return deliverNotification(sender, event, ruleId, { recipientId: recipient.id, accountId: sender.id, chatId: String(recipient.config.chatId ?? "") }, recipient);
   }
   const account: NotificationAccountRecord = {
@@ -4516,7 +4897,9 @@ function appendSessionMessage(sessionId: string, role: SessionMessage["role"], c
   const session = appData.sessions.find((item) => item.id === sessionId);
   if (session && role === "assistant") {
     appendUrlCardsForMessage(session, message.id, content);
+    forwardAssistantMessageToEmail(session, message);
     forwardAssistantMessageToTelegram(session, message);
+    weixinPlatform.forwardAssistantMessageToWeixin(session, message);
   }
   return message;
 }
@@ -11528,1109 +11911,6 @@ function enqueueCrossSessionFollowup(session: SessionSummary, result: string) {
   });
 }
 
-type TelegramUpdate = {
-  update_id: number;
-  message?: {
-    message_id?: number;
-    text?: string;
-    chat?: { id?: number | string; title?: string; username?: string; type?: string };
-    from?: { id?: number | string; username?: string; first_name?: string };
-  };
-  callback_query?: {
-    id: string;
-    data?: string;
-    message?: {
-      message_id?: number;
-      chat?: { id?: number | string; title?: string; username?: string; type?: string };
-    };
-    from?: { id?: number | string; username?: string; first_name?: string };
-  };
-};
-
-function telegramConfigList(value: unknown) {
-  if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
-  return String(value ?? "").split(",").map((item) => item.trim()).filter(Boolean);
-}
-
-function telegramUpdateChatId(update: TelegramUpdate) {
-  const id = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id;
-  return id === undefined ? "" : String(id);
-}
-
-function telegramUpdateUserId(update: TelegramUpdate) {
-  const id = update.message?.from?.id ?? update.callback_query?.from?.id;
-  return id === undefined ? "" : String(id);
-}
-
-function telegramInboundAllowed(account: NotificationAccountRecord, update: TelegramUpdate) {
-  const config = account.config as Record<string, unknown>;
-  const chatId = telegramUpdateChatId(update);
-  const userId = telegramUpdateUserId(update);
-  const allowedChatIds = telegramConfigList(config.allowedChatIds);
-  const allowedUserIds = telegramConfigList(config.allowedUserIds);
-  if (allowedChatIds.length && !allowedChatIds.includes(chatId)) return false;
-  if (allowedUserIds.length && !allowedUserIds.includes(userId)) return false;
-  return Boolean(chatId);
-}
-
-function telegramRouteSession(account: NotificationAccountRecord, chatId: string) {
-  const accountId = account.id;
-  const row = db.prepare("select session_id from telegram_chat_routes where account_id = ? and chat_id = ?").get(accountId, chatId) as { session_id?: string } | undefined;
-  const sessionId = row?.session_id ?? String((account.config as Record<string, unknown>).defaultSessionId ?? "");
-  return sessionId ? appData.sessions.find((session) => session.id === sessionId) ?? null : null;
-}
-
-function telegramSessionChoices(limit = 8) {
-  const categoryOrder = new Map<string, number>([
-    ["Codex", 0],
-    ["Agent", 1],
-    ["Room", 2],
-    ["Automation", 3],
-  ]);
-  return appData.sessions
-    .slice()
-    .filter((session) => !(session.conversationType === "agent" && session.roomId))
-    .sort((a, b) => {
-      const categoryDiff = (categoryOrder.get(telegramSessionCategory(a)) ?? 99) - (categoryOrder.get(telegramSessionCategory(b)) ?? 99);
-      if (categoryDiff !== 0) return categoryDiff;
-      return b.updatedAt.localeCompare(a.updatedAt);
-    })
-    .slice(0, limit);
-}
-
-function telegramSessionCategory(session: SessionSummary) {
-  if (session.conversationType === "automation") return "Automation";
-  if (session.conversationType === "room") return "Room";
-  if (session.conversationType === "agent") return "Agent";
-  return "Codex";
-}
-
-function telegramSessionLabel(session: SessionSummary, index?: number) {
-  const prefix = index === undefined ? "" : `${index + 1}. `;
-  const shortId = session.id.length > 12 ? `${session.id.slice(0, 12)}...` : session.id;
-  return `${prefix}[${telegramSessionCategory(session)}] ${session.title} (${shortId})`;
-}
-
-function telegramGroupedSessionText(limit = 12) {
-  const order = ["Codex", "Agent", "Room", "Automation"] as const;
-  const choices = telegramSessionChoices(limit);
-  const sections = order
-    .map((category) => {
-      const rows = choices
-        .map((session, index) => ({ session, index }))
-        .filter(({ session }) => telegramSessionCategory(session) === category)
-        .map(({ session, index }) => `${telegramSessionLabel(session, index)}\n${session.status} · ${session.updatedAt}\n${session.id}`);
-      return rows.length ? [`${category}:`, ...rows].join("\n\n") : "";
-    })
-    .filter(Boolean);
-  return sections.length ? sections.join("\n\n") : "No sessions yet.";
-}
-
-function telegramAgentChoices(limit?: number) {
-  const rows = limit === undefined
-    ? db.prepare("select * from agents where enabled = 1 order by updated_at desc, id desc").all() as Array<Record<string, unknown>>
-    : db.prepare("select * from agents where enabled = 1 order by updated_at desc, id desc limit ?").all(limit) as Array<Record<string, unknown>>;
-  return rows.map(agentFromRow);
-}
-
-function telegramAgentLabel(agent: AgentSummary, index?: number) {
-  const prefix = index === undefined ? "" : `${index + 1}. `;
-  const shortId = agent.id.length > 12 ? `${agent.id.slice(0, 12)}...` : agent.id;
-  return `${prefix}${agent.name} (${shortId})`;
-}
-
-function telegramRoomChoices(limit?: number) {
-  const rows = limit === undefined
-    ? db.prepare("select * from rooms order by updated_at desc, id desc").all() as Array<Record<string, unknown>>
-    : db.prepare("select * from rooms order by updated_at desc, id desc limit ?").all(limit) as Array<Record<string, unknown>>;
-  return rows.map(roomFromRow);
-}
-
-function telegramRoomLabel(room: RoomSummary, index?: number) {
-  const prefix = index === undefined ? "" : `${index + 1}. `;
-  const shortId = room.id.length > 12 ? `${room.id.slice(0, 12)}...` : room.id;
-  return `${prefix}${room.name} (${shortId})`;
-}
-
-function telegramPageCount(total: number, pageSize: number) {
-  return Math.max(1, Math.ceil(total / pageSize));
-}
-
-function telegramPageSlice<T>(items: T[], page = 0, pageSize = 10) {
-  const total = items.length;
-  const totalPages = telegramPageCount(total, pageSize);
-  const currentPage = Math.min(Math.max(page, 0), totalPages - 1);
-  const start = currentPage * pageSize;
-  const pageItems = items.slice(start, start + pageSize);
-  return { total, totalPages, page: currentPage, pageItems, start, end: Math.min(start + pageItems.length, total) };
-}
-
-function telegramAgentBrowseItems(ids: string[]) {
-  const rows = db.prepare("select * from agents where enabled = 1 order by updated_at desc, id desc").all() as Array<Record<string, unknown>>;
-  const rowsById = new Map(rows.map((row) => [String(row.id ?? ""), row] as const));
-  return ids
-    .map((id) => rowsById.get(id))
-    .filter((row): row is Record<string, unknown> => Boolean(row))
-    .map(agentFromRow);
-}
-
-function telegramRoomBrowseItems(ids: string[]) {
-  const rows = db.prepare("select * from rooms order by updated_at desc, id desc").all() as Array<Record<string, unknown>>;
-  const rowsById = new Map(rows.map((row) => [String(row.id ?? ""), row] as const));
-  return ids
-    .map((id) => rowsById.get(id))
-    .filter((row): row is Record<string, unknown> => Boolean(row))
-    .map(roomFromRow);
-}
-
-function telegramPendingKey(accountId: string, chatId: string) {
-  return `${accountId}:${chatId}`;
-}
-
-function telegramSelectionKey(accountId: string, chatId: string, kind: "agent" | "room") {
-  return `${accountId}:${chatId}:${kind}`;
-}
-
-function createTelegramAgentSession(agent: AgentSummary) {
-  if (!agent.enabled) throw new Error("agent_disabled");
-  const project = resolveAgentProject(agent);
-  const provider = agent.providerId ? appData.providers.find((item) => item.id === agent.providerId) : appData.providers[0];
-  const now = new Date().toISOString();
-  const id = `task-${randomUUID()}`;
-  const session: SessionSummary = {
-    id,
-    kind: project ? "project" : "scratch",
-    conversationType: "agent",
-    roomId: null,
-    directAgentId: agent.id,
-    title: agent.name,
-    projectId: project?.id ?? null,
-    workspacePath: project?.workspacePath ? resolveTerminalCwd(project.workspacePath) : ensureScratchSessionWorkspace(id),
-    providerId: provider?.id ?? null,
-    model: agent.model ?? provider?.defaultModel ?? null,
-    status: "paused",
-    createdAt: now,
-    updatedAt: now,
-  };
-  appData.sessions.unshift(session);
-  upsertSession(session);
-  db.prepare("insert into agent_sessions (session_id, agent_id, created_at) values (?, ?, ?)").run(session.id, agent.id, now);
-  return session;
-}
-
-function telegramRootChoices(chatSession?: SessionSummary | null) {
-  const roots: Array<{ label: string; root: string }> = [];
-  if (chatSession?.workspacePath) roots.push({ label: telegramSessionLabel(chatSession), root: chatSession.workspacePath });
-  if (!chatSession) roots.push({ label: "System workspace", root: workspaceRoot });
-  for (const session of telegramSessionChoices(8)) {
-    if (chatSession?.id === session.id || !session.workspacePath) continue;
-    roots.push({ label: telegramSessionLabel(session), root: session.workspacePath });
-  }
-  const seen = new Set<string>();
-  return roots.filter((item) => {
-    const root = resolve(item.root);
-    if (seen.has(root) || !existsSync(root) || !statSync(root).isDirectory()) return false;
-    seen.add(root);
-    item.root = root;
-    return true;
-  }).slice(0, 9);
-}
-
-function telegramSafeRelativePath(input = "") {
-  return input.split("/").map((part) => part.trim()).filter((part) => part && part !== "." && part !== "..").join("/");
-}
-
-function telegramDangerousCommand(command: string) {
-  return /\b(rm\s+-[^\n]*r|shutdown|reboot|halt|mkfs|dd\s+if=|:\(\)\s*\{)\b/i.test(command);
-}
-
-function setTelegramRouteSession(accountId: string, chatId: string, sessionId: string) {
-  db.prepare(`
-    insert into telegram_chat_routes (account_id, chat_id, session_id, updated_at)
-    values (?, ?, ?, ?)
-    on conflict(account_id, chat_id) do update set session_id = excluded.session_id, updated_at = excluded.updated_at
-  `).run(accountId, chatId, sessionId, new Date().toISOString());
-}
-
-function clearTelegramRouteSession(accountId: string, chatId: string) {
-  db.prepare("delete from telegram_chat_routes where account_id = ? and chat_id = ?").run(accountId, chatId);
-}
-
-function appendTelegramReplyTarget(
-  current: Array<{ accountId: string; chatId: string; createdAt: number }> | undefined,
-  accountId: string,
-  chatId: string,
-) {
-  const createdAt = Date.now();
-  const filtered = (current ?? []).filter((item) => createdAt - item.createdAt < 30 * 60 * 1000);
-  if (!filtered.some((item) => item.accountId === accountId && item.chatId === chatId)) {
-    filtered.push({ accountId, chatId, createdAt });
-  }
-  return filtered;
-}
-
-function queueTelegramQueuedReplyTarget(queueId: string, accountId: string, chatId: string) {
-  telegramQueuedReplyTargets.set(queueId, appendTelegramReplyTarget(telegramQueuedReplyTargets.get(queueId), accountId, chatId));
-}
-
-function queueTelegramActiveReplyTarget(sessionId: string, accountId: string, chatId: string) {
-  telegramActiveReplyTargets.set(sessionId, appendTelegramReplyTarget(telegramActiveReplyTargets.get(sessionId), accountId, chatId));
-}
-
-function activateTelegramReplyTargetFromQueue(sessionId: string, queueId: string) {
-  const pending = telegramQueuedReplyTargets.get(queueId) ?? [];
-  telegramQueuedReplyTargets.delete(queueId);
-  if (!pending.length) return;
-  const current = telegramActiveReplyTargets.get(sessionId) ?? [];
-  const now = Date.now();
-  telegramActiveReplyTargets.set(sessionId, [...current, ...pending].filter((item, index, items) => {
-    if (now - item.createdAt >= 30 * 60 * 1000) return false;
-    return items.findIndex((candidate) => candidate.accountId === item.accountId && candidate.chatId === item.chatId) === index;
-  }));
-}
-
-function boundTelegramReplyTargets(sessionId: string) {
-  return (db.prepare("select account_id, chat_id from telegram_chat_routes where session_id = ?").all(sessionId) as Array<{ account_id?: string; chat_id?: string }>)
-    .map((row) => ({ accountId: String(row.account_id ?? ""), chatId: String(row.chat_id ?? "") }))
-    .filter((item) => item.accountId && item.chatId);
-}
-
-function telegramReplyDestinations(sessionId: string) {
-  const deduped = new Map<string, { accountId: string; chatId: string }>();
-  const active = telegramActiveReplyTargets.get(sessionId) ?? [];
-  const now = Date.now();
-  for (const item of [...boundTelegramReplyTargets(sessionId), ...active.filter((entry) => now - entry.createdAt < 30 * 60 * 1000)]) {
-    deduped.set(`${item.accountId}:${item.chatId}`, item);
-  }
-  return [...deduped.values()];
-}
-
-function clearTelegramActiveReplyTargets(sessionId: string) {
-  telegramActiveReplyTargets.delete(sessionId);
-}
-
-function telegramOutboundQueueKey(accountId: string, chatId: string) {
-  return `${accountId}:${chatId}`;
-}
-
-function telegramTypingKey(accountId: string, chatId: string) {
-  return `${accountId}:${chatId}`;
-}
-
-function stopTelegramTyping(accountId: string, chatId: string) {
-  const key = telegramTypingKey(accountId, chatId);
-  const entry = telegramTypingTimers.get(key);
-  if (!entry) return;
-  clearTimeout(entry.timeoutId);
-  clearInterval(entry.intervalId);
-  telegramTypingTimers.delete(key);
-}
-
-function startTelegramTyping(account: NotificationAccountRecord, chatId: string) {
-  const key = telegramTypingKey(account.id, chatId);
-  stopTelegramTyping(account.id, chatId);
-  const sendTyping = () => {
-    void telegramBotApi(account, "sendChatAction", {
-      chat_id: chatId,
-      action: "typing",
-    }).catch(() => undefined);
-  };
-  sendTyping();
-  const intervalId = setInterval(sendTyping, 4000);
-  const timeoutId = setTimeout(() => stopTelegramTyping(account.id, chatId), 90_000);
-  telegramTypingTimers.set(key, { timeoutId, intervalId, startedAt: Date.now() });
-}
-
-function formatTelegramSessionReply(session: SessionSummary, content: string) {
-  const title = session.title?.trim() || session.id;
-  const body = content.trim();
-  return body ? `[${title}]\n\n${body}` : `[${title}]`;
-}
-
-function forwardAssistantMessageToTelegram(session: SessionSummary, message: SessionMessage) {
-  if (message.role !== "assistant") return;
-  const destinations = telegramReplyDestinations(session.id);
-  if (!destinations.length) return;
-  const accounts = new Map(
-    listNotificationAccounts(true)
-      .filter((account) => account.enabled && account.channelKind === "telegram")
-      .map((account) => [account.id, account]),
-  );
-  const text = formatTelegramSessionReply(session, message.content);
-  for (const destination of destinations) {
-    const account = accounts.get(destination.accountId);
-    if (!account) continue;
-    stopTelegramTyping(destination.accountId, destination.chatId);
-    void enqueueTelegramText(account, destination.chatId, text).catch((error) => {
-      console.warn("telegram reply forward failed", destination.accountId, destination.chatId, error instanceof Error ? error.message : error);
-    });
-  }
-}
-
-function enqueueTelegramText(account: NotificationAccountRecord, chatId: string, text: string) {
-  const key = telegramOutboundQueueKey(account.id, chatId);
-  const previous = telegramOutboundQueues.get(key) ?? Promise.resolve();
-  const next = previous
-    .catch(() => {})
-    .then(() => sendTelegramText(account, chatId, text));
-  telegramOutboundQueues.set(key, next.finally(() => {
-    if (telegramOutboundQueues.get(key) === next) telegramOutboundQueues.delete(key);
-  }));
-  return next;
-}
-
-async function sendTelegramText(account: NotificationAccountRecord, chatId: string, text: string) {
-  const response = await telegramBotApi(account, "sendMessage", {
-    chat_id: chatId,
-    text: text.slice(0, 3900),
-    disable_web_page_preview: true,
-  });
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
-  }
-}
-
-async function editTelegramText(account: NotificationAccountRecord, chatId: string, messageId: number, text: string, replyMarkup?: Record<string, unknown>) {
-  const response = await telegramBotApi(account, "editMessageText", {
-    chat_id: chatId,
-    message_id: messageId,
-    text: text.slice(0, 3900),
-    disable_web_page_preview: true,
-    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-  });
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
-  }
-}
-
-async function sendTelegramSessionPicker(account: NotificationAccountRecord, chatId: string, message: string) {
-  const choices = telegramSessionChoices();
-  if (!choices.length) {
-    await sendTelegramText(account, chatId, "No sessions are available. Create a session first.");
-    return;
-  }
-  telegramPendingSends.set(telegramPendingKey(account.id, chatId), {
-    message,
-    sessionIds: choices.map((session) => session.id),
-    createdAt: Date.now(),
-  });
-  const response = await telegramBotApi(account, "sendMessage", {
-    chat_id: chatId,
-    text: "Select a session to send this message:",
-    reply_markup: {
-      inline_keyboard: [
-        ...choices.map((session, index) => ([{
-        text: telegramSessionLabel(session, index).slice(0, 64),
-        callback_data: `send:${index}`,
-        }])),
-        [{ text: "Cancel", callback_data: "cancel" }],
-      ],
-    },
-  });
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
-  }
-}
-
-async function sendTelegramAgents(account: NotificationAccountRecord, chatId: string) {
-  const choices = telegramAgentChoices();
-  if (!choices.length) {
-    await sendTelegramText(account, chatId, "No enabled agents are available.");
-    return;
-  }
-  const pageSize = 8;
-  const { page } = telegramPageSlice(choices, 0, pageSize);
-  telegramPendingBrowse.set(telegramPendingKey(account.id, chatId), {
-    kind: "agent",
-    ids: choices.map((agent) => agent.id),
-    page,
-    pageSize,
-    createdAt: Date.now(),
-  });
-  await sendTelegramAgentsPage(account, chatId, 0);
-}
-
-async function sendTelegramAgentsPage(account: NotificationAccountRecord, chatId: string, page: number, messageId?: number) {
-  const pendingKey = telegramPendingKey(account.id, chatId);
-  const pending = telegramPendingBrowse.get(pendingKey);
-  if (!pending || pending.kind !== "agent") return;
-  const choices = telegramAgentBrowseItems(pending.ids);
-  if (!choices.length) {
-    telegramPendingBrowse.delete(pendingKey);
-    await sendTelegramText(account, chatId, "No enabled agents are available.");
-    return;
-  }
-  const pageSize = pending.pageSize || 8;
-  const { total, totalPages, page: currentPage, pageItems, start, end } = telegramPageSlice(choices, page, pageSize);
-  telegramPendingBrowse.set(pendingKey, { ...pending, page: currentPage, pageSize, createdAt: Date.now() });
-  const payload = {
-    text: `Select an agent to create and bind a new session.\nShowing ${start + 1}-${end} of ${total} (${currentPage + 1}/${totalPages})`,
-    reply_markup: {
-      inline_keyboard: [
-        ...pageItems.map((agent, index) => ([{
-          text: telegramAgentLabel(agent, start + index).slice(0, 64),
-          callback_data: `agent:${start + index}`,
-        }])),
-        ...(totalPages > 1 ? [[
-          ...(currentPage > 0 ? [{ text: "Prev", callback_data: `agentpage:${currentPage - 1}` }] : []),
-          ...(currentPage < totalPages - 1 ? [{ text: "Next", callback_data: `agentpage:${currentPage + 1}` }] : []),
-        ]] : []),
-        [{ text: "Cancel", callback_data: "cancel" }],
-      ],
-    },
-  };
-  if (messageId !== undefined) {
-    await editTelegramText(account, chatId, messageId, payload.text, payload.reply_markup);
-    return;
-  }
-  const response = await telegramBotApi(account, "sendMessage", {
-    chat_id: chatId,
-    ...payload,
-  });
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
-  }
-}
-
-async function sendTelegramRooms(account: NotificationAccountRecord, chatId: string) {
-  const choices = telegramRoomChoices();
-  if (!choices.length) {
-    await sendTelegramText(account, chatId, "No rooms are available.");
-    return;
-  }
-  const pageSize = 8;
-  const { page } = telegramPageSlice(choices, 0, pageSize);
-  telegramPendingBrowse.set(telegramPendingKey(account.id, chatId), {
-    kind: "room",
-    ids: choices.map((room) => room.id),
-    page,
-    pageSize,
-    createdAt: Date.now(),
-  });
-  await sendTelegramRoomsPage(account, chatId, 0);
-}
-
-async function sendTelegramRoomsPage(account: NotificationAccountRecord, chatId: string, page: number, messageId?: number) {
-  const pendingKey = telegramPendingKey(account.id, chatId);
-  const pending = telegramPendingBrowse.get(pendingKey);
-  if (!pending || pending.kind !== "room") return;
-  const choices = telegramRoomBrowseItems(pending.ids);
-  if (!choices.length) {
-    telegramPendingBrowse.delete(pendingKey);
-    await sendTelegramText(account, chatId, "No rooms are available.");
-    return;
-  }
-  const pageSize = pending.pageSize || 8;
-  const { total, totalPages, page: currentPage, pageItems, start, end } = telegramPageSlice(choices, page, pageSize);
-  telegramPendingBrowse.set(pendingKey, { ...pending, page: currentPage, pageSize, createdAt: Date.now() });
-  const payload = {
-    text: `Select a room to bind this chat to its session.\nShowing ${start + 1}-${end} of ${total} (${currentPage + 1}/${totalPages})`,
-    reply_markup: {
-      inline_keyboard: [
-        ...pageItems.map((room, index) => ([{
-          text: telegramRoomLabel(room, start + index).slice(0, 64),
-          callback_data: `room:${start + index}`,
-        }])),
-        ...(totalPages > 1 ? [[
-          ...(currentPage > 0 ? [{ text: "Prev", callback_data: `roompage:${currentPage - 1}` }] : []),
-          ...(currentPage < totalPages - 1 ? [{ text: "Next", callback_data: `roompage:${currentPage + 1}` }] : []),
-        ]] : []),
-        [{ text: "Cancel", callback_data: "cancel" }],
-      ],
-    },
-  };
-  if (messageId !== undefined) {
-    await editTelegramText(account, chatId, messageId, payload.text, payload.reply_markup);
-    return;
-  }
-  const response = await telegramBotApi(account, "sendMessage", {
-    chat_id: chatId,
-    ...payload,
-  });
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
-  }
-}
-
-async function sendTelegramFileRootPicker(account: NotificationAccountRecord, chatId: string) {
-  const roots = telegramRootChoices(null);
-  if (!roots.length) {
-    await sendTelegramText(account, chatId, "No file roots are available.");
-    return;
-  }
-  telegramPendingFileRoots.set(telegramPendingKey(account.id, chatId), { roots, createdAt: Date.now() });
-  const response = await telegramBotApi(account, "sendMessage", {
-    chat_id: chatId,
-    text: "Select a file root:",
-    reply_markup: {
-      inline_keyboard: [
-        ...roots.map((root, index) => ([{ text: root.label.slice(0, 64), callback_data: `filectx:${index}` }])),
-        [{ text: "Cancel", callback_data: "cancel" }],
-      ],
-    },
-  });
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
-  }
-}
-
-async function sendTelegramFiles(account: NotificationAccountRecord, chatId: string, root: string, relPath = "") {
-  const safeRel = telegramSafeRelativePath(relPath);
-  const target = resolve(root, safeRel);
-  if (!pathWithinRoot(target, root) || !existsSync(target) || !statSync(target).isDirectory()) {
-    await sendTelegramText(account, chatId, "Directory is not available.");
-    return;
-  }
-  const entries = readdirSync(target, { withFileTypes: true })
-    .filter((entry) => !entry.name.startsWith("."))
-    .map((entry) => {
-      const fullPath = join(target, entry.name);
-      const stat = statSync(fullPath);
-      return { name: entry.name, directory: entry.isDirectory(), size: stat.size, updatedAt: stat.mtime.toISOString() };
-    })
-    .sort((a, b) => Number(b.directory) - Number(a.directory) || a.name.localeCompare(b.name))
-    .slice(0, 40);
-  const dirs = entries.filter((entry) => entry.directory).slice(0, 20);
-  telegramPendingFiles.set(telegramPendingKey(account.id, chatId), {
-    root,
-    relPath: safeRel,
-    dirNames: dirs.map((entry) => entry.name),
-    createdAt: Date.now(),
-  });
-  const text = [
-    `Files: /${safeRel}`,
-    "",
-    ...entries.map((entry) => `${entry.directory ? "[dir]" : "[file]"} ${entry.name}${entry.directory ? "" : ` · ${entry.size} bytes`}`),
-  ].join("\n").slice(0, 3900);
-  const keyboard = [
-    ...dirs.map((entry, index) => ([{ text: `[dir] ${entry.name}`.slice(0, 64), callback_data: `file:${index}` }])),
-    ...(safeRel ? [[{ text: "..", callback_data: "fileup" }]] : []),
-    [{ text: "Cancel", callback_data: "cancel" }],
-  ];
-  const response = await telegramBotApi(account, "sendMessage", {
-    chat_id: chatId,
-    text,
-    reply_markup: { inline_keyboard: keyboard },
-  });
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
-  }
-}
-
-async function sendTelegramTerminalRootPicker(account: NotificationAccountRecord, chatId: string, command: string) {
-  const roots = telegramRootChoices(null);
-  if (!roots.length) {
-    await sendTelegramText(account, chatId, "No terminal roots are available.");
-    return;
-  }
-  telegramPendingTerminal.set(telegramPendingKey(account.id, chatId), { command, roots, createdAt: Date.now() });
-  const response = await telegramBotApi(account, "sendMessage", {
-    chat_id: chatId,
-    text: `Select where to run:\n${command}`,
-    reply_markup: {
-      inline_keyboard: [
-        ...roots.map((root, index) => ([{ text: root.label.slice(0, 64), callback_data: `term:${index}` }])),
-        [{ text: "Cancel", callback_data: "cancel" }],
-      ],
-    },
-  });
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
-  }
-}
-
-async function runTelegramTerminal(account: NotificationAccountRecord, chatId: string, cwd: string, command: string) {
-  if (!command.trim()) {
-    await sendTelegramText(account, chatId, "Usage: /terminal <command>");
-    return;
-  }
-  if (telegramDangerousCommand(command)) {
-    await sendTelegramText(account, chatId, "Command blocked by safety guard.");
-    return;
-  }
-  if (!existsSync(cwd) || !statSync(cwd).isDirectory()) {
-    await sendTelegramText(account, chatId, "Terminal directory is not available.");
-    return;
-  }
-  await sendTelegramText(account, chatId, `Running in ${cwd}:\n${command}`);
-  const shell = resolveShellPath();
-  const output = await new Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }>((resolveRun) => {
-    const child = spawnProcess(shell, ["-lc", command], { cwd, env: managedChildEnv() });
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      resolveRun({ code: null, stdout, stderr, timedOut: true });
-    }, 20_000);
-    child.stdout?.on("data", (chunk) => { stdout += String(chunk).slice(0, 20_000); });
-    child.stderr?.on("data", (chunk) => { stderr += String(chunk).slice(0, 20_000); });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      resolveRun({ code, stdout, stderr, timedOut: false });
-    });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      resolveRun({ code: null, stdout, stderr: error.message, timedOut: false });
-    });
-  });
-  await sendTelegramText(account, chatId, [
-    output.timedOut ? "Timed out." : `Exit code: ${output.code ?? "unknown"}`,
-    `\nstdout:\n${output.stdout || "(empty)"}`,
-    output.stderr ? `\nstderr:\n${output.stderr}` : "",
-  ].join("\n").slice(0, 3900));
-}
-
-async function answerTelegramCallback(account: NotificationAccountRecord, callbackQueryId: string, text: string) {
-  await telegramBotApi(account, "answerCallbackQuery", {
-    callback_query_id: callbackQueryId,
-    text: text.slice(0, 180),
-  });
-}
-
-async function sendTelegramBindPicker(account: NotificationAccountRecord, chatId: string) {
-  const choices = telegramSessionChoices();
-  if (!choices.length) {
-    await sendTelegramText(account, chatId, "No sessions are available. Create a session first.");
-    return;
-  }
-  telegramPendingBinds.set(telegramPendingKey(account.id, chatId), {
-    sessionIds: choices.map((session) => session.id),
-    createdAt: Date.now(),
-  });
-  const response = await telegramBotApi(account, "sendMessage", {
-    chat_id: chatId,
-    text: "Select a session to bind this chat to:",
-    reply_markup: {
-      inline_keyboard: [
-        ...choices.map((session, index) => ([{
-          text: telegramSessionLabel(session, index).slice(0, 64),
-          callback_data: `bind:${index}`,
-        }])),
-        [{ text: "Cancel", callback_data: "cancel" }],
-      ],
-    },
-  });
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
-  }
-}
-
-async function sendTelegramInputPrompt(account: NotificationAccountRecord, chatId: string, kind: "send" | "terminal") {
-  telegramPendingInputs.set(telegramPendingKey(account.id, chatId), { kind, createdAt: Date.now() });
-  const text = kind === "send"
-    ? "Send the message content in your next reply."
-    : "Send the terminal command in your next reply.";
-  const response = await telegramBotApi(account, "sendMessage", {
-    chat_id: chatId,
-    text,
-    reply_markup: { inline_keyboard: [[{ text: "Cancel", callback_data: "cancel" }]] },
-  });
-  if (!response.ok) {
-    const body = await response.text().catch(() => "");
-    throw new Error(body.slice(0, 500) || `telegram_http_${response.status}`);
-  }
-}
-
-async function routeTelegramSendMessage(account: NotificationAccountRecord, chatId: string, message: string) {
-  const target = telegramRouteSession(account, chatId);
-  if (!target) {
-    await sendTelegramSessionPicker(account, chatId, message);
-    return;
-  }
-  startTelegramTyping(account, chatId);
-  const result = dispatchMessageToSession(target, `Telegram message from chat ${chatId}:\n\n${message}`);
-  if (result.mode === "queued" && result.queuedId) queueTelegramQueuedReplyTarget(result.queuedId, account.id, chatId);
-  else queueTelegramActiveReplyTarget(target.id, account.id, chatId);
-  await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
-}
-
-function telegramRecentSessionsText() {
-  return telegramGroupedSessionText(12);
-}
-
-function resolveTelegramTargetSession(raw: string) {
-  const value = raw.trim();
-  if (!value) return null;
-  const choices = telegramSessionChoices(12);
-  const numericIndex = Number(value);
-  if (Number.isInteger(numericIndex) && numericIndex >= 1 && choices[numericIndex - 1]) return choices[numericIndex - 1];
-  return appData.sessions.find((session) => session.id === value)
-    ?? choices
-      .find((session) => session.title.toLowerCase().includes(value.toLowerCase()))
-    ?? appData.sessions.find((session) => `${session.title} ${session.id}`.toLowerCase().includes(value.toLowerCase()))
-    ?? null;
-}
-
-async function handleTelegramUpdate(account: NotificationAccountRecord, update: TelegramUpdate) {
-  if (!telegramInboundAllowed(account, update)) return;
-  if (update.callback_query) {
-    const chatId = telegramUpdateChatId(update);
-    const data = update.callback_query.data ?? "";
-    if (!chatId) return;
-    if (data === "cancel") {
-      telegramPendingSends.delete(telegramPendingKey(account.id, chatId));
-      telegramPendingBinds.delete(telegramPendingKey(account.id, chatId));
-      telegramPendingBrowse.delete(telegramPendingKey(account.id, chatId));
-      telegramPendingSelections.delete(telegramSelectionKey(account.id, chatId, "agent"));
-      telegramPendingSelections.delete(telegramSelectionKey(account.id, chatId, "room"));
-      telegramPendingFileRoots.delete(telegramPendingKey(account.id, chatId));
-      telegramPendingFiles.delete(telegramPendingKey(account.id, chatId));
-      telegramPendingTerminal.delete(telegramPendingKey(account.id, chatId));
-      telegramPendingInputs.delete(telegramPendingKey(account.id, chatId));
-      await answerTelegramCallback(account, update.callback_query.id, "Canceled.");
-      await sendTelegramText(account, chatId, "Canceled.");
-      return;
-    }
-    if (data.startsWith("send:")) {
-      const pendingKey = telegramPendingKey(account.id, chatId);
-      const pending = telegramPendingSends.get(pendingKey);
-      if (!pending || Date.now() - pending.createdAt > 10 * 60 * 1000) {
-        telegramPendingSends.delete(pendingKey);
-        await answerTelegramCallback(account, update.callback_query.id, "This pending message expired.");
-        return;
-      }
-      const index = Number(data.slice("send:".length));
-      const sessionId = Number.isInteger(index) ? pending.sessionIds[index] : "";
-      const target = sessionId ? appData.sessions.find((session) => session.id === sessionId) ?? null : null;
-      if (!target) {
-        await answerTelegramCallback(account, update.callback_query.id, "Session is no longer available.");
-        return;
-      }
-      telegramPendingSends.delete(pendingKey);
-      await answerTelegramCallback(account, update.callback_query.id, "Working...");
-      startTelegramTyping(account, chatId);
-      const result = dispatchMessageToSession(target, `Telegram message from chat ${chatId}:\n\n${pending.message}`);
-      if (result.mode === "queued" && result.queuedId) queueTelegramQueuedReplyTarget(result.queuedId, account.id, chatId);
-      else queueTelegramActiveReplyTarget(target.id, account.id, chatId);
-      // await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
-      return;
-    }
-    if (data.startsWith("bind:")) {
-      const pendingKey = telegramPendingKey(account.id, chatId);
-      const pending = telegramPendingBinds.get(pendingKey);
-      if (!pending || Date.now() - pending.createdAt > 10 * 60 * 1000) {
-        telegramPendingBinds.delete(pendingKey);
-        await answerTelegramCallback(account, update.callback_query.id, "This bind list expired.");
-        return;
-      }
-      const index = Number(data.slice("bind:".length));
-      const sessionId = Number.isInteger(index) ? pending.sessionIds[index] : "";
-      const target = sessionId ? appData.sessions.find((session) => session.id === sessionId) ?? null : null;
-      if (!target) {
-        await answerTelegramCallback(account, update.callback_query.id, "Session is no longer available.");
-        return;
-      }
-      telegramPendingBinds.delete(pendingKey);
-      await answerTelegramCallback(account, update.callback_query.id, "Working...");
-      setTelegramRouteSession(account.id, chatId, target.id);
-      await sendTelegramText(account, chatId, `Bound to: ${target.title}\n${target.id}`);
-      return;
-    }
-    if (data.startsWith("agentpage:") || data.startsWith("roompage:")) {
-      const pendingKey = telegramPendingKey(account.id, chatId);
-      const pending = telegramPendingBrowse.get(pendingKey);
-      const kind = data.startsWith("agentpage:") ? "agent" : "room";
-      if (!pending || pending.kind !== kind || Date.now() - pending.createdAt > 10 * 60 * 1000) {
-        telegramPendingBrowse.delete(pendingKey);
-        await answerTelegramCallback(account, update.callback_query.id, "This list expired.");
-        return;
-      }
-      const nextPage = Number(data.split(":")[1]);
-      if (!Number.isInteger(nextPage) || nextPage < 0) {
-        await answerTelegramCallback(account, update.callback_query.id, "Invalid page.");
-        return;
-      }
-      await answerTelegramCallback(account, update.callback_query.id, "Working...");
-      const messageId = update.callback_query.message?.message_id;
-      if (kind === "agent") {
-        await sendTelegramAgentsPage(account, chatId, nextPage, messageId);
-      } else {
-        await sendTelegramRoomsPage(account, chatId, nextPage, messageId);
-      }
-      return;
-    }
-    if (data.startsWith("agent:")) {
-      const pendingKey = telegramPendingKey(account.id, chatId);
-      const pending = telegramPendingBrowse.get(pendingKey);
-      if (!pending || pending.kind !== "agent" || Date.now() - pending.createdAt > 10 * 60 * 1000) {
-        telegramPendingBrowse.delete(pendingKey);
-        await answerTelegramCallback(account, update.callback_query.id, "This agent list expired.");
-        return;
-      }
-      const index = Number(data.slice("agent:".length));
-      const agentId = Number.isInteger(index) ? pending.ids[index] : "";
-      const row = agentId ? db.prepare("select * from agents where id = ?").get(agentId) as Record<string, unknown> | undefined : undefined;
-      if (!row) {
-        await answerTelegramCallback(account, update.callback_query.id, "Agent is no longer available.");
-        return;
-      }
-      await answerTelegramCallback(account, update.callback_query.id, "Working...");
-      const session = createTelegramAgentSession(agentFromRow(row));
-      setTelegramRouteSession(account.id, chatId, session.id);
-      await sendTelegramText(account, chatId, `Created and bound session:\n${telegramSessionLabel(session)}\n${session.id}`);
-      return;
-    }
-    if (data.startsWith("room:")) {
-      const pendingKey = telegramPendingKey(account.id, chatId);
-      const pending = telegramPendingBrowse.get(pendingKey);
-      if (!pending || pending.kind !== "room" || Date.now() - pending.createdAt > 10 * 60 * 1000) {
-        telegramPendingBrowse.delete(pendingKey);
-        await answerTelegramCallback(account, update.callback_query.id, "This room list expired.");
-        return;
-      }
-      const index = Number(data.slice("room:".length));
-      const roomId = Number.isInteger(index) ? pending.ids[index] : "";
-      const row = roomId ? db.prepare("select * from rooms where id = ?").get(roomId) as Record<string, unknown> | undefined : undefined;
-      const room = row ? roomFromRow(row) : null;
-      if (!room?.sessionId) {
-        await answerTelegramCallback(account, update.callback_query.id, "Room session is no longer available.");
-        return;
-      }
-      await answerTelegramCallback(account, update.callback_query.id, "Working...");
-      setTelegramRouteSession(account.id, chatId, room.sessionId);
-      await sendTelegramText(account, chatId, `Bound room session:\n${telegramRoomLabel(room)}\n${room.sessionId}`);
-      return;
-    }
-    if (data.startsWith("filectx:")) {
-      const rootKey = telegramPendingKey(account.id, chatId);
-      const pending = telegramPendingFileRoots.get(rootKey);
-      if (!pending || Date.now() - pending.createdAt > 10 * 60 * 1000) {
-        telegramPendingFileRoots.delete(rootKey);
-        await answerTelegramCallback(account, update.callback_query.id, "This file list expired.");
-        return;
-      }
-      const index = Number(data.slice("filectx:".length));
-      const root = Number.isInteger(index) ? pending.roots[index]?.root : "";
-      if (!root) {
-        await answerTelegramCallback(account, update.callback_query.id, "File root is no longer available.");
-        return;
-      }
-      telegramPendingFileRoots.delete(rootKey);
-      await answerTelegramCallback(account, update.callback_query.id, "Working...");
-      await sendTelegramFiles(account, chatId, root);
-      return;
-    }
-    if (data.startsWith("file:") || data === "fileup") {
-      const pendingKey = telegramPendingKey(account.id, chatId);
-      const pending = telegramPendingFiles.get(pendingKey);
-      if (!pending || Date.now() - pending.createdAt > 10 * 60 * 1000) {
-        telegramPendingFiles.delete(pendingKey);
-        await answerTelegramCallback(account, update.callback_query.id, "This file list expired.");
-        return;
-      }
-      const nextRel = data === "fileup"
-        ? dirname(pending.relPath) === "." ? "" : dirname(pending.relPath)
-        : join(pending.relPath, pending.dirNames[Number(data.slice("file:".length))] ?? "");
-      await answerTelegramCallback(account, update.callback_query.id, "Working...");
-      await sendTelegramFiles(account, chatId, pending.root, nextRel);
-      return;
-    }
-    if (data.startsWith("term:")) {
-      const terminalKey = telegramPendingKey(account.id, chatId);
-      const pending = telegramPendingTerminal.get(terminalKey);
-      if (!pending || Date.now() - pending.createdAt > 10 * 60 * 1000) {
-        telegramPendingTerminal.delete(terminalKey);
-        await answerTelegramCallback(account, update.callback_query.id, "This terminal command expired.");
-        return;
-      }
-      const index = Number(data.slice("term:".length));
-      const root = Number.isInteger(index) ? pending.roots[index]?.root : "";
-      if (!root) {
-        await answerTelegramCallback(account, update.callback_query.id, "Terminal root is no longer available.");
-        return;
-      }
-      telegramPendingTerminal.delete(terminalKey);
-      await answerTelegramCallback(account, update.callback_query.id, "Working...");
-      await runTelegramTerminal(account, chatId, root, pending.command);
-      return;
-    }
-  }
-  const text = update.message?.text?.trim() ?? "";
-  const chatId = String(update.message?.chat?.id ?? "");
-  if (!text || !chatId) return;
-  const pendingInputKey = telegramPendingKey(account.id, chatId);
-  const pendingInput = telegramPendingInputs.get(pendingInputKey);
-  if (pendingInput) {
-    if (text === "/cancel" || Date.now() - pendingInput.createdAt > 10 * 60 * 1000) {
-      telegramPendingInputs.delete(pendingInputKey);
-      await sendTelegramText(account, chatId, text === "/cancel" ? "Canceled." : "Pending input expired.");
-      return;
-    }
-    telegramPendingInputs.delete(pendingInputKey);
-    if (pendingInput.kind === "send") {
-      await routeTelegramSendMessage(account, chatId, text);
-    } else {
-      const target = telegramRouteSession(account, chatId);
-      if (target?.workspacePath) {
-        await runTelegramTerminal(account, chatId, target.workspacePath, text);
-      } else {
-        await sendTelegramTerminalRootPicker(account, chatId, text);
-      }
-    }
-    return;
-  }
-  const [rawCommand, ...restParts] = text.split(/\s+/);
-  const command = rawCommand.replace(/@[^@\s]+$/, "");
-  const rest = restParts.join(" ").trim();
-  if (command === "/start" || command === "/help") {
-    await sendTelegramText(account, chatId, [
-      "Codex Web Telegram Bot",
-      "",
-      "/sessions - list recent sessions",
-      "/agents - list agents and create a bound agent session",
-      "/rooms - list rooms and bind a room session",
-      "/files - browse bound or system files",
-      "/terminal <command> - run in bound or selected workspace",
-      "/bind - pick a session to bind this chat to, or /bind <index, title, or sessionId>",
-      "/unbind - clear the bound session",
-      "/send <index, title, or sessionId> | <message> - send to a session",
-      "/send <message> - choose a session when no session is bound",
-      "",
-      "Reply behavior:",
-      "- Bound/default session: plain text goes into that session and assistant replies are sent back here.",
-      "- /send: sends one message to the chosen session and the assistant reply for that round is sent back here.",
-      "Plain text is sent to the bound/default session, or asks you to choose one.",
-    ].join("\n"));
-    return;
-  }
-  if (command === "/sessions") {
-    await sendTelegramText(account, chatId, telegramRecentSessionsText());
-    return;
-  }
-  if (command === "/agents") {
-    await sendTelegramAgents(account, chatId);
-    return;
-  }
-  if (command === "/rooms") {
-    await sendTelegramRooms(account, chatId);
-    return;
-  }
-  if (command === "/files") {
-    const target = telegramRouteSession(account, chatId);
-    if (target?.workspacePath) {
-      await sendTelegramFiles(account, chatId, target.workspacePath, rest);
-    } else {
-      await sendTelegramFileRootPicker(account, chatId);
-    }
-    return;
-  }
-  if (command === "/terminal") {
-    if (!rest) {
-      await sendTelegramInputPrompt(account, chatId, "terminal");
-      return;
-    }
-    const target = telegramRouteSession(account, chatId);
-    if (target?.workspacePath) {
-      await runTelegramTerminal(account, chatId, target.workspacePath, rest);
-    } else {
-      await sendTelegramTerminalRootPicker(account, chatId, rest);
-    }
-    return;
-  }
-  if (command === "/bind") {
-    if (!rest) {
-      await sendTelegramBindPicker(account, chatId);
-      return;
-    }
-    const target = resolveTelegramTargetSession(rest);
-    if (!target) {
-      await sendTelegramText(account, chatId, "Session not found. Use /sessions to view recent sessions.");
-      return;
-    }
-    setTelegramRouteSession(account.id, chatId, target.id);
-    await sendTelegramText(account, chatId, `Bound to: ${target.title}\n${target.id}`);
-    return;
-  }
-  if (command === "/unbind") {
-    clearTelegramRouteSession(account.id, chatId);
-    await sendTelegramText(account, chatId, "Bound session cleared.");
-    return;
-  }
-  if (command === "/send") {
-    if (!rest) {
-      await sendTelegramInputPrompt(account, chatId, "send");
-      return;
-    }
-    const separator = rest.indexOf("|");
-    const targetText = separator >= 0 ? rest.slice(0, separator).trim() : "";
-    const message = separator >= 0 ? rest.slice(separator + 1).trim() : rest;
-    if (!message) {
-      await sendTelegramText(account, chatId, "Message is empty. Use /send <sessionId or title> | <message>.");
-      return;
-    }
-    const target = targetText ? resolveTelegramTargetSession(targetText) : telegramRouteSession(account, chatId);
-    if (!target) {
-      if (targetText) {
-        await sendTelegramText(account, chatId, "Session not found. Use /sessions to view recent sessions.");
-      } else {
-        await sendTelegramSessionPicker(account, chatId, message);
-      }
-      return;
-    }
-    startTelegramTyping(account, chatId);
-    const result = dispatchMessageToSession(target, `Telegram message from chat ${chatId}:\n\n${message}`);
-    if (result.mode === "queued" && result.queuedId) queueTelegramQueuedReplyTarget(result.queuedId, account.id, chatId);
-    else queueTelegramActiveReplyTarget(target.id, account.id, chatId);
-    // await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
-    return;
-  }
-  const target = telegramRouteSession(account, chatId);
-  if (!target) {
-    await sendTelegramSessionPicker(account, chatId, text);
-    return;
-  }
-  startTelegramTyping(account, chatId);
-  const result = dispatchMessageToSession(target, `Telegram message from chat ${chatId}:\n\n${text}`);
-  if (result.mode === "queued" && result.queuedId) queueTelegramQueuedReplyTarget(result.queuedId, account.id, chatId);
-  else queueTelegramActiveReplyTarget(target.id, account.id, chatId);
-  // await sendTelegramText(account, chatId, `Sent to ${target.title}: ${result.mode}`);
-}
-
-async function pollTelegramAccount(account: NotificationAccountRecord) {
-  if (telegramPollingBusy.has(account.id)) return;
-  telegramPollingBusy.add(account.id);
-  try {
-    const offset = telegramPollingOffsets.get(account.id) ?? 0;
-    const response = await telegramBotApi(account, "getUpdates", {
-      offset: offset ? offset + 1 : undefined,
-      timeout: 0,
-      limit: 20,
-      allowed_updates: ["message", "callback_query"],
-    });
-    const body = await response.json().catch(() => null) as { ok?: boolean; result?: TelegramUpdate[] } | null;
-    if (!response.ok || !body?.ok || !Array.isArray(body.result)) return;
-    for (const update of body.result) {
-      telegramPollingOffsets.set(account.id, Math.max(telegramPollingOffsets.get(account.id) ?? 0, update.update_id));
-      await handleTelegramUpdate(account, update).catch((error) => {
-        console.error("telegram inbound update failed", account.id, error);
-      });
-    }
-  } catch (error) {
-    console.warn("telegram inbound poll failed", account.id, error instanceof Error ? error.message : error);
-  } finally {
-    telegramPollingBusy.delete(account.id);
-  }
-}
-
-function pollTelegramInboundBots() {
-  try {
-    const accounts = listNotificationAccounts(true)
-      .filter((account) => account.enabled && account.channelKind === "telegram" && (account.config as Record<string, unknown>).inboundEnabled === true);
-    for (const account of accounts) void pollTelegramAccount(account);
-  } catch (error) {
-    console.warn("telegram inbound poll scheduler failed", error instanceof Error ? error.message : error);
-  }
-}
-
 function ingestCrossSessionSkillBlocks(session: SessionSummary, message: SessionMessage, text: string) {
   for (const request of parseCrossSessionSkillBlocks(text)) {
     const action = String(request.action ?? request.type ?? "").trim() || "readSession";
@@ -12894,6 +12174,7 @@ function finalizeCodexRunnerTask(session: SessionSummary, exitCode: number | nul
   flushCodexTaskLog(session);
   backfillSessionFromTaskLog(session);
   clearTelegramActiveReplyTargets(session.id);
+  weixinPlatform.clearActiveReplyTargets(session.id);
   codexTaskProcesses.delete(session.id);
   codexTaskStdoutBuffers.delete(session.id);
   stopCodexTaskTailer(session.id);
@@ -13086,6 +12367,7 @@ function runQueuedMessageIfIdle(session: SessionSummary) {
   const item = popNextQueuedMessage(session.id);
   if (!item) return false;
   activateTelegramReplyTargetFromQueue(session.id, item.id);
+  weixinPlatform.activateReplyTargetFromQueue(session.id, item.id);
   restoreCodexSessionIdFromLog(session);
   const providerId = item.providerId ?? session.providerId ?? null;
   const provider = providerId ? appData.providers.find((providerItem) => providerItem.id === providerId) : appData.providers[0];
@@ -14066,11 +13348,13 @@ app.get("/api/app-notifications/events", (c) => {
 });
 
 app.use("/api/*", async (c, next) => {
+  const pathname = new URL(c.req.url).pathname;
+  if (pathname.startsWith("/api/webhook/")) return next();
   const principal = resolveAuthPrincipalFromBearer(getBearerToken(c.req.header("authorization")));
   if (!principal) return c.json({ error: "unauthorized" }, 401);
   (c as unknown as { set: (name: string, value: AuthPrincipal) => void }).set("authPrincipal", principal);
   if (principal.type === "api_key") {
-    const permission = routePermissionForRequest(c.req.method, new URL(c.req.url).pathname);
+    const permission = routePermissionForRequest(c.req.method, pathname);
     if (!permission || !hasApiKeyPermission(principal, permission)) return c.json({ error: "forbidden" }, 403);
   }
   return next();
@@ -14727,6 +14011,241 @@ app.get("/api/notifications", (c) => c.json({
   recentDeliveries: listNotificationDeliveries(20).items,
 }));
 
+app.get("/api/notifications/platforms", (c) => c.json(platformOverview({
+  db,
+  sessions: appData.sessions,
+  listNotificationAccounts,
+  webhookRoutes: listWebhookRoutes(),
+})));
+
+app.get("/api/webhook-routes", (c) => c.json(listWebhookRoutes()));
+
+app.post("/api/webhook-routes", async (c) => {
+  const body = await c.req.json<{ name?: unknown; enabled?: unknown; secret?: unknown; commandTemplate?: unknown; promptTemplate?: unknown; routeKey?: unknown }>().catch(() => null);
+  const name = String(body?.name ?? "").trim();
+  if (!name) return c.json({ error: "invalid_webhook_route" }, 400);
+  const now = new Date().toISOString();
+  const id = `webhook-route-${randomUUID()}`;
+  const routeKeyBase = slugifyWebhookRouteName(String(body?.routeKey ?? name));
+  const routeKey = `${routeKeyBase}-${randomUUID().slice(0, 8)}`;
+  const secret = normalizeWebhookRouteSecret(String(body?.secret ?? ""));
+  if (!webhookSecretIsSafe(secret)) return c.json({ error: "webhook_insecure_secret_requires_loopback" }, 400);
+  const commandTemplate = String(body?.commandTemplate ?? body?.promptTemplate ?? "").trim() || "Webhook event from {{routeName}} ({{eventType}})\n\n{{body}}";
+  upsertWebhookRoute({
+    id,
+    routeKey,
+    name,
+    enabled: body?.enabled === false ? false : true,
+    secret,
+    sessionId: null,
+    promptTemplate: commandTemplate,
+    createdAt: now,
+    updatedAt: now,
+  });
+  return c.json(webhookRouteFromRow(db.prepare("select * from webhook_routes where id = ?").get(id) as Record<string, unknown>), 201);
+});
+
+app.patch("/api/webhook-routes/:id", async (c) => {
+  const current = db.prepare("select * from webhook_routes where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
+  if (!current) return c.json({ error: "webhook_route_not_found" }, 404);
+  const body = await c.req.json<{ name?: unknown; enabled?: unknown; secret?: unknown; commandTemplate?: unknown; promptTemplate?: unknown }>().catch(() => null);
+  if (!body) return c.json({ error: "invalid_webhook_route" }, 400);
+  const now = new Date().toISOString();
+  const secret = String(body.secret ?? "").trim() ? normalizeWebhookRouteSecret(String(body.secret ?? "")) : String(current.secret ?? "");
+  if (!webhookSecretIsSafe(secret)) return c.json({ error: "webhook_insecure_secret_requires_loopback" }, 400);
+  upsertWebhookRoute({
+    id: String(current.id),
+    routeKey: String(current.route_key),
+    name: String(body.name ?? current.name).trim() || String(current.name),
+    enabled: body.enabled === undefined ? Boolean(current.enabled) : body.enabled !== false,
+    secret,
+    sessionId: current.session_id ? String(current.session_id) : null,
+    promptTemplate: String(body.commandTemplate ?? body.promptTemplate ?? current.prompt_template ?? "").trim() || "Webhook event from {{routeName}} ({{eventType}})\n\n{{body}}",
+    createdAt: String(current.created_at),
+    updatedAt: now,
+  });
+  return c.json(webhookRouteFromRow(db.prepare("select * from webhook_routes where id = ?").get(c.req.param("id")) as Record<string, unknown>));
+});
+
+app.delete("/api/webhook-routes/:id", (c) => {
+  const result = db.prepare("delete from webhook_routes where id = ?").run(c.req.param("id"));
+  if (!result.changes) return c.json({ error: "webhook_route_not_found" }, 404);
+  return c.json({ ok: true });
+});
+
+async function handleWebhookCommandRoute(c: any) {
+  const route = db.prepare("select * from webhook_routes where route_key = ?").get(c.req.param("routeKey")) as Record<string, unknown> | undefined;
+  if (!route) return c.json({ error: "webhook_route_not_found" }, 404);
+  if (!Boolean(route.enabled)) return c.json({ error: "webhook_route_disabled" }, 403);
+
+  let rawBody = Buffer.from("");
+  try {
+    const body = await c.req.raw.clone().arrayBuffer();
+    rawBody = Buffer.from(body);
+  } catch {
+    return c.json({ error: "webhook_bad_request" }, 400);
+  }
+  if (rawBody.byteLength > 1_048_576) return c.json({ error: "webhook_payload_too_large" }, 413);
+
+  const secret = String(route.secret ?? "");
+  if (!validateWebhookToken(secret, c.req.raw)) {
+    return c.json({ error: "invalid_signature" }, 401);
+  }
+
+  const payload = parseWebhookPayload(c.req.raw, rawBody);
+  const command = String(c.req.query("command") ?? payload.command ?? payload.action ?? "").trim().toLowerCase();
+  const payloadSessionId = String(payload.sessionId ?? payload.session_id ?? payload.targetSessionId ?? "").trim();
+  const payloadSessionTarget = String(payload.target ?? payload.session ?? payload.bind ?? "").trim();
+  const payloadMessage = String(payload.message ?? payload.content ?? payload.text ?? "").trim();
+  const sessionId = String(c.req.query("sessionId") ?? payloadSessionId ?? payloadSessionTarget).trim();
+  const message = String(c.req.query("message") ?? payloadMessage).trim();
+  const routeSummary = webhookRouteFromRow(db.prepare("select * from webhook_routes where id = ?").get(String(route.id)) as Record<string, unknown>);
+  const routeSessionId = String(route.session_id ?? "").trim();
+  const boundSession = routeSessionId ? appData.sessions.find((item) => item.id === routeSessionId) ?? null : null;
+
+  if (!command || command === "help") {
+    return c.json({
+      ok: true,
+      command: "help",
+      route: routeSummary,
+      commands: [
+        {
+          command: "help",
+          usage: `GET /api/webhook/${routeSummary.routeKey}?command=help`,
+          description: "Show command list and usage.",
+        },
+        {
+          command: "sessions",
+          usage: `GET /api/webhook/${routeSummary.routeKey}?command=sessions`,
+          description: "List recent sessions.",
+        },
+        {
+          command: "agents",
+          usage: `GET /api/webhook/${routeSummary.routeKey}?command=agents`,
+          description: "List recent agents.",
+        },
+        {
+          command: "rooms",
+          usage: `GET /api/webhook/${routeSummary.routeKey}?command=rooms`,
+          description: "List recent rooms.",
+        },
+        {
+          command: "bind",
+          usage: `POST /api/webhook/${routeSummary.routeKey}?command=bind&sessionId=<sessionId>`,
+          description: "Bind this route to an existing session.",
+        },
+        {
+          command: "unbind",
+          usage: `POST /api/webhook/${routeSummary.routeKey}?command=unbind`,
+          description: "Clear the bound session.",
+        },
+        {
+          command: "send",
+          usage: `POST /api/webhook/${routeSummary.routeKey}?command=send&sessionId=<sessionId>&message=<message>`,
+          description: "Send a message to an existing session.",
+        },
+      ],
+    });
+  }
+
+  if (command === "sessions") {
+    return c.json({
+      ok: true,
+      command: "sessions",
+      route: routeSummary,
+      sessions: listWebhookSessionSummaries(parsePageLimit(c.req.query("limit"), 20)),
+    });
+  }
+
+  if (command === "agents") {
+    return c.json({
+      ok: true,
+      command: "agents",
+      route: routeSummary,
+      agents: listWebhookAgentSummaries(parsePageLimit(c.req.query("limit"), 20)),
+    });
+  }
+
+  if (command === "rooms") {
+    return c.json({
+      ok: true,
+      command: "rooms",
+      route: routeSummary,
+      rooms: listWebhookRoomSummaries(parsePageLimit(c.req.query("limit"), 20)),
+    });
+  }
+
+  if (command === "bind") {
+    if (!sessionId) {
+      return c.json({
+        ok: false,
+        command: "bind",
+        error: "webhook_session_id_required",
+        route: routeSummary,
+        boundSession,
+        sessions: listWebhookSessionSummaries(parsePageLimit(c.req.query("limit"), 20)),
+      }, 400);
+    }
+    const targetSession = appData.sessions.find((item) => item.id === sessionId) ?? null;
+    if (!targetSession) return c.json({ error: "session_not_found" }, 404);
+    db.prepare("update webhook_routes set session_id = ?, updated_at = ? where id = ?").run(targetSession.id, new Date().toISOString(), String(route.id));
+    return c.json({
+      ok: true,
+      command: "bind",
+      route: webhookRouteFromRow(db.prepare("select * from webhook_routes where id = ?").get(String(route.id)) as Record<string, unknown>),
+      boundSession: {
+        id: targetSession.id,
+        title: targetSession.title,
+        status: targetSession.status,
+        conversationType: targetSession.conversationType,
+        roomId: targetSession.roomId ?? null,
+        projectId: targetSession.projectId ?? null,
+        updatedAt: targetSession.updatedAt,
+      },
+    });
+  }
+
+  if (command === "unbind") {
+    db.prepare("update webhook_routes set session_id = null, updated_at = ? where id = ?").run(new Date().toISOString(), String(route.id));
+    return c.json({
+      ok: true,
+      command: "unbind",
+      route: webhookRouteFromRow(db.prepare("select * from webhook_routes where id = ?").get(String(route.id)) as Record<string, unknown>),
+    });
+  }
+
+  if (command === "send") {
+    const targetSessionId = sessionId || routeSessionId;
+    if (!targetSessionId) {
+      return c.json({
+        error: "webhook_session_id_required",
+        route: routeSummary,
+        boundSession,
+        sessions: listWebhookSessionSummaries(parsePageLimit(c.req.query("limit"), 20)),
+      }, 400);
+    }
+    if (!message) return c.json({ error: "webhook_message_required" }, 400);
+    const targetSession = appData.sessions.find((item) => item.id === targetSessionId) ?? null;
+    if (!targetSession) return c.json({ error: "session_not_found" }, 404);
+    const result = dispatchMessageToSession(targetSession, message);
+    return c.json({
+      ok: true,
+      command: "send",
+      route: routeSummary,
+      sessionId: targetSession.id,
+      dispatch: result,
+    }, 202);
+  }
+
+  return c.json({
+    error: "unsupported_webhook_command",
+    allowedCommands: ["help", "sessions", "agents", "rooms", "bind", "unbind", "send"],
+  }, 400);
+}
+
+app.all("/api/webhook/:routeKey", handleWebhookCommandRoute);
+app.all("/webhooks/:routeKey", handleWebhookCommandRoute);
+
 app.get("/api/app-notifications", (c) => c.json(listAppNotifications(parsePageLimit(c.req.query("limit"), 30))));
 
 app.patch("/api/app-notifications/read", async (c) => {
@@ -14863,6 +14382,56 @@ app.patch("/api/notifications/accounts/:id", async (c) => {
   return c.json(notificationAccountFromRow(db.prepare("select * from notification_accounts where id = ?").get(c.req.param("id")) as Record<string, unknown>));
 });
 
+app.post("/api/notifications/accounts/:id/weixin/qr/start", async (c) => {
+  const row = db.prepare("select * from notification_accounts where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
+  if (!row || String(row.channel_kind) !== "weixin") return c.json({ error: "notification_account_not_found" }, 404);
+  const body = (await c.req.json().catch(() => ({}))) as { botType?: string };
+  try {
+    return c.json(await weixinPlatform.startQrLogin(String(row.id), String(body.botType ?? "3")));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+  }
+});
+
+app.post("/api/notifications/weixin/qr/start", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as { botType?: string };
+  try {
+    return c.json(await weixinPlatform.startDraftQrLogin(String(body.botType ?? "3")));
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+  }
+});
+
+app.get("/api/notifications/accounts/:id/weixin/qr/status", async (c) => {
+  const row = db.prepare("select * from notification_accounts where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
+  if (!row || String(row.channel_kind) !== "weixin") return c.json({ error: "notification_account_not_found" }, 404);
+  try {
+    const state = weixinPlatform.getQrLoginState(String(row.id));
+    if (!state) return c.json({ error: "weixin_qr_session_not_found" }, 404);
+    if (state.status === "wait" || state.status === "scaned" || state.status === "scaned_but_redirect") {
+      return c.json(await weixinPlatform.refreshQrLogin(String(row.id)));
+    }
+    return c.json(state);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+  }
+});
+
+app.get("/api/notifications/weixin/qr/status", async (c) => {
+  const qrKey = String(c.req.query("qrKey") ?? "").trim();
+  if (!qrKey) return c.json({ error: "weixin_qr_session_not_found" }, 404);
+  try {
+    const state = weixinPlatform.getQrLoginState(qrKey);
+    if (!state) return c.json({ error: "weixin_qr_session_not_found" }, 404);
+    if (state.status === "wait" || state.status === "scaned" || state.status === "scaned_but_redirect") {
+      return c.json(await weixinPlatform.refreshQrLogin(qrKey));
+    }
+    return c.json(state);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
+  }
+});
+
 app.delete("/api/notifications/accounts/:id", (c) => {
   const result = db.prepare("delete from notification_accounts where id = ?").run(c.req.param("id"));
   if (!result.changes) return c.json({ error: "notification_account_not_found" }, 404);
@@ -14875,6 +14444,7 @@ app.post("/api/notifications/accounts/:id/test", async (c) => {
   const body = await c.req.json<TestNotificationAccountRequest>().catch((): TestNotificationAccountRequest => ({}));
   const account = notificationAccountFromRow(row, true);
   const config = account.config as Record<string, unknown>;
+  const language = notificationLanguageFromConfig(config);
   const emailTo = body?.emailTo?.length
     ? body.emailTo
     : Array.isArray(config.testEmailTo)
@@ -14884,8 +14454,16 @@ app.post("/api/notifications/accounts/:id/test", async (c) => {
   const ok = await deliverNotification(account, {
     eventType: "task_completed",
     severity: "info",
-    title: "Codex Web test notification",
-    message: "This is a test notification from Codex Web.",
+    title: notificationLocaleText(language, "Codex Web 测试通知", "Codex Web test notification"),
+    message: [
+      notificationLocaleText(language, "这是一条来自 Codex Web 的测试通知。", "This is a test notification from Codex Web."),
+      "",
+      account.channelKind === "telegram"
+        ? telegramPlatform.telegramHelpText(account)
+        : account.channelKind === "weixin"
+          ? weixinPlatform.weixinHelpText(account)
+          : "",
+    ].join("\n"),
     sourceType: "notification-account",
     sourceId: account.id,
   }, null, { accountId: account.id, emailTo, chatId });
@@ -14898,7 +14476,7 @@ app.get("/api/notifications/recipients", (c) => c.json(listNotificationRecipient
 
 app.post("/api/notifications/recipients", async (c) => {
   const body = await c.req.json<UpsertNotificationRecipientRequest>().catch(() => null);
-  const kind = body?.kind && ["email", "webhook", "bark", "telegram"].includes(body.kind) ? body.kind : null;
+  const kind = body?.kind && ["email", "webhook", "bark", "telegram", "weixin"].includes(body.kind) ? body.kind : null;
   if (!body?.name?.trim() || !kind) return c.json({ error: "invalid_notification_recipient" }, 400);
   const now = new Date().toISOString();
   const id = `notification-recipient-${randomUUID()}`;
@@ -14942,7 +14520,15 @@ app.post("/api/notifications/recipients/:id/test", async (c) => {
       eventType: "task_completed",
       severity: "info",
       title: "Codex Web test notification",
-      message: "This is a test notification from Codex Web.",
+      message: [
+        "This is a test notification from Codex Web.",
+        "",
+        recipient.kind === "telegram"
+          ? telegramPlatform.telegramHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
+          : recipient.kind === "weixin"
+            ? weixinPlatform.weixinHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
+            : "",
+      ].join("\n"),
       sourceType: "notification-recipient",
       sourceId: recipient.id,
     }, null, { recipientId: recipient.id });
@@ -18345,15 +17931,15 @@ const automationTimer = setInterval(checkScheduledWork, 60_000);
 automationTimer.unref();
 const startupAutomationTimer = setTimeout(runStartupAutomations, 2_000);
 startupAutomationTimer.unref();
-const telegramInboundTimer = setInterval(pollTelegramInboundBots, 10_000);
-telegramInboundTimer.unref();
 let shuttingDown = false;
 function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
   clearInterval(automationTimer);
   clearTimeout(startupAutomationTimer);
-  clearInterval(telegramInboundTimer);
+  shutdownEmailPlatform();
+  shutdownTelegramPlatform();
+  weixinPlatform.shutdown();
   console.log(`Codex Web API shutting down after ${signal}`);
   for (const child of codexTaskProcesses.values()) child.kill("SIGTERM");
   for (const previewId of Array.from(new Set([...previewProcesses.keys(), ...previewProcessGroups.keys()]))) stopPreviewProcess(previewId);

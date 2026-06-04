@@ -3946,6 +3946,49 @@ button:disabled {
   padding-top: 12px;
 }
 
+.notification-card .settings-collapsible {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 10px 12px;
+}
+
+.notification-card .settings-collapsible summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  font-weight: 600;
+  list-style: none;
+  gap: 12px;
+}
+
+.notification-card .settings-collapsible summary::-webkit-details-marker {
+  display: none;
+}
+
+.notification-card .settings-collapsible-chevron {
+  flex: 0 0 auto;
+  transition: transform 0.2s ease;
+}
+
+.notification-card .settings-collapsible[open] .settings-collapsible-chevron {
+  transform: rotate(180deg);
+}
+
+.notification-card .settings-collapsible-body {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.detail-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
 .provider-card > .ghost-button,
 .provider-card > .dark-button {
   justify-self: start;

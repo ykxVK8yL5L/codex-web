@@ -678,12 +678,23 @@ export interface TaskHealthRepairResponse {
   health: TaskHealthResponse;
 }
 
-export type NotificationChannelKind = "webhook" | "bark" | "email" | "telegram";
-export type NotificationChannelAdapter = "webhook" | "authenticated_webhook" | "email" | "telegram";
+export type NotificationChannelKind = "webhook" | "bark" | "email" | "telegram" | "weixin";
+export type NotificationChannelAdapter = "webhook" | "authenticated_webhook" | "email" | "telegram" | "weixin";
 export type NotificationChannelAuthType = "none" | "bearer" | "query_token" | "token_request";
 export type NotificationSeverity = "info" | "success" | "warning" | "error";
 export type NotificationEventType = "task_completed" | "task_failed" | "task_interrupted" | "needs_approval" | "task_health_issue" | "provider_check_failed" | "backup_failed" | "restore_failed" | "auth_login";
 export type NotificationDeliveryStatus = "pending" | "sent" | "failed" | "skipped";
+export type PlatformKind = "telegram" | "email" | "webhook" | "bark" | "weixin" | "wecom" | "feishu" | "qq";
+export type PlatformCapability =
+  | "inbound_messages"
+  | "outbound_messages"
+  | "session_binding"
+  | "session_selection"
+  | "reply_routing"
+  | "working_status"
+  | "command_menu"
+  | "file_browse"
+  | "terminal";
 
 export interface NotificationChannelDefinition {
   id: string;
@@ -724,7 +735,7 @@ export interface NotificationRuleTarget {
   emailTo?: string[];
 }
 
-export type NotificationRecipientKind = "email" | "webhook" | "bark" | "telegram";
+export type NotificationRecipientKind = "email" | "webhook" | "bark" | "telegram" | "weixin";
 
 export interface NotificationPermissionPolicy {
   allowedAgentIds?: string[];
@@ -794,6 +805,55 @@ export interface NotificationSettingsResponse {
   rules: NotificationRuleSummary[];
   ephemeralRules: NotificationEphemeralRuleSummary[];
   recentDeliveries: NotificationDeliverySummary[];
+}
+
+export interface PlatformRouteSummary {
+  id: string;
+  kind: PlatformKind;
+  accountId: string;
+  chatId: string;
+  sessionId: string;
+  sessionTitle: string;
+  sessionConversationType?: ConversationType | null;
+  updatedAt: string;
+}
+
+export interface WebhookRouteSummary {
+  id: string;
+  routeKey: string;
+  name: string;
+  enabled: boolean;
+  secret: string;
+  curlExample: string;
+  sessionId?: string | null;
+  sessionTitle?: string | null;
+  commandTemplate: string;
+  promptTemplate: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PlatformSummary {
+  id: string;
+  kind: PlatformKind;
+  label: string;
+  description: string;
+  enabled: boolean;
+  builtin: boolean;
+  channelId?: string | null;
+  accountCount: number;
+  connectedRouteCount: number;
+  baselineCapabilities: PlatformCapability[];
+  supportedCapabilities: PlatformCapability[];
+  notes?: string | null;
+}
+
+export interface PlatformSettingsResponse {
+  baselineCapabilities: PlatformCapability[];
+  capabilityLabels: Record<PlatformCapability, string>;
+  platforms: PlatformSummary[];
+  routes: PlatformRouteSummary[];
+  webhookRoutes: WebhookRouteSummary[];
 }
 
 export interface AppNotificationSummary {
