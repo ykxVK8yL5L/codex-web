@@ -167,7 +167,7 @@ export function WeixinNotificationAccountPanel({
 
   return (
     <>
-      <label className="dialog-checkbox">
+      <label className="checkbox-row">
         <input name="notification-weixin-inbound-enabled" type="checkbox" checked={form.weixinInboundEnabled} onChange={(event) => setForm((current: any) => ({ ...current, weixinInboundEnabled: event.target.checked }))} />
         <span>{t("settings.notificationWeixinInboundEnabled")}</span>
       </label>

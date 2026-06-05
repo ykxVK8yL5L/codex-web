@@ -1,4 +1,4 @@
-import type { ArchiveIgnoreTemplate } from "@codex-web/protocol";
+import type { ArchiveIgnoreTemplate, ProjectSummary } from "@codex-web/protocol";
 
 export function formatShortDate(value?: string) {
   if (!value) return "unknown";
@@ -54,4 +54,22 @@ export function rulesForArchiveTemplates(templates: ArchiveIgnoreTemplate[], tem
     }
   }
   return rules.join("\n");
+}
+
+export function newestTaskRunsFirst(log: string) {
+  const chunks = log.split(/(?=^\[codex-web\])/m);
+  if (chunks.length <= 1) return log;
+  const prefix = chunks[0]?.startsWith("[codex-web]") ? "" : chunks.shift() ?? "";
+  return [prefix, ...chunks.reverse()].filter(Boolean).join("").trimStart();
+}
+
+function projectFolderName(project: ProjectSummary) {
+  const normalized = project.workspacePath.replaceAll("\\", "/").replace(/\/+$/g, "");
+  return normalized.split("/").filter(Boolean).at(-1) || project.id;
+}
+
+export function projectDisplayName(project: ProjectSummary | undefined, projects: ProjectSummary[]) {
+  if (!project) return "";
+  const duplicateName = projects.some((item) => item.id !== project.id && item.name === project.name);
+  return duplicateName ? `${project.name} / ${projectFolderName(project)}` : project.name;
 }

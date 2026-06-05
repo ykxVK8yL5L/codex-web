@@ -161,6 +161,15 @@ The image installs the Codex CLI with `npm install -g @openai/codex`, installs P
 
 The restore workflow may create automatic pre-restore backup ZIP files under `/app/apps/api/restore-backups` inside the container before overwriting `apps/api/data`. This directory is not an auto-restore input folder and is not mounted by default. To restore a backup, upload the backup ZIP from the web UI.
 
+The Docker image also includes `docker/sync.sh` in the source tree for optional rclone-based data sync. It reads `REMOTE_FOLDER` as the remote root and preserves local absolute paths below that root:
+
+```bash
+REMOTE_FOLDER=remote:codex-web-backup sh docker/sync.sh backup
+REMOTE_FOLDER=remote:codex-web-backup sh docker/sync.sh restore
+```
+
+For example, `/app/apps/api/data` is synced to `remote:codex-web-backup/app/apps/api/data`. This is a file-level convenience sync for container data. Restores should be run before the API starts, and hot backups of a running SQLite-backed data directory are best-effort rather than a strict transactional snapshot.
+
 For production-style deployment without Docker, build the web app and run the API behind a process manager or container supervisor:
 
 ```bash

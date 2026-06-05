@@ -10,21 +10,29 @@ export type DingTalkNotificationAccountForm = {
   dingtalkBotToken: string;
   dingtalkBotSecret: string;
   dingtalkBaseUrl: string;
+  dingtalkCreateRecipient: boolean;
 };
 
 type Props = {
   form: DingTalkNotificationAccountForm;
   setForm: Dispatch<SetStateAction<any>>;
   t: TFunction;
+  showCreateRecipient?: boolean;
 };
 
-export function DingTalkNotificationAccountPanel({ form, setForm, t }: Props) {
+export function DingTalkNotificationAccountPanel({ form, setForm, t, showCreateRecipient = false }: Props) {
   return (
     <>
       <label>
         <span>{t("settings.notificationDingtalkBotToken")}</span>
         <input name="notification-dingtalk-bot-token" className="search-input" value={form.dingtalkBotToken} onChange={(event) => setForm((current: any) => ({ ...current, dingtalkBotToken: event.target.value }))} placeholder="access_token" />
       </label>
+      {showCreateRecipient && (
+        <label className="checkbox-row">
+          <input name="notification-dingtalk-create-recipient" type="checkbox" checked={form.dingtalkCreateRecipient} onChange={(event) => setForm((current: any) => ({ ...current, dingtalkCreateRecipient: event.target.checked }))} />
+          <span>{t("settings.notificationDingTalkCreateRecipient")}</span>
+        </label>
+      )}
       <details className="settings-collapsible">
         <summary>
           <span>{t("settings.notificationDingtalkAdvanced")}</span>

@@ -11,6 +11,7 @@ export type FeishuNotificationAccountForm = {
   feishuDomain: string;
   feishuInboundEnabled: boolean;
   feishuTestChatId: string;
+  feishuCreateRecipient: boolean;
   language: string;
 };
 
@@ -18,9 +19,10 @@ type Props = {
   form: FeishuNotificationAccountForm;
   setForm: Dispatch<SetStateAction<any>>;
   t: TFunction;
+  showCreateRecipient?: boolean;
 };
 
-export function FeishuNotificationAccountPanel({ form, setForm, t }: Props) {
+export function FeishuNotificationAccountPanel({ form, setForm, t, showCreateRecipient = false }: Props) {
   return (
     <>
       <label className="checkbox-row">
@@ -51,6 +53,12 @@ export function FeishuNotificationAccountPanel({ form, setForm, t }: Props) {
         <span>{t("settings.notificationFeishuTestChatId")}</span>
         <input name="notification-feishu-test-chat-id" className="search-input" value={form.feishuTestChatId} onChange={(event) => setForm((current: any) => ({ ...current, feishuTestChatId: event.target.value }))} placeholder="oc_xxx / ou_xxx" />
       </label>
+      {showCreateRecipient && (
+        <label className="checkbox-row">
+          <input name="notification-feishu-create-recipient" type="checkbox" checked={form.feishuCreateRecipient} onChange={(event) => setForm((current: any) => ({ ...current, feishuCreateRecipient: event.target.checked }))} />
+          <span>{t("settings.notificationFeishuCreateRecipient")}</span>
+        </label>
+      )}
     </>
   );
 }

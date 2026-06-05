@@ -115,7 +115,6 @@ export function platformOverview(deps: PlatformDeps): PlatformSettingsResponse {
     "weixin",
     "wecom",
     "dingtalk",
-    "wecom",
     "feishu",
     "qq",
   ] as PlatformKind[]).map((kind) => {

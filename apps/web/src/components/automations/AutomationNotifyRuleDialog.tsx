@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type FormEvent } from "react";
 import type {
   AutomationSummary,
   NotificationEventType,
+  NotificationEphemeralRuleSummary,
   NotificationRecipientSummary,
   NotificationRuleTarget,
   NotificationSettingsResponse,
@@ -66,6 +67,9 @@ export function AutomationNotifyRuleDialog({ open, automation, sessionToken, t, 
   const [selectedEventTypes, setSelectedEventTypes] = useState<NotificationEventType[]>(["task_completed", "task_failed"]);
 
   const recipients = useMemo(() => settings?.recipients.filter((recipient) => recipient.enabled) ?? [], [settings]);
+  const existingRule = useMemo(() =>
+    settings?.ephemeralRules.find((rule: NotificationEphemeralRuleSummary) => rule.scopeType === "automation" && rule.scopeId === automation?.id) ?? null,
+  [automation?.id, settings]);
   const availableRecipientKinds = useMemo(() => Array.from(new Set(recipients.map((recipient) => recipient.kind))), [recipients]);
   const groupedRecipients = useMemo(() => availableRecipientKinds.map((kind) => ({
     kind,
@@ -100,8 +104,14 @@ export function AutomationNotifyRuleDialog({ open, automation, sessionToken, t, 
 
   useEffect(() => {
     if (!open) return;
+    if (existingRule) {
+      setSelectedEventTypes(existingRule.eventTypes);
+      setSelectedRecipientIds(existingRule.targets.map((target) => target.recipientId).filter((value): value is string => Boolean(value)));
+      return;
+    }
     setSelectedEventTypes(["task_completed", "task_failed"]);
-  }, [open]);
+    setSelectedRecipientIds([]);
+  }, [existingRule, open]);
 
   if (!open || !automation) return null;
 
@@ -120,8 +130,8 @@ export function AutomationNotifyRuleDialog({ open, automation, sessionToken, t, 
         senderAccountId: defaultSenderAccountId(settings, recipient) || undefined,
       };
     });
-    const response = await fetch("/api/notifications/ephemeral-rules", {
-      method: "POST",
+    const response = await fetch(existingRule ? `/api/notifications/ephemeral-rules/${existingRule.id}` : "/api/notifications/ephemeral-rules", {
+      method: existingRule ? "PATCH" : "POST",
       headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
       body: JSON.stringify({
         scopeType: "automation",
@@ -129,6 +139,7 @@ export function AutomationNotifyRuleDialog({ open, automation, sessionToken, t, 
         eventTypes: selectedEventTypes,
         targets,
         expireMode: "manual",
+        enabled: true,
       }),
     });
     if (!response.ok) {

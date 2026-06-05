@@ -806,6 +806,13 @@ export interface NotificationEphemeralRuleSummary {
   id: string;
   scopeType: "task" | "session" | "room_task" | "automation";
   scopeId: string;
+  source?: {
+    type: "task" | "session" | "room_task" | "automation";
+    id: string;
+    label: string;
+    detail?: string | null;
+    exists: boolean;
+  } | null;
   eventTypes: NotificationEventType[];
   targets: NotificationRuleTarget[];
   enabled: boolean;
@@ -956,6 +963,12 @@ export interface SystemBackupProjectReference {
   note: string;
 }
 
+export interface SystemBackupFileEntry {
+  path: string;
+  bytes: number;
+  modifiedAt?: string | null;
+}
+
 export interface SystemBackupManifest {
   schemaVersion: 1;
   createdAt: string;
@@ -981,6 +994,7 @@ export interface SystemBackupPreviewResponse {
   ok: boolean;
   manifest: SystemBackupManifest;
   entries: number;
+  files: SystemBackupFileEntry[];
   bytes: number;
   restartRequired: boolean;
 }
@@ -1005,6 +1019,8 @@ export interface StorageItemSummary {
   path: string;
   bytes: number;
   updatedAt: string;
+  sessionType?: ConversationType | null;
+  sessionKind?: SessionKind | null;
   relatedId?: string | null;
   relatedName?: string | null;
   relatedType?: "project" | "session" | "room" | "run" | "preview" | null;

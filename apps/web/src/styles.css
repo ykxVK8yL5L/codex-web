@@ -355,6 +355,15 @@ button:disabled {
   min-width: 0;
 }
 
+.thread-unread-dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #a83c4b;
+  box-shadow: 0 0 0 2px white;
+}
+
 .session-title-line h1 {
   display: block;
   flex: 1 1 auto;
@@ -3946,14 +3955,16 @@ button:disabled {
   padding-top: 12px;
 }
 
-.notification-card .settings-collapsible {
+.notification-card .settings-collapsible,
+.notification-editor-dialog .settings-collapsible {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--surface);
   padding: 10px 12px;
 }
 
-.notification-card .settings-collapsible summary {
+.notification-card .settings-collapsible summary,
+.notification-editor-dialog .settings-collapsible summary {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -3963,20 +3974,29 @@ button:disabled {
   gap: 12px;
 }
 
-.notification-card .settings-collapsible summary::-webkit-details-marker {
+.notification-card .settings-collapsible summary::-webkit-details-marker,
+.notification-editor-dialog .settings-collapsible summary::-webkit-details-marker {
   display: none;
 }
 
-.notification-card .settings-collapsible-chevron {
+.notification-card .settings-collapsible summary::marker,
+.notification-editor-dialog .settings-collapsible summary::marker {
+  content: "";
+}
+
+.notification-card .settings-collapsible-chevron,
+.notification-editor-dialog .settings-collapsible-chevron {
   flex: 0 0 auto;
   transition: transform 0.2s ease;
 }
 
-.notification-card .settings-collapsible[open] .settings-collapsible-chevron {
+.notification-card .settings-collapsible[open] .settings-collapsible-chevron,
+.notification-editor-dialog .settings-collapsible[open] .settings-collapsible-chevron {
   transform: rotate(180deg);
 }
 
-.notification-card .settings-collapsible-body {
+.notification-card .settings-collapsible-body,
+.notification-editor-dialog .settings-collapsible-body {
   display: grid;
   gap: 10px;
   margin-top: 12px;
@@ -6358,10 +6378,99 @@ button:disabled {
   width: min(560px, calc(100vw - 24px));
 }
 
+.notification-help-dialog {
+  width: min(560px, calc(100vw - 24px));
+}
+
+.notification-card .environment-card-head {
+  align-items: center;
+}
+
+.notification-card-title-row {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+}
+
+.notification-card-title-row strong {
+  min-width: 0;
+}
+
+.notification-title-info-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  padding: 0;
+}
+
+.notification-title-info-button:hover {
+  background: var(--surface);
+  color: var(--ink);
+}
+
 .notification-editor-dialog {
   width: min(760px, calc(100vw - 24px));
   max-height: min(86vh, calc(100vh - 24px));
   overflow: auto;
+}
+
+.notification-editor-dialog label:not(.checkbox-row) {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.notification-editor-dialog label > span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.notification-editor-dialog .checkbox-row {
+  display: inline-flex;
+  align-items: center;
+  justify-self: start;
+  min-height: 32px;
+  max-width: 100%;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 6px 10px;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.25;
+}
+
+.notification-editor-dialog .checkbox-row:hover {
+  border-color: var(--line-strong);
+  background: var(--surface-2);
+}
+
+.notification-editor-dialog .checkbox-row input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  margin: 0;
+  accent-color: var(--green);
+}
+
+.notification-editor-dialog .checkbox-row span {
+  min-width: 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .notify-builder-summary {

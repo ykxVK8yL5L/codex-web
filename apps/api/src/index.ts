@@ -8,7 +8,7 @@ import type { IncomingMessage } from "node:http";
 import { basename, delimiter, dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn as spawnPty } from "node-pty";
-import { generateSecret, generateURI } from "otplib";
+import { generateSecret } from "otplib";
 import { WebSocketServer, WebSocket } from "ws";
 import { createDingtalkPlatform } from "./platforms/dingtalk.js";
 import { createEmailPlatform } from "./platforms/email.js";
@@ -17,7 +17,148 @@ import { createQQPlatform } from "./platforms/qq.js";
 import { createWeComPlatform } from "./platforms/wecom.js";
 import { createTelegramPlatform } from "./platforms/telegram.js";
 import { createWeixinPlatform } from "./platforms/weixin.js";
-import { platformOverview } from "./platforms.js";
+import { createAppDataStore } from "./app-data.js";
+import { createTaskEventBus, type TaskEvent } from "./tasks/events.js";
+import { activityLabel, readActivityEvent, readAssistantText, readFileActivityPath, readTextField, shortenActivityDetail } from "./tasks/activity-parser.js";
+import { createTaskStorage } from "./tasks/storage.js";
+import { createTaskLogRuntime } from "./tasks/logs.js";
+import { setSessionQueueDeps, listQueuedMessages, getQueuedMessage, enqueueMessage, updateQueuedMessage, deleteQueuedMessage, reorderQueuedMessages, popNextQueuedMessage } from "./sessions/queue.js";
+import { setSessionMessageDeps, listSessionMessages, allSessionMessages } from "./sessions/messages.js";
+import { createSessionMessageRuntime } from "./sessions/runtime.js";
+import { createSessionFilesystem } from "./sessions/filesystem.js";
+import { createSessionDeletionService } from "./sessions/deletion.js";
+import { createSessionCompactionRuntime } from "./sessions/compaction.js";
+import {
+  activeGoalForOwner,
+  activeGoalForSession,
+  applyGoalProposal,
+  createDefaultGoalPlan,
+  createGoal,
+  createGoalFocus,
+  createGoalItem,
+  createGoalProposal,
+  createReplanProposal,
+  goalActorFromRequest,
+  goalDetail,
+  goalEventFromRow,
+  goalFocusFromRow,
+  goalFromRow,
+  goalItemFromRow,
+  goalMode,
+  goalOwnerType,
+  goalProposalFromRow,
+  goalStatus,
+  assertCanManageGoal,
+  assertCanUpdateGoalItem,
+  recordGoalEvent,
+  rejectGoalProposal,
+  setGoalStoreDeps,
+  updateGoal,
+  updateGoalFocus,
+  updateGoalItem,
+  listGoalProposals,
+} from "./goals/index.js";
+import { registerGoalRoutes } from "./goals/routes.js";
+import {
+  deleteFileMount,
+  deleteFileMountsForRoot,
+  deleteStorageItem,
+  listStorageItems,
+  loadFileMounts,
+  normalizeMountPath,
+  pathWithinRoot,
+  resolveFileRequestMount,
+  resolveInsideMount,
+  resolveInsideRoot,
+  resolveMountWorkspace,
+  setFileStoreDeps,
+  toFileEntry,
+  toRelativePath,
+  upsertFileMount,
+  writeProjectWorkspaceMetadata,
+} from "./files/index.js";
+import { createWorkspacePathService } from "./files/paths.js";
+import { registerFileRoutes } from "./files/routes.js";
+import {
+  agentRunFromRow,
+  listRooms,
+  publishRoomEvent,
+  roomActivitySnapshot,
+  roomEventFromRow,
+  roomFromRow,
+  roomOrchestrationSettings,
+  roomScheduleFromRow,
+  roomStatus,
+  roomTaskFromRow,
+  setRoomStoreDeps,
+  subscribeRoomEvents,
+} from "./rooms/index.js";
+import { createRoomRecordService } from "./rooms/records.js";
+import {
+  createTaskRun,
+  finishTaskRun,
+  finishTaskRunById,
+  latestRunningTaskRun,
+  listTaskHealth,
+  listTaskRuns,
+  listTaskRunsForSession,
+  markTaskRunStopRequested,
+  setTaskRunStoreDeps,
+  taskActivityFromRow,
+  taskRunFromRow,
+  updateTaskRunPid,
+} from "./tasks/runs.js";
+import { setApiKeyStoreDeps } from "./auth/api-keys.js";
+import { registerApiAuthMiddleware, registerProtectedAuthRoutes, registerPublicAuthRoutes } from "./auth/routes.js";
+import { registerAppNotificationRoutes, registerAppNotificationStreamRoute } from "./notifications/app-routes.js";
+import { notificationChannels } from "./notifications/channels.js";
+import { createNotificationService } from "./notifications/service.js";
+import { registerNotificationAccountRoutes, registerNotificationBaseRoutes, registerNotificationRecipientRoutes, registerNotificationRuleRoutes } from "./notifications/routes.js";
+import {
+  automationCommandTimeoutSeconds,
+  automationFromRow,
+  automationHasRunningRun,
+  automationRuntimeFields,
+  automationStatusLabel,
+  buildAutomationNotificationMessage,
+  cronFieldMatches,
+  cronMatches,
+  isValidAutomationSchedule,
+  nextAutomationRunAt,
+  notificationDurationLabel,
+  notificationSnippet,
+  sanitizeAutomationOverlapPolicy,
+  sanitizeAutomationRetryDelayMinutes,
+  sanitizeAutomationRetryMax,
+  setAutomationStoreDeps,
+  shouldRunAutomationNow,
+} from "./automations/index.js";
+import { createAutomationRuntime } from "./automations/runtime.js";
+import { registerAutomationRoutes } from "./automations/routes.js";
+import {
+  appNotificationFromRow,
+  appNotificationUnreadCount,
+  createAppNotification,
+  getNotificationChannel,
+  listAppNotifications,
+  listNotificationChannels,
+  notificationAccountFromRow,
+  notificationChannelFromRow,
+  notificationDeliveryFromRow,
+  notificationEphemeralRuleFromRow,
+  notificationEventTypes,
+  notificationLanguageFromConfig,
+  notificationLocaleText,
+  notificationRecipientFromRow,
+  notificationRuleFromRow,
+  notificationSeverityRank,
+  publicNotificationConfig,
+  publishAppNotificationEvent,
+  publishAppNotificationsSnapshot,
+  sanitizeNotificationPermissions,
+  setNotificationStoreDeps,
+  subscribeAppNotifications,
+} from "./notifications/index.js";
 import type {
   ApprovalActionType,
   ApprovalDecisionResponse,
@@ -26,16 +167,11 @@ import type {
   ApprovalStatus,
   ApprovalSummary,
   AgentCircleSummary,
-  AgentGroupSummary,
   AgentListenMode,
   AgentPermissionSettings,
-  AgentProjectAccessMode,
   AgentRoleSummary,
-  AgentRoleSourceType,
-  AgentRoleTemplateSummary,
   AgentRunSummary,
   AgentSummary,
-  AgentWorkspaceMode,
   AppNotificationSummary,
   AppNotificationStreamEvent,
   AppNotificationsResponse,
@@ -49,13 +185,10 @@ import type {
   AuthState,
   AutomationRunSummary,
   AutomationSummary,
-  CodexApprovalPolicy,
   CodexRuntimeSettings,
-  CodexSandboxMode,
   CodexTaskDetail,
   CodexTaskDiff,
   ContinueCodexTaskRequest,
-  ConversationType,
   CreateCodexTaskRequest,
   CreateAutomationRequest,
   CreateApiKeyRequest,
@@ -143,17 +276,11 @@ import type {
   TestNotificationAccountRequest,
   UpdateNotificationTestSettingsRequest,
   PageResponse,
-  PermissionProfileId,
   PlatformSettingsResponse,
   WebhookRouteSummary,
   CreatePreviewRequest,
-  ProjectCheckRunSummary,
-  ProjectGitOperationRequest,
-  ProjectGitOperationSummary,
-  ProjectGitOperationType,
   ProjectStatsSummary,
   ProjectSummary,
-  PreviewAccess,
   PreviewAccessSettings,
   PreviewSummary,
   ProviderCapabilities,
@@ -178,7 +305,6 @@ import type {
   RoomOrchestrationSettings,
   RoomRunDiffResponse,
   RoomRunMergeResponse,
-  RoomScheduleSummary,
   RoomStatus,
   RoomTaskSummary,
   RoomSummary,
@@ -211,7 +337,6 @@ import type {
   UpdateRoomDecisionRequest,
   UpdateRoomHandoffRequest,
   TerminalCommandRequest,
-  TerminalCommandResponse,
   TaskActivityResponse,
   TaskActivitySummary,
   TaskContextFileResponse,
@@ -250,7 +375,6 @@ import type {
   GoalItemStatus,
   GoalItemSummary,
   GoalMode,
-  GoalOwnerType,
   GoalProposalKind,
   GoalProposalStatus,
   GoalProposalSummary,
@@ -262,8 +386,18 @@ import type {
   UpdateGoalItemRequest,
   UpdateGoalRequest,
 } from "@codex-web/protocol";
-import { createAuthHelpers, type AuthConfig } from "./auth.js";
+import { createAuthHelpers, type AuthConfig } from "./auth/index.js";
+import { createApprovalService } from "./auth/approvals.js";
+import { createAuthConfigStore } from "./auth/config.js";
+import { seedMultiAgentDefaults } from "./agents/defaults.js";
+import { createDirectAgentSessionService } from "./agents/direct-sessions.js";
+import { createExecutionContextStore } from "./agents/execution-contexts.js";
+import { agentPermissions, conversationType, defaultAgentPermissions, listenMode, permissionProfileId, permissionProfiles, previewAccess, projectAccessMode, resolvedAgentPermissions, roleSourceType, workspaceMode } from "./agents/permissions.js";
+import { createAgentRoleTemplateService, markdownDescription, markdownTitle, systemPromptWithRoleDescription, type AgentRoleTemplateRecord } from "./agents/role-templates.js";
+import { registerAgentCircleRoutes, registerAgentGroupRoutes, registerAgentRoleRoutes, registerAgentRoutes } from "./agents/routes.js";
+import { createAgentStore } from "./agents/store.js";
 import { archiveExcluder, createZipArchive, createZipArchiveWithEntries, listArchiveIgnoreTemplates, parseStoredZipArchive, previewZipArchive } from "./archive.js";
+import { createProjectHistoryService } from "./projects/history.js";
 import {
   createRateLimitMiddleware,
   createRateLimitStore,
@@ -272,13 +406,39 @@ import {
   incrementProviderProxyConcurrency,
 } from "./rate-limit.js";
 import { createRuntimeSettingsStore } from "./runtime-settings.js";
-import { decodeOffsetCursor, decodePageCursor, offsetPageFromRows, pageFromRows, parsePageLimit } from "./pagination.js";
+import { decodePageCursor, pageFromRows, parsePageLimit } from "./pagination.js";
+import { registerWebhookRoutes } from "./webhooks/routes.js";
 import {
-  createEnvironmentPackageRegistry,
-  packageInstallCommandSpec,
-  packageUninstallCommandSpec,
-  packageUninstallCommandText,
-} from "./environment-packages.js";
+  buildEnvironmentOverview,
+  saveEnvironmentOverview,
+  setEnvironmentStoreDeps,
+} from "./environment/index.js";
+import { registerEnvironmentRoutes } from "./environment/routes.js";
+import { commandVersion, managedChildEnv, miseCommandCandidates, miseExecVersion, resolveMiseCommand } from "./environment/runtime-utils.js";
+import { createExtensionService } from "./extensions/index.js";
+import { registerExtensionRoutes } from "./extensions/routes.js";
+import { registerProviderRoutes } from "./providers/routes.js";
+import { createProviderRuntime } from "./providers/runtime.js";
+import { registerPreviewLogStreamRoute, registerPreviewRoutes } from "./previews/routes.js";
+import { createPreviewRuntime } from "./previews/runtime.js";
+import { createPreviewAccessService } from "./previews/access.js";
+import { createPreviewLogEventBus } from "./previews/events.js";
+import { createPreviewProcessRuntime } from "./previews/processes.js";
+import { registerProjectRoutes } from "./projects/routes.js";
+import { createProjectGitRuntime } from "./projects/git-runtime.js";
+import { createRoomRuntimeService } from "./rooms/runtime.js";
+import { registerRoomRoutes } from "./rooms/routes.js";
+import { registerSettingsRoutes } from "./settings/routes.js";
+import { createSettingsRuntime } from "./settings/runtime.js";
+import { jsonArray, jsonPayload } from "./server/json.js";
+import { registerServerRoutes } from "./server/routes.js";
+import { createDatabaseRecordDeletionService } from "./storage/database-records.js";
+import { registerStorageRoutes } from "./storage/routes.js";
+import { registerTaskRoutes } from "./tasks/routes.js";
+import { registerTerminalRoutes } from "./terminal/routes.js";
+import { createTerminalRuntime } from "./terminal/runtime.js";
+import { createTerminalCommandRuntime } from "./terminal/commands.js";
+import { createWebhookService } from "./webhooks/index.js";
 
 type ProviderRecord = ProviderSummary & { apiKey?: string };
 type ApprovalRecord = ApprovalSummary & { payload: unknown };
@@ -305,15 +465,6 @@ type TerminalRuntime = TerminalSessionSummary & {
   ephemeral: boolean;
 };
 type CreateTerminalSessionInput = CreateTerminalSessionRequest & { ephemeral?: boolean };
-type TaskEvent =
-  | { type: "started"; session: SessionSummary }
-  | { type: "output"; bytes: number; at: string }
-  | { type: "activity"; id?: string; kind: "command" | "file" | "tool"; label: string; detail?: string; status?: string; at: string }
-  | { type: "workspace"; session: SessionSummary; reason: "activity" | "done" | "revert"; at: string }
-  | { type: "message"; message: SessionMessage; session: SessionSummary }
-  | { type: "queue"; queue: QueuedMessage[]; session: SessionSummary }
-  | { type: "done"; session: SessionSummary; exitCode: number | null }
-  | { type: "error"; session: SessionSummary; error: string };
 type RoomStreamEvent =
   | { type: "snapshot"; room: RoomSummary; tasks: RoomTaskSummary[]; runs: AgentRunSummary[]; events: RoomEventSummary[]; messages: SessionMessage[] }
   | { type: "activity"; roomId: string; event?: RoomEventSummary; tasks: RoomTaskSummary[]; runs: AgentRunSummary[]; events: RoomEventSummary[]; messages: SessionMessage[] }
@@ -345,9 +496,14 @@ const apiPort = Number(process.env.PORT ?? 8787);
 const localApiBaseUrl = process.env.CODEX_WEB_LOCAL_API_BASE_URL ?? `http://127.0.0.1:${apiPort}`;
 
 const db = openDatabase();
-seedMultiAgentDefaults();
+seedMultiAgentDefaults(db, agentRoleTemplateDir);
 const rateLimitStore = createRateLimitStore(db);
 const runtimeSettingsStore = createRuntimeSettingsStore(db, { codexSandboxMode, codexApprovalPolicy, codexBypassSandbox });
+const authConfigStore = createAuthConfigStore(db);
+const {
+  loadAuthConfig,
+  saveAuthConfig,
+} = authConfigStore;
 let authConfig = loadAuthConfig();
 const {
   anonymousState,
@@ -363,16 +519,1215 @@ const {
   verifyProviderProxyToken,
   verifySessionToken,
 } = createAuthHelpers(() => authConfig, sessionTtlMs);
+setApiKeyStoreDeps({
+  db,
+  hashToken,
+  verifySessionToken,
+});
 const sessionCookieName = "codex_web_session";
 let pendingOtpSecret = generateSecret();
 let pendingResetOtpSecret: string | null = null;
+const authRouteDeps = {
+  anonymousState,
+  authenticatedAuthState,
+  clearSessionCookie,
+  emitExternalNotification: (event: any) => emitExternalNotification(event),
+  getAuthConfig: () => authConfig,
+  getBearerToken,
+  getPendingOtpSecret: () => pendingOtpSecret,
+  getPendingResetOtpSecret: () => pendingResetOtpSecret,
+  hashToken,
+  saveAuthConfig,
+  sessionCookie,
+  setAuthConfig: (config: AuthConfig) => {
+    authConfig = config;
+  },
+  setPendingResetOtpSecret: (secret: string | null) => {
+    pendingResetOtpSecret = secret;
+  },
+  signSessionToken,
+  verifyOtp,
+  verifySessionToken,
+};
+const appNotificationRouteDeps = {
+  db,
+  getBearerToken,
+  listAppNotifications,
+  parsePageLimit,
+  publishAppNotificationEvent,
+  publishAppNotificationsSnapshot,
+  subscribeAppNotifications,
+  verifySessionToken,
+};
+const environmentRouteDeps = {
+  getOverview: () => environmentOverview,
+  setOverview: (overview: EnvironmentOverview) => {
+    environmentOverview = overview;
+  },
+};
+let appDataProjectsForPaths: ProjectSummary[] = [];
+const workspacePathService = createWorkspacePathService({
+  getProjects: () => appDataProjectsForPaths,
+  projectWorkspaceRoot,
+  resolveInsideMount,
+  resolveInsideRoot,
+  resolveMountWorkspace,
+  terminalDefaultCwd,
+  terminalRoot,
+  toRelativePath,
+});
+const {
+  defaultProjectWorkspacePath,
+  resolveChildPath,
+  resolveTerminalCwd,
+  resolveWorkspacePath,
+  slugify,
+  toTerminalPath,
+  uniqueProjectId,
+} = workspacePathService;
+const settingsRuntime = createSettingsRuntime({
+  archiveExcluder,
+  codexHome,
+  createZipArchiveWithEntries,
+  dataDir,
+  db,
+  getAppData: () => appData,
+  getSystemBackupSettings: () => systemBackupSettings,
+  parseStoredZipArchive,
+  resolveTerminalCwd,
+  runGitSync: (cwd, args) => runGitSync(cwd, args),
+  sessionWorkspaceRoot,
+});
+const {
+  backupTimestamp,
+  buildSystemBackupManifest,
+  createSystemBackupArchive,
+  dataBackupEntries,
+  defaultSystemBackupSettings,
+  loadJsonSetting,
+  loadNotificationTestSettings,
+  loadSystemBackupSettings,
+  pathStats,
+  projectBackupReferences,
+  pruneCodexSessionProjectTrustEntries,
+  readBackupUpload,
+  readSystemBackupArchive,
+  safeBackupEntryName,
+  sanitizeNotificationTestSettings,
+  sanitizeSystemBackupSettings,
+  saveJsonSetting,
+  saveNotificationTestSettings,
+  saveSystemBackupSettings,
+  systemBackupPreviewFromArchive,
+} = settingsRuntime;
 let codexRuntimeSettings = runtimeSettingsStore.codexRuntime.load();
 let previewAccessSettings = runtimeSettingsStore.previewAccess.load();
 let sessionCompactionSettings = runtimeSettingsStore.sessionCompaction.load();
 let rateLimitSettings = rateLimitStore.load();
 let systemBackupSettings = loadSystemBackupSettings();
 let notificationTestSettings: NotificationTestSettings;
+notificationTestSettings = loadNotificationTestSettings();
+let writeSessionMetadataHandler: ((session: SessionSummary) => void) | null = null;
+function writeSessionMetadata(session: SessionSummary) {
+  writeSessionMetadataHandler?.(session);
+}
+function earlyTopLevelSessionDataPath(sessionId: string) {
+  return resolve(sessionWorkspaceRoot, sessionId);
+}
+function earlyRoomParentSessionId(roomId: string) {
+  const row = db.prepare("select session_id from rooms where id = ?").get(roomId) as { session_id?: string | null } | undefined;
+  return row?.session_id ?? null;
+}
+function earlySessionDataPath(sessionId: string) {
+  const row = db.prepare("select conversation_type, room_id from sessions where id = ?").get(sessionId) as { conversation_type?: string | null; room_id?: string | null } | undefined;
+  if (row?.conversation_type === "agent" && row.room_id) {
+    const parentSessionId = earlyRoomParentSessionId(row.room_id);
+    if (parentSessionId && parentSessionId !== sessionId) return resolve(earlyTopLevelSessionDataPath(parentSessionId), "room", "agent-sessions", sessionId);
+  }
+  return earlyTopLevelSessionDataPath(sessionId);
+}
+function earlyScratchSessionWorkspacePath(sessionId: string) {
+  return resolve(earlySessionDataPath(sessionId), "workspace");
+}
+function earlyEnsureScratchSessionWorkspace(sessionId: string) {
+  const workspacePath = earlyScratchSessionWorkspacePath(sessionId);
+  mkdirSync(workspacePath, { recursive: true });
+  return workspacePath;
+}
+const appDataStore = createAppDataStore({
+  db,
+  activeGoalForSession,
+  automationFromRow,
+  conversationType,
+  ensureScratchSessionWorkspace: earlyEnsureScratchSessionWorkspace,
+  jsonArray,
+  resolveTerminalCwd,
+  scratchSessionWorkspacePath: earlyScratchSessionWorkspacePath,
+  upsertAutomation,
+  upsertProject,
+  upsertProvider,
+  upsertSession,
+});
+const {
+  defaultProviderCapabilities,
+  loadAppData,
+  mergeProviderCapabilities,
+  projectCheckRunFromRow,
+  projectFromRow,
+  projectGitOperationFromRow,
+  providerFromRow,
+  providerHealthCheckFromRow,
+  sanitizeProviderRpmLimit,
+  sessionFromRow,
+  splitProjectCheckCommands,
+} = appDataStore;
 const appData = loadAppData();
+appDataProjectsForPaths = appData.projects;
+function saveAppData() {
+  appDataStore.saveAppData(appData);
+}
+const agentStore = createAgentStore({
+  db,
+  getProjects: () => appData.projects,
+  jsonArray,
+  agentPermissions,
+  listenMode,
+  permissionProfileId,
+  projectAccessMode,
+  roleSourceType,
+  workspaceMode,
+});
+const {
+  agentCanAccessProject,
+  agentCircleFromRow,
+  agentFromRow,
+  agentGroupFromRow,
+  agentRoleFromRow,
+  listAgentCircles,
+  listAgentGroups,
+  listAgentRoles,
+  listAgents,
+  normalizeProjectIds,
+  resolveAgentProject,
+} = agentStore;
+const directAgentSessionService = createDirectAgentSessionService({
+  db,
+  agentFromRow,
+  agentRoleFromRow,
+});
+const { directAgentForSession, promptForDirectAgentSession } = directAgentSessionService;
+const executionContextStore = createExecutionContextStore({
+  db,
+  agentPermissions,
+  permissionProfileId,
+});
+const { executionContextFromRow, recordExecutionContext } = executionContextStore;
+const roomRecordService = createRoomRecordService({
+  db,
+  jsonPayload,
+  roomEvent,
+});
+const {
+  createRoomArtifact,
+  createRoomDecision,
+  createRoomHandoff,
+  roomArtifactFromRow,
+  roomDecisionFromRow,
+  roomHandoffFromRow,
+  roomHandoffStatus,
+} = roomRecordService;
+const notificationService = createNotificationService({
+  appData,
+  db,
+  host,
+  notificationChannels,
+  dingtalkPlatform: {
+    sendNotification: (...args: any[]) => dingtalkPlatform.sendNotification(...args as [any, any]),
+  },
+  feishuPlatform: {
+    sendNotification: (...args: any[]) => feishuPlatform.sendNotification(...args as [any, any, any]),
+  },
+  qqPlatform: {
+    sendNotification: (...args: any[]) => qqPlatform.sendNotification(...args as [any, any, any]),
+  },
+  sendEmailNotification: (...args: any[]) => sendEmailNotification(...args as [any, any]),
+  wecomPlatform: {
+    sendNotification: (...args: any[]) => wecomPlatform.sendNotification(...args as [any, any, any]),
+  },
+  weixinPlatform: {
+    sendNotification: (...args: any[]) => weixinPlatform.sendNotification(...args as [any, any, any]),
+  },
+});
+const {
+  cleanupNotificationTargetsForDeletedReferences,
+  createExternalNotification,
+  createNotificationEphemeralRule,
+  deleteNotificationAccount,
+  deliverNotification,
+  deliverNotificationToRecipient,
+  emitExternalNotification,
+  listAllNotificationRules,
+  listNotificationAccounts,
+  listNotificationDeliveries,
+  listNotificationEphemeralRules,
+  listNotificationRecipients,
+  listNotificationRules,
+  parseJsonValue,
+  parseWebhookPayload,
+  readNotificationRecipients,
+  registerEphemeralNotificationsFromPrompt,
+  sanitizeNotificationConfig,
+  sanitizeNotificationTargets,
+  sendNotificationToAccount,
+  sendWebhookNotification,
+  syncDefaultNotificationRecipients,
+  syncTelegramBotCommands,
+  validateWebhookToken,
+} = notificationService;
+const approvalService = createApprovalService({
+  db,
+  emitExternalNotification,
+  saveCodexRuntimeSettings: (settings) => runtimeSettingsStore.codexRuntime.save(settings),
+  setCodexRuntimeSettings: (settings) => {
+    codexRuntimeSettings = settings;
+  },
+});
+const {
+  approvalAlwaysAllowed,
+  archiveApproval,
+  applyCodexRuntimeSettings,
+  codexRuntimeDetails,
+  codexRuntimeRisk,
+  createApproval,
+  createPreviewApproval,
+  createProjectDeleteApproval,
+  createProjectGitApproval,
+  createRoomRunMergeApproval,
+  getApproval,
+  listApprovalGrants,
+  listApprovals,
+  previewCommandRisk,
+  publicApproval,
+  resolveApproval,
+  restoreApproval,
+  saveApprovalGrant,
+  stableJson,
+} = approvalService;
+const providerRuntime = createProviderRuntime({
+  db,
+  providerTimeoutMs,
+  providerModelsCacheTtlMs,
+  defaultProviderCapabilities,
+  mergeProviderCapabilities,
+  stableJson,
+  stringifyReadable,
+});
+const {
+  clearProviderModelCache,
+  detectProviderInterface,
+  discoverProviderModels,
+  joinUrl,
+  proxyResponsesToChatCompletions,
+  proxyResponsesToResponses,
+  publicProvider,
+  readProviderModelCache,
+  recordProviderHealthCheck,
+  saveProviderModelCache,
+  testProvider,
+} = providerRuntime;
+
+const sessionFilesystem = createSessionFilesystem({
+  appData,
+  dataDir,
+  db,
+  ensureGitRepositorySync: (workspacePath) => ensureGitRepositorySync(workspacePath),
+  resolveTerminalCwd,
+  runGitSync: (cwd, args) => runGitSync(cwd, args),
+  sessionWorkspaceRoot,
+  upsertSession,
+});
+const {
+  attachmentMarkdown,
+  ensureRoomRunWorkspace,
+  ensureRoomWorkspace,
+  ensureScratchSessionWorkspace,
+  messageWithAttachments,
+  migrateLegacyScratchSessionWorkspace,
+  migrateRoomAgentSessionDataRoots,
+  migrateRoomWorkspaceRoots,
+  promptWithAttachments,
+  resetSessionContextFiles,
+  resolveSessionWorkspace,
+  roomParentSessionId,
+  roomWorkspaceDataPath,
+  saveSessionAttachments,
+  scratchSessionWorkspacePath,
+  sessionAttachmentsPath,
+  sessionCodexMetadataPath,
+  sessionContextPath,
+  sessionDataPath,
+  sessionLogsPath,
+  sessionMemoryPath,
+  topLevelSessionDataPath,
+  writeSessionContextFile,
+  writeSessionMetadata: writeSessionMetadataFromFilesystem,
+} = sessionFilesystem;
+writeSessionMetadataHandler = writeSessionMetadataFromFilesystem;
+const notificationBaseRouteDeps = {
+  appData,
+  cleanupNotificationTargetsForDeletedReferences,
+  deleteNotificationAccount,
+  db,
+  deliverNotification,
+  deliverNotificationToRecipient,
+  getNotificationChannel,
+  getNotificationChannels: () => notificationChannels,
+  getNotificationTestSettings: () => notificationTestSettings,
+  createNotificationEphemeralRule,
+  listNotificationAccounts,
+  listNotificationChannels,
+  listNotificationDeliveries,
+  listNotificationEphemeralRules,
+  listNotificationRecipients,
+  listNotificationRules,
+  listWebhookRoutes: () => listWebhookRoutes(),
+  notificationAccountFromRow,
+  notificationAccountHelpText: (account: NotificationAccountSummary) =>
+    account.channelKind === "telegram"
+      ? telegramPlatform.telegramHelpText(account)
+      : account.channelKind === "weixin"
+        ? weixinPlatform.weixinHelpText(account)
+        : account.channelKind === "wecom"
+          ? wecomPlatform.wecomHelpText(account)
+          : account.channelKind === "dingtalk"
+            ? dingtalkPlatform.dingtalkHelpText(account)
+            : account.channelKind === "feishu"
+              ? feishuPlatform.feishuHelpText(account)
+              : account.channelKind === "qq"
+                ? qqPlatform.qqHelpText(account)
+                : "",
+  notificationChannelFromRow,
+  notificationLanguageFromConfig,
+  notificationLocaleText: (language: string, zh: string, en: string) => notificationLocaleText(language === "zh-CN" ? "zh-CN" : "en-US", zh, en),
+  notificationDeliveryFromRow,
+  notificationEphemeralRuleFromRow,
+  notificationEventTypes,
+  notificationRuleFromRow,
+  notificationSeverityRank,
+  notificationRecipientFromRow,
+  parseJsonValue,
+  platformSyncConnections: () => {
+    void Promise.resolve(feishuPlatform.syncConnections()).catch((error: unknown) => console.warn("feishu sync failed", error));
+    void Promise.resolve(wecomPlatform.syncConnections()).catch((error: unknown) => console.warn("wecom sync failed", error));
+    void Promise.resolve(qqPlatform.syncConnections()).catch((error: unknown) => console.warn("qq sync failed", error));
+  },
+  recipientHelpText: (kind: NotificationRecipientSummary["kind"]) =>
+    kind === "telegram"
+      ? telegramPlatform.telegramHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
+      : kind === "weixin"
+        ? weixinPlatform.weixinHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
+        : kind === "wecom"
+          ? wecomPlatform.wecomHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
+          : kind === "dingtalk"
+            ? dingtalkPlatform.dingtalkHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
+            : kind === "qq"
+              ? qqPlatform.qqHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
+              : kind === "feishu"
+                ? feishuPlatform.feishuHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
+                : "",
+  sanitizeNotificationPermissions,
+  sanitizeNotificationConfig,
+  sanitizeNotificationTargets,
+  syncTelegramBotCommands,
+  wecomConnectionStatus: (account: NotificationAccountSummary) => wecomPlatform.connectionStatus(account),
+  weixinGetQrLoginState: (key: string) => weixinPlatform.getQrLoginState(key),
+  weixinRefreshQrLogin: (key: string) => weixinPlatform.refreshQrLogin(key),
+  weixinStartDraftQrLogin: (botType: string) => weixinPlatform.startDraftQrLogin(botType),
+  weixinStartQrLogin: (accountId: string, botType: string) => weixinPlatform.startQrLogin(accountId, botType),
+};
+const webhookService = createWebhookService({
+  appData,
+  db,
+  host,
+  listAgents,
+  listRooms,
+});
+const {
+  listWebhookAgentSummaries,
+  listWebhookRoomSummaries,
+  listWebhookRoutes,
+  listWebhookSessionSummaries,
+  normalizeWebhookRouteSecret,
+  slugifyWebhookRouteName,
+  upsertWebhookRoute,
+  webhookRouteFromRow,
+  webhookSecretIsSafe,
+} = webhookService;
+const webhookRouteDeps = {
+  appData,
+  db,
+  dispatchMessageToSession,
+  listWebhookAgentSummaries,
+  listWebhookRoomSummaries,
+  listWebhookRoutes,
+  listWebhookSessionSummaries,
+  normalizeWebhookRouteSecret,
+  parsePageLimit,
+  parseWebhookPayload,
+  slugifyWebhookRouteName,
+  upsertWebhookRoute,
+  validateWebhookToken,
+  webhookRouteFromRow,
+  webhookSecretIsSafe,
+};
+const goalRouteDeps = {
+  applyGoalProposal,
+  assertCanManageGoal,
+  assertCanUpdateGoalItem,
+  createDefaultGoalPlan,
+  createGoal,
+  createGoalFocus,
+  createGoalItem,
+  createGoalProposal,
+  db,
+  goalActorFromRequest,
+  goalDetail,
+  goalEventFromRow,
+  goalFromRow,
+  goalItemFromRow,
+  goalOwnerType,
+  listGoalProposals,
+  orchestrateRoom,
+  recordGoalEvent,
+  rejectGoalProposal,
+  roomEvent,
+  roomTaskFromRow,
+  updateGoal,
+  updateGoalFocus,
+  updateGoalItem,
+};
+const extensionService = createExtensionService({
+  codexHome,
+  loadJsonSetting,
+  saveJsonSetting,
+  slugify,
+});
+const extensionRouteDeps = extensionService;
+const terminalCommandRuntime = createTerminalCommandRuntime({
+  managedChildEnv,
+  toTerminalPath,
+});
+const { formatShellCommandOutput, runShellCommand } = terminalCommandRuntime;
+const projectGitRuntime = createProjectGitRuntime({
+  appData,
+  db,
+  deletePreviewsForScope: (scopeType, scopeId) => deletePreviewsForScope(scopeType, scopeId),
+  ensureScratchSessionWorkspace,
+  managedChildEnv,
+  resolveSessionCwd,
+  resolveTerminalCwd,
+  saveAppData,
+  terminalRoot,
+  upsertProject,
+  upsertSession,
+  writeProjectWorkspaceMetadata,
+});
+const {
+  applyWorkspaceGitFileAction,
+  assertWorkspaceChangePath,
+  collectRoomWorkspaceChanges,
+  collectWorkspaceChanges,
+  collectWorkspaceChangesForCwd,
+  deleteProjectRecord,
+  ensureGitRepositoryForProject,
+  ensureGitRepositorySync,
+  hasGitCommand,
+  parseNumstat,
+  parseShortStatusLine,
+  readGitRemoteStatus,
+  readTextFileIfSmall,
+  refreshProjectGitStatus,
+  resolveWorkspaceChangeActionCwd,
+  runGitCommand,
+} = projectGitRuntime;
+const projectHistoryService = createProjectHistoryService({
+  db,
+  projectCheckRunFromRow,
+  projectGitOperationFromRow,
+  resolveTerminalCwd,
+  runGitSync: (cwd, args) => runGitSync(cwd, args),
+});
+const {
+  listProjectCheckRuns,
+  listProjectGitOperations,
+  projectGitArgs,
+  runProjectGitOperation,
+  saveProjectCheckRun,
+  saveProjectGitOperation,
+} = projectHistoryService;
+const projectRouteDeps = {
+  appData,
+  applyWorkspaceGitFileAction,
+  approvalAlwaysAllowed,
+  assertWorkspaceChangePath,
+  collectWorkspaceChangesForCwd,
+  createProjectDeleteApproval,
+  createProjectGitApproval,
+  defaultProjectWorkspacePath,
+  deleteProjectRecord,
+  ensureGitRepositoryForProject,
+  listProjectCheckRuns,
+  listProjectGitOperations,
+  getPreviews: () => previews,
+  projectGitArgs,
+  publicApproval,
+  refreshProjectGitStatus,
+  resolveTerminalCwd,
+  runGitCommand,
+  runProjectGitOperation,
+  runShellCommand,
+  saveAppData,
+  saveProjectCheckRun,
+  saveProjectGitOperation,
+  splitProjectCheckCommands,
+  uniqueProjectId,
+  upsertProject,
+  writeProjectWorkspaceMetadata,
+};
+const agentRoleTemplateService = createAgentRoleTemplateService(agentRoleTemplateDir);
+const {
+  listAgentRoleTemplates,
+  publicAgentRoleTemplate,
+} = agentRoleTemplateService;
+const agentRouteDeps = {
+  agentCanAccessProject,
+  agentCircleFromRow,
+  agentFromRow,
+  agentGroupFromRow,
+  agentPermissions,
+  agentRoleFromRow,
+  appData,
+  createAgentGroupFromCircle,
+  db,
+  getDefaultAgentPermissions: () => defaultAgentPermissions,
+  ensureScratchSessionWorkspace,
+  jsonArray,
+  listenMode,
+  listAgentCircles,
+  listAgentGroups,
+  listAgentRoleTemplates,
+  listAgentRoles,
+  listAgents,
+  markdownDescription,
+  markdownTitle,
+  normalizeProjectIds,
+  permissionProfileId,
+  getPermissionProfiles: () => permissionProfiles,
+  projectAccessMode,
+  publicAgentRoleTemplate,
+  replaceGroupMembers,
+  resolveAgentProject,
+  resolveTerminalCwd,
+  roleSourceType,
+  sessionFromRow,
+  slugify,
+  systemPromptWithRoleDescription,
+  upsertSession,
+  workspaceMode,
+};
+const sessionMessageRuntime = createSessionMessageRuntime({
+  db,
+  appData,
+  previews: () => previews,
+  discoverPreviewUrls: (session, value) => discoverPreviewUrls(session, value),
+  publicPreview: (preview) => publicPreview(preview),
+  forwardAssistantMessageToEmail: (session, message) => forwardAssistantMessageToEmail(session, message),
+  forwardAssistantMessageToTelegram: (session, message) => forwardAssistantMessageToTelegram(session, message),
+  feishuPlatform: () => feishuPlatform,
+  wecomPlatform: () => wecomPlatform,
+  qqPlatform: () => qqPlatform,
+  weixinPlatform: () => weixinPlatform,
+});
+const {
+  appendMessageCard,
+  appendSessionMessage,
+  appendUrlCardsForMessage,
+  deleteSessionMessages,
+  dismissMessageCard,
+  ensureSessionUrlCards,
+  getSessionMessage,
+  isMessageCardDismissed,
+  listSessionCards,
+  messageCardFromRow,
+  messageFromRow,
+  promptWithReplyContext,
+  syncRoomMessagesToSession,
+} = sessionMessageRuntime;
+const previewLogEventBus = createPreviewLogEventBus();
+const { publishPreviewLogEvent, subscribePreviewLogEvents } = previewLogEventBus;
+const previewRuntime = createPreviewRuntime({
+  db,
+  appendMessageCard,
+  appendPreviewLog: (previewId, value) => appendPreviewLog(previewId, value),
+  getPreviewAccessSettings: () => previewAccessSettings,
+  isMessageCardDismissed,
+  latestExecutionContextForSession: (sessionId) => latestExecutionContextForSession(sessionId),
+  previewAccess,
+  publishPreviewLogEvent,
+  resolveApproval,
+  stopPreviewProcess: (previewId) => stopPreviewProcess(previewId),
+});
+const {
+  deletePreview,
+  deletePreviewsForScope,
+  discoverPreviewUrls,
+  expirePreviewAccessRequests,
+  insertPreview,
+  loadPreviewAccessRequests,
+  loadPreviewLogs,
+  loadPreviews,
+  previewAccessRequestFromRow,
+  previewAccessRequests,
+  previewFromRow,
+  previewLogs,
+  previews,
+  previewUrl,
+  publicPreview,
+  shouldIgnoreDiscoveredPreviewUrl,
+  updatePreview,
+  upsertPreviewAccessRequest,
+} = previewRuntime;
+const previewAccessService = createPreviewAccessService({
+  createApproval,
+  expirePreviewAccessRequests,
+  getBearerToken,
+  parseCookieHeader,
+  previewAccessRequests,
+  previewUrl,
+  sessionCookieName,
+  signPreviewAccessToken,
+  upsertPreviewAccessRequest,
+  verifyPreviewAccessToken,
+  verifySessionToken,
+});
+const {
+  createPreviewAccessRequest,
+  getPreviewAccessRequest,
+  previewAccessCookie,
+  privatePreviewAccessResponse,
+  requestHasPreviewAccess,
+} = previewAccessService;
+const databaseRecordDeletionService = createDatabaseRecordDeletionService({
+  db,
+  deletePreviewsForScope,
+  deleteSessionMessages,
+});
+const { deleteRoomDatabaseRows, deleteSessionDatabaseRows } = databaseRecordDeletionService;
+const taskLogRuntime = createTaskLogRuntime({
+  db,
+  readTaskLogContent: (sessionId) => readTaskLogContent(sessionId),
+  sessionLogsPath,
+  taskLogDir,
+});
+const {
+  legacyTaskLogPath,
+  legacyTaskMetaPath,
+  readRoomTaskLogContent,
+  roomAgentRunLogSources,
+  taskLogPath,
+  taskMetaPath,
+} = taskLogRuntime;
+const sessionDeletionService = createSessionDeletionService({
+  dataDir,
+  deleteFileMountsForRoot,
+  legacyTaskLogPath,
+  legacyTaskMetaPath,
+  pathWithinRoot,
+  roomWorkspaceDataPath,
+  sessionContextPath,
+  sessionDataPath,
+  sessionWorkspaceRoot,
+  taskLogPath,
+  taskMetaPath,
+});
+const { deleteSessionData } = sessionDeletionService;
+const sessionCompactionRuntime = createSessionCompactionRuntime({
+  allSessionMessages,
+  appendCodexErrorOutput: (session, value) => appendCodexErrorOutput(session, value),
+  appData,
+  db,
+  getSessionCompactionSettings: () => sessionCompactionSettings,
+  joinUrl,
+  publishTaskEvent: (sessionId, event) => publishTaskEvent(sessionId, event),
+  recordTaskActivity: (sessionId, activity) => recordTaskActivity(sessionId, activity),
+  sessionMemoryPath,
+});
+const {
+  createSessionCompaction,
+  latestSessionCompaction,
+  latestSessionMemoryMarkdown,
+  listSessionCompactions,
+  messagesAfterCompaction,
+  restoreSessionCompaction,
+  scheduleSessionAutoCompaction,
+  sessionCompactionFromRow,
+  sessionCompactionPrompt,
+  shouldAutoCompactSession,
+  updateLatestSessionCompaction,
+} = sessionCompactionRuntime;
+const previewProcessRuntime = createPreviewProcessRuntime({
+  apiPort,
+  appData,
+  db,
+  host,
+  managedChildEnv,
+  previewLogs,
+  previews,
+  previewUrl,
+  publishPreviewLogEvent,
+  toTerminalPath,
+  updatePreview,
+});
+const {
+  appendPreviewLog,
+  isPreviewReachable,
+  previewFromReferer,
+  previewProcessGroups,
+  previewProcesses,
+  previewScopeWorkspace,
+  previewUpstreamPathFromUrl,
+  previewUsingPort,
+  resolvePreviewCwd,
+  rewritePreviewCss,
+  rewritePreviewHtml,
+  rewritePreviewLocation,
+  rewritePreviewText,
+  settlePreviewProcessExit,
+  startPreviewProcess,
+  stopPreviewProcess,
+  validPreviewHost,
+  waitForPreviewReady,
+} = previewProcessRuntime;
+const roomRuntimeService = createRoomRuntimeService({
+  agentFromRow,
+  agentPermissionsForRun: resolvedAgentPermissions,
+  agentGroupFromRow,
+  agentRoleFromRow,
+  agentRunFromRow,
+  allSessionMessages,
+  appendCodexOutput: (sessionId: string, value: string) => appendCodexOutput(sessionId, value),
+  appendMessageCard,
+  appData,
+  appendSessionMessage,
+  createRoomArtifact,
+  createGoalItem,
+  createRoomDecision,
+  db,
+  deleteSessionMessages,
+  directAgentForSession,
+  ensureRoomRunWorkspace,
+  ensureScratchSessionWorkspace,
+  executionContextFromRow,
+  finishTaskRun,
+  finishTaskRunById,
+  goalFromRow,
+  getCodexTaskStopRequested: () => codexTaskStopRequested,
+  getDefaultAgentPermissions: () => defaultAgentPermissions,
+  groupContextForRoom,
+  jsonPayload,
+  latestRunningTaskRun,
+  markTaskRunStopRequested,
+  managedChildEnv,
+  messageFromRow,
+  orchestrateRoom,
+  publishTaskEvent: (sessionId: string, event: TaskEvent) => publishTaskEvent(sessionId, event),
+  publicApproval,
+  readCodexOutput,
+  readRoomAgentThread,
+  recentRoomContext,
+  resolveAgentProject,
+  resolveTerminalCwd,
+  roomAgentsWithListenModes,
+  roomEvent,
+  roomFromRow,
+  roomTaskFromRow,
+  saveAppData,
+  saveProjectCheckRun,
+  scheduleSessionAutoCompaction,
+  splitProjectCheckCommands,
+  startCodexTask,
+  taskLogPath,
+  toTerminalPath,
+  updateGoalItem,
+  upsertSession,
+});
+const {
+  agentPermissionsForRun,
+  applyRoomRunMerge,
+  finishAgentRun,
+  latestExecutionContextForSession,
+  mentionsRoomUser,
+  roomGroupForRoom,
+  roomProject,
+  roomTaskShouldNotifyUser,
+  runGitSync,
+  setRoomParentSessionStatus,
+  startRoomTaskRun,
+  stopOrphanRoomAgentRun,
+} = roomRuntimeService;
+const automationRuntime = createAutomationRuntime({
+  appData,
+  appendSessionMessage,
+  automationCommandTimeoutSeconds,
+  automationHasRunningRun,
+  buildAutomationNotificationMessage,
+  createAutomationRun,
+  db,
+  emitExternalNotification,
+  ensureScratchSessionWorkspace,
+  finishAutomationRun,
+  formatShellCommandOutput,
+  publishTaskEvent: (sessionId: string, event: TaskEvent) => publishTaskEvent(sessionId, event),
+  resolveTerminalCwd,
+  roomEvent,
+  runLoggedShellCommand,
+  sanitizeAutomationOverlapPolicy,
+  sanitizeAutomationRetryDelayMinutes,
+  sanitizeAutomationRetryMax,
+  saveAppData,
+  shouldRunAutomationNow,
+  startCodexTask,
+  startRoomTaskRun,
+  upsertSession,
+});
+const {
+  automationForSession,
+  automationIdForSession,
+  checkDueRoomSchedules,
+  checkScheduledAutomations,
+  checkScheduledWork,
+  consecutiveAutomationFailures,
+  emitAutomationCommandNotification,
+  ensureAutomationSession,
+  latestAutomationSession,
+  linkAutomationSession,
+  queueAutomationRun,
+  runAutomationNow,
+  runStartupAutomations,
+  scheduleAutomationRetry,
+  sessionHasExistingAutomationOwner,
+  sessionVisibleInChatTools,
+  skipAutomationRun,
+  startDueQueuedAutomationRuns,
+  startNextQueuedAutomationRun,
+} = automationRuntime;
+const roomRouteDeps = {
+  agentCircleFromRow,
+  agentGroupFromRow,
+  agentPermissionsForRun,
+  agentRunFromRow,
+  appData,
+  appendMessageCard,
+  appendSessionMessage,
+  applyRoomRunMerge,
+  approvalAlwaysAllowed,
+  autoListenAgentsForRoomMessage,
+  getCodexTaskProcesses: () => codexTaskProcesses,
+  getCodexTaskStopRequested: () => codexTaskStopRequested,
+  createAgentGroupFromCircle,
+  createGoal,
+  createRoomArtifact,
+  createRoomDecision,
+  createRoomHandoff,
+  createRoomRunMergeApproval,
+  db,
+  ensureScratchSessionWorkspace,
+  insertRoomTask,
+  isProcessAlive,
+  listenMode,
+  listRooms,
+  markTaskRunStopRequested,
+  mentionedRoomAgents,
+  mentionsRoomUser,
+  messageWithAttachments,
+  orchestrateRoom,
+  promptWithAttachments,
+  publicApproval,
+  resolveTerminalCwd,
+  roomAgentsWithListenModes,
+  roomArtifactFromRow,
+  roomDecisionFromRow,
+  roomEvent,
+  roomEventFromRow,
+  roomFromRow,
+  roomGroupForRoom,
+  roomHandoffFromRow,
+  roomHandoffStatus,
+  roomOrchestrationSettings,
+  roomProject,
+  roomScheduleFromRow,
+  roomStatus,
+  roomTaskFromRow,
+  runGitSync,
+  saveSessionAttachments,
+  startRoomTaskRun,
+  stopOrphanRoomAgentRun,
+  upsertSession,
+  updateGoalItem,
+};
+const taskRouteDeps = {
+  allSessionMessages,
+  appendCodexErrorOutput,
+  appendSessionMessage,
+  applyWorkspaceGitFileAction,
+  appData,
+  assertWorkspaceChangePath,
+  backfillRoomActivitiesFromAgentLogs,
+  backfillSessionFromTaskLog,
+  backfillTaskActivitiesFromLog,
+  clearCodexTaskRuntime,
+  collectWorkspaceChanges,
+  collectWorkspaceChangesForCwd,
+  conversationType,
+  createGoal,
+  createNotificationEphemeralRule,
+  createSessionCompaction,
+  db,
+  deletePreview,
+  deleteQueuedMessage,
+  deleteRoomDatabaseRows,
+  deleteSessionData,
+  deleteSessionDatabaseRows,
+  deleteSessionMessages,
+  dismissMessageCard,
+  enqueueMessage,
+  ensureScratchSessionWorkspace,
+  executionContextFromRow,
+  getCodexTaskProcesses: () => codexTaskProcesses,
+  getCodexTaskStopRequested: () => codexTaskStopRequested,
+  getPreviews: () => previews,
+  isProcessAlive,
+  latestRunningTaskRun,
+  latestSessionCompaction,
+  listQueuedMessages,
+  listRoomTaskContextFiles,
+  listSessionCards,
+  listSessionCompactions,
+  listSessionMessages,
+  listTaskActivities,
+  listTaskContextFiles,
+  listTaskRuns,
+  listTaskRunsForSession,
+  markTaskRunStopRequested,
+  messageWithAttachments,
+  promptForDirectAgentSession,
+  promptWithAttachments,
+  promptWithReplyContext,
+  publicPreview,
+  readCodexOutput,
+  readRoomTaskContextFile,
+  readRoomTaskLogContent,
+  readTaskContextFile,
+  readTaskErrorSummary,
+  getReadTaskLogContent: () => readTaskLogContent,
+  reorderQueuedMessages,
+  resolveSessionCwd,
+  resolveTerminalCwd,
+  resolveWorkspaceChangeActionCwd,
+  restoreCodexSessionIdFromLog,
+  restoreSessionCompaction,
+  runGitCommand,
+  saveAppData,
+  saveSessionAttachments,
+  sessionAttachmentsPath,
+  sessionHasExistingAutomationOwner,
+  startCodexTask,
+  updateLatestSessionCompaction,
+  updateQueuedMessage,
+  upsertSession,
+  writeSessionMetadata,
+};
+const settingsRouteDeps = {
+  appData,
+  applyCodexRuntimeSettings,
+  applyRoomRunMerge,
+  archiveExcluder,
+  archiveApproval,
+  backupTimestamp,
+  cleanupDatabaseRedundancy,
+  codexRuntimeSettings,
+  codexRuntimeDetails,
+  codexRuntimeRisk,
+  createApproval,
+  createRoomDecision,
+  createSystemBackupArchive,
+  createZipArchive,
+  createZipArchiveWithEntries,
+  dataDir,
+  db,
+  deleteProjectRecord,
+  dirname,
+  emitExternalNotification,
+  expirePreviewAccessRequests,
+  getApproval,
+  getCodexRuntimeSettings: () => codexRuntimeSettings,
+  getNotificationTestSettings: () => notificationTestSettings,
+  getPreviewAccessRequests: () => previewAccessRequests,
+  getPreviewAccessSettings: () => previewAccessSettings,
+  getRateLimitSettings: () => rateLimitSettings,
+  getSessionCompactionSettings: () => sessionCompactionSettings,
+  getSystemBackupSettings: () => systemBackupSettings,
+  join,
+  listApprovalGrants,
+  listApprovals,
+  listArchiveIgnoreTemplates,
+  listTaskHealth,
+  mkdirSync,
+  getAppNotificationRouteDeps: () => appNotificationRouteDeps,
+  getEnvironmentRouteDeps: () => environmentRouteDeps,
+  getNotificationBaseRouteDeps: () => notificationBaseRouteDeps,
+  getStorageRouteDeps: () => storageRouteDeps,
+  getWebhookRouteDeps: () => webhookRouteDeps,
+  parseStoredZipArchive,
+  previewZipArchive,
+  publicApproval,
+  publicPreview,
+  readBackupUpload,
+  readSystemBackupArchive,
+  rateLimitStore,
+  registerAppNotificationRoutes,
+  registerEnvironmentRoutes,
+  registerNotificationAccountRoutes,
+  registerNotificationBaseRoutes,
+  registerNotificationRecipientRoutes,
+  registerNotificationRuleRoutes,
+  registerStorageRoutes,
+  registerWebhookRoutes,
+  repairTaskHealth,
+  restoreApproval,
+  resolveApproval,
+  runtimeSettingsStore,
+  runProjectGitOperation,
+  sanitizeNotificationTestSettings,
+  sanitizeSystemBackupSettings,
+  saveApprovalGrant,
+  saveNotificationTestSettings,
+  saveSystemBackupSettings,
+  setCodexRuntimeSettings: (next: CodexRuntimeSettings) => {
+    codexRuntimeSettings = next;
+  },
+  setNotificationTestSettings: (next: NotificationTestSettings) => {
+    notificationTestSettings = next;
+  },
+  setPreviewAccessSettings: (next: PreviewAccessSettings) => {
+    previewAccessSettings = next;
+  },
+  setRateLimitSettings: (next: RateLimitSettings) => {
+    rateLimitSettings = next;
+  },
+  setSessionCompactionSettings: (next: SessionCompactionSettings) => {
+    sessionCompactionSettings = next;
+  },
+  setSystemBackupSettings: (next: SystemBackupSettings) => {
+    systemBackupSettings = next;
+  },
+  approvalAlwaysAllowed,
+  pathWithinRoot,
+  getPreviews: () => previews,
+  rmSync,
+  systemBackupPreviewFromArchive,
+  startPreviewProcess,
+  updatePreview,
+  upsertPreviewAccessRequest,
+  writeFileSync,
+};
+const serverRouteDeps = {
+  allSessionMessages,
+  appData,
+  appNotificationRouteDeps,
+  authRouteDeps,
+  createPreviewAccessRequest,
+  decrementProviderProxyConcurrency,
+  expirePreviewAccessRequests,
+  getBearerToken,
+  getPreviews: () => previews,
+  getPreviewAccessRequest,
+  getProviderProxyConcurrency,
+  getRateLimitSettings: () => rateLimitSettings,
+  incrementProviderProxyConcurrency,
+  listQueuedMessages,
+  previewAccessCookie,
+  previewFromReferer,
+  getPreviewRouteDeps: () => previewRouteDeps,
+  previewUpstreamPathFromUrl,
+  previewUrl,
+  privatePreviewAccessResponse,
+  proxyPreviewHttpRequest,
+  proxyResponsesToChatCompletions,
+  proxyResponsesToResponses,
+  readCodexOutput,
+  registerAppNotificationStreamRoute,
+  registerPreviewLogStreamRoute,
+  registerPublicAuthRoutes,
+  requestHasPreviewAccess,
+  roomActivitySnapshot,
+  subscribeRoomEvents,
+  getSubscribeTaskEvents: () => subscribeTaskEvents,
+  verifyProviderProxyToken,
+  verifySessionToken,
+};
+const providerRouteDeps = {
+  appData,
+  clearProviderModelCache,
+  db,
+  detectProviderInterface,
+  discoverProviderModels,
+  emitExternalNotification,
+  mergeProviderCapabilities,
+  providerHealthCheckFromRow,
+  publicProvider,
+  readProviderModelCache,
+  recordProviderHealthCheck,
+  sanitizeProviderRpmLimit,
+  saveAppData,
+  saveProviderModelCache,
+  slugify,
+  testProvider,
+};
+setRoomStoreDeps({
+  db,
+  activeGoalForOwner,
+  allSessionMessages,
+});
+setGoalStoreDeps({
+  db,
+  findSessionById: (sessionId) => appData.sessions.find((item) => item.id === sessionId),
+});
+const terminalRuntime = createTerminalRuntime({
+  db,
+  managedChildEnv,
+  resolveTerminalCwd,
+  toTerminalPath,
+});
+const {
+  closePersistedRunningTerminals,
+  createTerminalSession,
+  deletedTerminalSessionIds,
+  deleteTerminalSessionRecord,
+  listTerminalSessionSummaries,
+  markTerminalClosed,
+  resolveShellPath,
+  terminalSessionFromRow,
+  terminalSessions,
+  terminalSummary,
+  upsertTerminalSession,
+} = terminalRuntime;
+setSessionMessageDeps({
+  db,
+  messageFromRow,
+  findSessionById: (sessionId) => appData.sessions.find((item) => item.id === sessionId),
+  syncRoomMessagesToSession,
+});
 const emailPlatform = createEmailPlatform({
   db,
   sessions: appData.sessions,
@@ -463,49 +1818,173 @@ const weixinPlatform = createWeixinPlatform({
   telegramSessionLabel,
   telegramGroupedSessionText,
 });
+setNotificationStoreDeps({
+  db,
+  builtinNotificationChannels: notificationChannels,
+  listNotificationAccounts,
+});
+setAutomationStoreDeps({ db });
+
+startEmailPlatform();
+feishuPlatform.start();
+wecomPlatform.start();
+qqPlatform.start();
+weixinPlatform.start();
+startTelegramPlatform();
+
 pruneCodexSessionProjectTrustEntries();
+setEnvironmentStoreDeps({
+  appProjects: appData.projects,
+  commandVersion,
+  loadJsonSetting,
+  managedChildEnv,
+  resolveMiseCommand,
+  resolveTerminalCwd,
+  saveJsonSetting,
+});
 let environmentOverview = buildEnvironmentOverview();
 migrateRoomAgentSessionDataRoots();
 migrateRoomWorkspaceRoots();
 const fileMounts = new Map<string, FileMountRecord>();
+const fileRouteDeps = {
+  archiveIgnoreTemplateDir,
+  createZipArchive,
+  deleteFileMount,
+  fileMounts,
+  listArchiveIgnoreTemplates,
+  normalizeMountPath,
+  previewZipArchive,
+  resolveFileRequestMount,
+  resolveInsideMount,
+  slugify,
+  toFileEntry,
+  toRelativePath,
+  upsertFileMount,
+};
+const storageRouteDeps = {
+  deleteStorageItem,
+  listStorageItems,
+};
+const previewRouteDeps = {
+  appData,
+  approvalAlwaysAllowed,
+  createPreviewApproval,
+  deletePreview,
+  getBearerToken,
+  insertPreview,
+  previewAccess,
+  previewAccessCookie,
+  previewCommandRisk,
+  previewLogs,
+  previews,
+  previewUrl,
+  previewUsingPort,
+  publicApproval,
+  publicPreview,
+  startPreviewProcess,
+  stopPreviewProcess,
+  subscribePreviewLogEvents,
+  updatePreview,
+  validPreviewHost,
+  verifySessionToken,
+};
+setFileStoreDeps({
+  db,
+  appData,
+  previews,
+  previewLogs,
+  fileMounts,
+  workspaceRoot,
+  dataDir,
+  internalProjectWorkspaceRoot,
+  sessionWorkspaceRoot,
+  taskLogDir,
+  projectWorkspaceMetadataFile,
+  resolveTerminalCwd,
+  legacyTaskLogPath,
+  legacyTaskMetaPath,
+  deleteSessionDatabaseRows,
+});
 loadFileMounts();
-const previews = new Map<string, PreviewRecord>();
-const previewLogs = new Map<string, string>();
 loadPreviews();
 loadPreviewLogs();
-const previewProcesses = new Map<string, ChildProcess>();
-const previewProcessGroups = new Map<string, number>();
-type PreviewLogEvent =
-  | { type: "snapshot"; preview: PreviewSummary; logs: string }
-  | { type: "log"; previewId: string; chunk: string; at: string }
-  | { type: "status"; preview: PreviewSummary };
-const previewLogSubscribers = new Map<string, Set<(event: PreviewLogEvent) => void>>();
-type PreviewAccessRequest = {
-  id: string;
-  previewId: string;
-  secret: string;
-  status: "pending" | "approved" | "denied";
-  approvedUntil?: string | null;
-  createdAt: string;
-  updatedAt: string;
+const terminalRouteDeps = {
+  appData,
+  createTerminalSession,
+  db,
+  deletedTerminalSessionIds,
+  deleteTerminalSessionRecord,
+  listTerminalSessionSummaries,
+  resolveTerminalCwd,
+  runLoggedShellCommand,
+  runShellCommand,
+  terminalDefaultCwd,
+  terminalSessionFromRow,
+  terminalSessions,
+  terminalSummary,
+  upsertTerminalSession,
 };
-const previewAccessRequests = new Map<string, PreviewAccessRequest>();
-loadPreviewAccessRequests();
-
-const terminalSessions = new Map<string, TerminalRuntime>();
-const deletedTerminalSessionIds = new Set<string>();
 const codexTaskOutputs = new Map<string, { output: string; exitCode: number | null }>();
 const codexTaskProcesses = new Map<string, ChildProcess>();
 const codexTaskStopRequested = new Set<string>();
 const shellTaskProcesses = new Map<string, ChildProcess>();
 const shellTaskStopRequested = new Set<string>();
+const automationRouteDeps = {
+  appendCodexErrorOutput,
+  appendSessionMessage,
+  appData,
+  clearCodexTaskRuntime,
+  codexTaskProcesses,
+  codexTaskStopRequested,
+  db,
+  deleteSessionData,
+  deleteSessionDatabaseRows,
+  finishAutomationRun,
+  isProcessAlive,
+  latestAutomationSession,
+  runAutomationNow,
+  saveAppData,
+  shellTaskProcesses,
+  shellTaskStopRequested,
+  upsertAutomation,
+  upsertSession,
+};
 const codexTaskStdoutBuffers = new Map<string, string>();
 const codexTaskLogOffsets = new Map<string, number>();
 const codexTaskTailers = new Map<string, NodeJS.Timeout>();
 const finalizedRecoveredTasks = new Set<string>();
-const codexTaskSubscribers = new Map<string, Set<(event: TaskEvent) => void>>();
 const roomEventSubscribers = new Map<string, Set<(event: RoomStreamEvent) => void>>();
-const appNotificationSubscribers = new Set<(event: AppNotificationStreamEvent) => void>();
+const { publishTaskEvent, subscribeTaskEvents } = createTaskEventBus({
+  recordTaskActivity: (sessionId, activity) => recordTaskActivity(sessionId, activity),
+});
+setSessionQueueDeps({
+  db,
+  publishTaskEvent,
+});
+const {
+  readTaskLogContent,
+  appendCodexOutput,
+  readTaskExitCode,
+  readTaskMeta,
+  writeTaskExitCode,
+  taskLogBytes,
+} = createTaskStorage({
+  sessionLogsPath,
+  taskLogPath,
+  legacyTaskLogPath,
+  taskMetaPath,
+  legacyTaskMetaPath,
+});
+setTaskRunStoreDeps({
+  db,
+  findSessionById: (sessionId) => appData.sessions.find((item) => item.id === sessionId),
+  isProcessAlive,
+  parsePageLimit,
+  decodePageCursor,
+  pageFromRows,
+  readTaskMeta,
+  taskLogBytes,
+});
 pauseStaleRunningSessions();
 recoverInterruptedRoomAgentRunsFromLogs();
 closePersistedRunningTerminals();
@@ -1394,1534 +2873,6 @@ function openDatabase() {
   return database;
 }
 
-function seedMultiAgentDefaults() {
-  const now = new Date().toISOString();
-  const storyToMovieRules = [
-    "This circle turns a user's short idea, prompt, or story seed into a complete movie production package.",
-    "The current system does not export a final video file by default, but the room must still design the full movie package: story, screenplay, scene list, shot list, storyboard images, character visuals, voiceover, dialogue, music, sound effects, editing plan, image prompts, video prompts, and an HTML preview page.",
-    "The Film Producer is the orchestrator. It owns the canonical version, assigns work, prevents conflicting rewrites, and merges final deliverables.",
-    "The Screenwriter develops the story, characters, structure, scenes, dialogue, and voiceover.",
-    "The Storyboard Director converts scenes into shots and storyboard panels.",
-    "The Visual Development Director and Character Concept Artist define a stable visual language and consistent character appearances before storyboard generation.",
-    "The Storyboard Image Prompt Engineer creates reusable prompts for character concept images and storyboard panels, preserving character identity and style.",
-    "The Voice Music Sound Director designs narration, performance notes, music direction, ambient sound, and sound effects.",
-    "The Editing Director plans pacing, shot duration, transitions, and trailer structure.",
-    "The Production Quality Reviewer checks continuity, missing deliverables, prompt consistency, and audio/editing alignment.",
-    "Default files should be organized under a movie package folder with numbered Markdown documents, a storyboard image folder, and index.html.",
-  ].join("\n");
-  const developmentRules = [
-    "This circle turns product ideas, bug reports, refactor requests, and technical goals into working software changes.",
-    "The Software Architect is the orchestrator. It clarifies scope, chooses the implementation strategy, splits work, protects boundaries, and owns the final integration plan.",
-    "The Product Manager sharpens requirements, success criteria, user impact, edge cases, and release scope before implementation expands.",
-    "The Frontend Developer owns UI, client state, accessibility, responsive behavior, and frontend performance.",
-    "The Backend Architect owns APIs, services, data flow, persistence boundaries, and server-side reliability.",
-    "The Database Optimizer owns schema design, migrations, indexing, query performance, and data integrity.",
-    "The DevOps Automator owns local/dev/prod scripts, CI, deployment, environment variables, runtime checks, and preview commands.",
-    "The API Tester owns endpoint validation, contract tests, integration coverage, and regression evidence.",
-    "The Code Reviewer checks correctness, maintainability, regressions, and missing tests before handoff.",
-    "The Security Engineer checks auth, permissions, secrets, injection risks, unsafe file access, and deployment-sensitive behavior.",
-    "The Technical Writer updates developer-facing docs, runbooks, API notes, and migration notes when behavior changes.",
-    "Default handoff should include changed files, verification commands, risks, and next actions. Prefer focused implementation over speculative rewrites.",
-  ].join("\n");
-  const circles: Array<Pick<AgentCircleSummary, "id" | "name" | "description"> & Partial<Pick<AgentCircleSummary, "collaborationRules" | "eventRoutingRules" | "maxConcurrentAgents" | "approvalPolicy" | "mergeStrategy">>> = [
-    {
-      id: "circle-story-to-movie-studio",
-      name: "故事到电影工作室",
-      description: "把一句话或故事设定扩展为完整电影制作包，包括剧本、分镜、角色形象、故事板图片、配音、配乐、音效、剪辑方案和预览页面。",
-      collaborationRules: storyToMovieRules,
-      eventRoutingRules: "User ideas should first route to the Film Producer. Story, screenplay, and dialogue route to the Screenwriter. Shot planning routes to the Storyboard Director. Character and visual consistency route to the Visual Development Director and Character Concept Artist. Image/storyboard prompts route to the Storyboard Image Prompt Engineer. Voice, music, and sound route to the Voice Music Sound Director. Pacing and assembly route to the Editing Director. Final checks route to the Production Quality Reviewer.",
-      maxConcurrentAgents: 4,
-      approvalPolicy: "bounded",
-      mergeStrategy: "approval-required",
-    },
-    {
-      id: "circle-software-development-studio",
-      name: "软件开发工作室",
-      description: "面向前后端、API、数据库、测试、部署、安全和文档的通用程序开发协作圈子。",
-      collaborationRules: developmentRules,
-      eventRoutingRules: "New work should first route to the Software Architect. Ambiguous product scope routes to the Product Manager. UI and interaction work routes to the Frontend Developer. API, service, and persistence work route to the Backend Architect and Database Optimizer. Build, deployment, preview, and environment work routes to the DevOps Automator. Endpoint validation routes to the API Tester. Final correctness and maintainability review routes to the Code Reviewer. Auth, permission, secret, and unsafe filesystem/network concerns route to the Security Engineer. Documentation or handoff gaps route to the Technical Writer.",
-      maxConcurrentAgents: 4,
-      approvalPolicy: "bounded",
-      mergeStrategy: "approval-required",
-    },
-  ];
-  const seededCircleIds = circles.map((circle) => circle.id);
-  const circlePlaceholders = seededCircleIds.map(() => "?").join(",");
-  db.prepare(`delete from agent_circle_roles where circle_id in (select id from agent_circles where builtin = 1 and id not in (${circlePlaceholders}))`).run(...seededCircleIds);
-  db.prepare(`delete from agent_circles where builtin = 1 and id not in (${circlePlaceholders})`).run(...seededCircleIds);
-  db.prepare(`delete from agent_circle_roles where circle_id in (${circlePlaceholders})`).run(...seededCircleIds);
-  const insert = db.prepare(`
-    insert into agent_circles (id, name, description, group_template_id, collaboration_rules, event_routing_rules, max_concurrent_agents, approval_policy, merge_strategy, builtin, created_at, updated_at)
-    values (?, ?, ?, null, ?, ?, ?, ?, ?, 1, ?, ?)
-    on conflict(id) do update set
-      name = excluded.name,
-      description = excluded.description,
-      collaboration_rules = excluded.collaboration_rules,
-      event_routing_rules = excluded.event_routing_rules,
-      max_concurrent_agents = excluded.max_concurrent_agents,
-      approval_policy = excluded.approval_policy,
-      merge_strategy = excluded.merge_strategy,
-      builtin = 1,
-      updated_at = excluded.updated_at
-  `);
-  for (const circle of circles) {
-    insert.run(
-      circle.id,
-      circle.name,
-      circle.description ?? null,
-      circle.collaborationRules ?? "",
-      circle.eventRoutingRules ?? "",
-      circle.maxConcurrentAgents ?? 3,
-      circle.approvalPolicy ?? "bounded",
-      circle.mergeStrategy ?? "approval-required",
-      now,
-      now,
-    );
-  }
-
-  const storyToMovieRoles = [
-    { id: "role-story-to-movie-film-producer", path: "story-to-movie/film-producer.md", listenMode: "orchestrator" },
-    { id: "role-story-to-movie-screenwriter", path: "story-to-movie/screenwriter.md", listenMode: "active" },
-    { id: "role-story-to-movie-storyboard-director", path: "story-to-movie/storyboard-director.md", listenMode: "passive" },
-    { id: "role-story-to-movie-visual-development-director", path: "story-to-movie/visual-development-director.md", listenMode: "passive" },
-    { id: "role-story-to-movie-character-concept-artist", path: "story-to-movie/character-concept-artist.md", listenMode: "passive" },
-    { id: "role-story-to-movie-image-prompt-engineer", path: "story-to-movie/storyboard-image-prompt-engineer.md", listenMode: "passive" },
-    { id: "role-story-to-movie-voice-music-sound-director", path: "story-to-movie/voice-music-sound-director.md", listenMode: "passive" },
-    { id: "role-story-to-movie-editing-director", path: "story-to-movie/editing-director.md", listenMode: "passive" },
-    { id: "role-story-to-movie-production-quality-reviewer", path: "story-to-movie/production-quality-reviewer.md", listenMode: "passive" },
-  ] satisfies Array<{ id: string; path: string; listenMode: AgentListenMode }>;
-  const developmentRoles = [
-    { id: "role-dev-software-architect", path: "agency-agents/engineering/engineering-software-architect.md", listenMode: "orchestrator" },
-    { id: "role-dev-product-manager", path: "agency-agents/product/product-manager.md", listenMode: "active" },
-    { id: "role-dev-frontend-developer", path: "agency-agents/engineering/engineering-frontend-developer.md", listenMode: "active" },
-    { id: "role-dev-backend-architect", path: "agency-agents/engineering/engineering-backend-architect.md", listenMode: "active" },
-    { id: "role-dev-database-optimizer", path: "agency-agents/engineering/engineering-database-optimizer.md", listenMode: "passive" },
-    { id: "role-dev-devops-automator", path: "agency-agents/engineering/engineering-devops-automator.md", listenMode: "passive" },
-    { id: "role-dev-api-tester", path: "agency-agents/testing/testing-api-tester.md", listenMode: "passive" },
-    { id: "role-dev-code-reviewer", path: "agency-agents/engineering/engineering-code-reviewer.md", listenMode: "passive" },
-    { id: "role-dev-security-engineer", path: "agency-agents/engineering/engineering-security-engineer.md", listenMode: "passive" },
-    { id: "role-dev-technical-writer", path: "agency-agents/engineering/engineering-technical-writer.md", listenMode: "passive" },
-  ] satisfies Array<{ id: string; path: string; listenMode: AgentListenMode }>;
-  const insertRole = db.prepare(`
-    insert into agent_roles (id, name, description, source_type, source_path, source_url, markdown_content, system_prompt, capabilities, default_listen_mode, default_listen_events, default_workspace_mode, default_sandbox_mode, default_approval_policy, output_contract, safety_notes, created_at, updated_at)
-    values (?, ?, ?, 'builtin-template', ?, null, ?, ?, '[]', ?, '[]', 'isolated-worktree-with-shared-room', null, null, ?, ?, ?, ?)
-    on conflict(id) do update set
-      name = excluded.name,
-      description = excluded.description,
-      source_type = excluded.source_type,
-      source_path = excluded.source_path,
-      markdown_content = excluded.markdown_content,
-      system_prompt = excluded.system_prompt,
-      default_listen_mode = excluded.default_listen_mode,
-      default_workspace_mode = excluded.default_workspace_mode,
-      output_contract = excluded.output_contract,
-      safety_notes = excluded.safety_notes,
-      updated_at = excluded.updated_at
-  `);
-  const insertCircleRole = db.prepare("insert or replace into agent_circle_roles (circle_id, role_id, position) values (?, ?, ?)");
-  function seedCircleRoles(circleId: string, roles: Array<{ id: string; path: string; listenMode: AgentListenMode }>, outputContract: string, safetyNotes: string) {
-    for (const [position, role] of roles.entries()) {
-      const templatePath = join(agentRoleTemplateDir, role.path);
-      if (!existsSync(templatePath)) continue;
-      const markdownContent = readFileSync(templatePath, "utf8");
-      const metadata = parseMarkdownFrontmatter(markdownContent);
-      const name = metadata.name || markdownTitle(markdownContent) || role.id;
-      const description = metadata.description || markdownDescription(markdownContent);
-      insertRole.run(role.id, name, description, role.path, markdownContent, markdownContent, role.listenMode, outputContract, safetyNotes, now, now);
-      insertCircleRole.run(circleId, role.id, position);
-    }
-  }
-  seedCircleRoles(
-    "circle-story-to-movie-studio",
-    storyToMovieRoles,
-    "Return Markdown artifacts suitable for a complete movie production package. When creating files, keep them under the related session or project workspace.",
-    "Do not claim that a final video file was generated unless an actual video generation tool is available and used. Avoid copyrighted song requirements; describe musical qualities instead.",
-  );
-  seedCircleRoles(
-    "circle-software-development-studio",
-    developmentRoles,
-    "Return focused implementation plans, code changes, tests, review notes, and documentation updates suitable for software delivery. When creating files, keep them under the related project or session workspace.",
-    "Respect project boundaries, secrets, permissions, and approval settings. Do not run destructive commands or expose credentials. Prefer small verified changes with clear rollback notes.",
-  );
-}
-
-function loadAuthConfig(): AuthConfig | null {
-  const row = db.prepare("select access_token_hash, otp_secret from auth_config where id = 'local-admin'").get() as
-    | { access_token_hash: string; otp_secret: string }
-    | undefined;
-  return row ? { accessTokenHash: row.access_token_hash, otpSecret: row.otp_secret } : null;
-}
-
-function saveAuthConfig(config: AuthConfig) {
-  db.prepare(`
-    insert into auth_config (id, access_token_hash, otp_secret, updated_at)
-    values ('local-admin', ?, ?, ?)
-    on conflict(id) do update set
-      access_token_hash = excluded.access_token_hash,
-      otp_secret = excluded.otp_secret,
-      updated_at = excluded.updated_at
-  `).run(config.accessTokenHash, config.otpSecret, new Date().toISOString());
-}
-
-type ApiKeyRecord = {
-  id: string;
-  name: string;
-  keyHash: string;
-  keyPreview: string;
-  permissions: ApiKeyPermission[];
-  lastUsedAt: string | null;
-  revokedAt: string | null;
-  createdAt: string;
-  updatedAt: string;
-};
-
-type AuthPrincipal =
-  | { type: "session"; userId: string }
-  | { type: "api_key"; key: ApiKeyRecord };
-
-const apiKeyPermissionGroups: ApiKeyPermissionGroup[] = [
-  { id: "sessions", label: "Sessions", permissions: [{ id: "sessions.read", label: "Read" }, { id: "sessions.manage", label: "Manage" }, { id: "sessions.run", label: "Run" }] },
-  { id: "rooms", label: "Rooms", permissions: [{ id: "rooms.read", label: "Read" }, { id: "rooms.manage", label: "Manage" }, { id: "rooms.run", label: "Run" }] },
-  { id: "agents", label: "Agents", permissions: [{ id: "agents.read", label: "Read" }, { id: "agents.manage", label: "Manage" }] },
-  { id: "automations", label: "Automations", permissions: [{ id: "automations.read", label: "Read" }, { id: "automations.manage", label: "Manage" }, { id: "automations.run", label: "Run" }] },
-  { id: "goals", label: "Goals", permissions: [{ id: "goals.read", label: "Read" }, { id: "goals.manage", label: "Manage" }, { id: "goals.run", label: "Run" }] },
-  { id: "projects", label: "Projects", permissions: [{ id: "projects.read", label: "Read" }, { id: "projects.manage", label: "Manage" }, { id: "projects.git", label: "Git actions" }] },
-  { id: "previews", label: "Previews", permissions: [{ id: "previews.read", label: "Read" }, { id: "previews.manage", label: "Manage" }] },
-  { id: "files", label: "Files", permissions: [{ id: "files.read", label: "Read" }, { id: "files.write", label: "Write" }] },
-  { id: "terminal", label: "Terminal", permissions: [{ id: "terminal.exec", label: "Execute" }] },
-  { id: "providers", label: "Providers", permissions: [{ id: "providers.read", label: "Read" }, { id: "providers.manage", label: "Manage" }] },
-  { id: "extensions", label: "Extensions", permissions: [{ id: "extensions.read", label: "Read" }, { id: "extensions.manage", label: "Manage" }, { id: "extensions.install", label: "Install" }] },
-  { id: "environment", label: "Environment", permissions: [{ id: "environment.read", label: "Read" }, { id: "environment.manage", label: "Manage" }, { id: "environment.restore", label: "Restore" }] },
-  { id: "notifications", label: "Notifications", permissions: [{ id: "notifications.read", label: "Read" }, { id: "notifications.manage", label: "Manage" }] },
-  { id: "approvals", label: "Approvals", permissions: [{ id: "approvals.read", label: "Read" }, { id: "approvals.decide", label: "Decide" }] },
-  { id: "settings", label: "Settings", permissions: [{ id: "settings.read", label: "Read" }, { id: "settings.manage", label: "Manage" }] },
-  { id: "storage", label: "Storage", permissions: [{ id: "storage.read", label: "Read" }, { id: "storage.manage", label: "Manage" }] },
-  { id: "backup", label: "Backup", permissions: [{ id: "backup.read", label: "Read" }, { id: "backup.restore", label: "Restore" }] },
-];
-
-const apiKeyPresets: ApiKeyPreset[] = [
-  { id: "read-only", label: "Read only", permissions: apiKeyPermissionGroups.flatMap((group) => group.permissions.map((item) => item.id)).filter((id) => id.endsWith(".read")) },
-  { id: "automation-runner", label: "Automation runner", permissions: ["automations.read", "automations.run", "sessions.read", "sessions.run", "rooms.read", "rooms.run", "goals.read", "goals.run", "projects.read", "previews.read"] },
-  { id: "environment-restore", label: "Environment restore", permissions: ["environment.read", "environment.restore", "settings.read"] },
-  { id: "project-ops", label: "Project ops", permissions: ["projects.read", "projects.manage", "projects.git", "files.read", "files.write", "previews.read", "previews.manage", "terminal.exec"] },
-  { id: "full-access", label: "Full access", permissions: apiKeyPermissionGroups.flatMap((group) => group.permissions.map((item) => item.id)) },
-];
-
-const apiKeyPermissionSet = new Set<ApiKeyPermission>(apiKeyPermissionGroups.flatMap((group) => group.permissions.map((item) => item.id)));
-const apiKeyLastUsedWrites = new Map<string, number>();
-
-function apiKeyPermissionsResponse(): ApiKeyPermissionsResponse {
-  return { groups: apiKeyPermissionGroups, presets: apiKeyPresets };
-}
-
-function apiKeyFromRow(row: Record<string, unknown>): ApiKeyRecord {
-  return {
-    id: String(row.id),
-    name: String(row.name),
-    keyHash: String(row.key_hash),
-    keyPreview: String(row.key_preview),
-    permissions: parseJsonValue<ApiKeyPermission[]>(row.permissions, []).filter((item): item is ApiKeyPermission => apiKeyPermissionSet.has(item as ApiKeyPermission)),
-    lastUsedAt: row.last_used_at ? String(row.last_used_at) : null,
-    revokedAt: row.revoked_at ? String(row.revoked_at) : null,
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function publicApiKey(record: ApiKeyRecord): ApiKeySummary {
-  return {
-    id: record.id,
-    name: record.name,
-    permissions: record.permissions,
-    keyPreview: record.keyPreview,
-    lastUsedAt: record.lastUsedAt,
-    createdAt: record.createdAt,
-    updatedAt: record.updatedAt,
-    revokedAt: record.revokedAt,
-  };
-}
-
-function listApiKeys() {
-  return db.prepare("select * from api_keys order by created_at desc").all().map((row) => publicApiKey(apiKeyFromRow(row as Record<string, unknown>)));
-}
-
-function createApiKey(body: CreateApiKeyRequest): ApiKeyDetailResponse {
-  const name = body.name.trim();
-  const permissions = Array.from(new Set((body.permissions ?? []).filter((item): item is ApiKeyPermission => apiKeyPermissionSet.has(item))));
-  if (!name || !permissions.length) throw new Error("invalid_api_key");
-  const id = `key-${randomUUID()}`;
-  const secret = `cwk_${randomBytes(24).toString("base64url")}`;
-  const now = new Date().toISOString();
-  const preview = `${secret.slice(0, 10)}...${secret.slice(-4)}`;
-  db.prepare(`
-    insert into api_keys (id, name, key_hash, key_preview, permissions, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?)
-  `).run(id, name, hashToken(secret), preview, JSON.stringify(permissions), now, now);
-  const record = apiKeyFromRow(db.prepare("select * from api_keys where id = ?").get(id) as Record<string, unknown>);
-  return { ...publicApiKey(record), key: secret };
-}
-
-function updateApiKey(id: string, body: UpdateApiKeyRequest) {
-  const name = body.name.trim();
-  const permissions = Array.from(new Set((body.permissions ?? []).filter((item): item is ApiKeyPermission => apiKeyPermissionSet.has(item))));
-  if (!name || !permissions.length) throw new Error("invalid_api_key");
-  const now = new Date().toISOString();
-  const result = db.prepare(`
-    update api_keys
-    set name = ?, permissions = ?, updated_at = ?
-    where id = ?
-  `).run(name, JSON.stringify(permissions), now, id);
-  if (!result.changes) throw new Error("api_key_not_found");
-  const row = db.prepare("select * from api_keys where id = ?").get(id) as Record<string, unknown> | undefined;
-  if (!row) throw new Error("api_key_not_found");
-  return publicApiKey(apiKeyFromRow(row));
-}
-
-function revokeApiKey(id: string) {
-  const now = new Date().toISOString();
-  db.prepare("update api_keys set revoked_at = ?, updated_at = ? where id = ? and revoked_at is null").run(now, now, id);
-  const row = db.prepare("select * from api_keys where id = ?").get(id) as Record<string, unknown> | undefined;
-  if (!row) throw new Error("api_key_not_found");
-  return publicApiKey(apiKeyFromRow(row));
-}
-
-function deleteRevokedApiKey(id: string) {
-  const row = db.prepare("select * from api_keys where id = ?").get(id) as Record<string, unknown> | undefined;
-  if (!row) throw new Error("api_key_not_found");
-  const record = apiKeyFromRow(row);
-  if (!record.revokedAt) throw new Error("api_key_not_revoked");
-  db.prepare("delete from api_keys where id = ?").run(id);
-  return publicApiKey(record);
-}
-
-function findApiKeyByToken(token: string): ApiKeyRecord | null {
-  const row = db.prepare("select * from api_keys where key_hash = ? and revoked_at is null").get(hashToken(token)) as Record<string, unknown> | undefined;
-  if (!row) return null;
-  return apiKeyFromRow(row);
-}
-
-function touchApiKeyLastUsed(id: string) {
-  const nowMs = Date.now();
-  if (nowMs - (apiKeyLastUsedWrites.get(id) ?? 0) < 60_000) return;
-  apiKeyLastUsedWrites.set(id, nowMs);
-  db.prepare("update api_keys set last_used_at = ?, updated_at = ? where id = ?").run(new Date(nowMs).toISOString(), new Date(nowMs).toISOString(), id);
-}
-
-function resolveAuthPrincipalFromBearer(token: string | null): AuthPrincipal | null {
-  if (!token) return null;
-  if (verifySessionToken(token)) return { type: "session", userId: "local-admin" };
-  const key = findApiKeyByToken(token);
-  if (!key) return null;
-  touchApiKeyLastUsed(key.id);
-  return { type: "api_key", key };
-}
-
-function requireSessionPrincipal(c: unknown) {
-  const principal = (c as { get: (name: string) => AuthPrincipal | undefined }).get("authPrincipal");
-  if (!principal || principal.type !== "session") throw new Error("session_auth_required");
-  return principal;
-}
-
-function hasApiKeyPermission(principal: AuthPrincipal, permission: ApiKeyPermission) {
-  return principal.type === "session" || principal.key.permissions.includes(permission);
-}
-
-function routePermissionForRequest(method: string, path: string): ApiKeyPermission | null {
-  if (path.startsWith("/api/auth/api-key-permissions")) return "auth.read";
-  if (path.startsWith("/api/auth/api-keys")) return "auth.manage";
-  if (path.startsWith("/api/providers")) return method === "GET" ? "providers.read" : "providers.manage";
-  if (path.startsWith("/api/sessions") || path.startsWith("/api/codex/tasks") || path.startsWith("/api/task-runs") || path.startsWith("/api/execution-contexts")) {
-    if (method === "GET") return "sessions.read";
-    return path.includes("/messages") || path.includes("/queue") || path.includes("/stop") || path.includes("/recover") || path.includes("/compact") ? "sessions.run" : "sessions.manage";
-  }
-  if (path.startsWith("/api/rooms")) {
-    if (method === "GET") return "rooms.read";
-    return path.includes("/messages") || path.includes("/runs/") || path.includes("/tasks") || path.includes("/retry-failed") ? "rooms.run" : "rooms.manage";
-  }
-  if (path.startsWith("/api/agents") || path.startsWith("/api/agent-roles") || path.startsWith("/api/agent-role-templates") || path.startsWith("/api/agent-groups") || path.startsWith("/api/agent-circles") || path.startsWith("/api/permission-profiles")) return method === "GET" ? "agents.read" : "agents.manage";
-  if (path.startsWith("/api/automations")) return method === "GET" ? "automations.read" : path.includes("/run") || path.includes("/stop-running") || path.includes("/cancel-queued") ? "automations.run" : "automations.manage";
-  if (path.startsWith("/api/goals")) return method === "GET" ? "goals.read" : path.includes("/plan") || path.includes("/orchestrate") ? "goals.run" : "goals.manage";
-  if (path.startsWith("/api/projects")) return method === "GET" ? "projects.read" : path.includes("/git") || path.includes("/check") || path.includes("/changes/") ? "projects.git" : "projects.manage";
-  if (path.startsWith("/api/previews")) return method === "GET" ? "previews.read" : "previews.manage";
-  if (path.startsWith("/api/files") || path.startsWith("/api/file-mounts")) return method === "GET" ? "files.read" : "files.write";
-  if (path.startsWith("/api/terminal")) return path.includes("/exec") ? "terminal.exec" : method === "GET" ? "terminal.exec" : "terminal.exec";
-  if (path.startsWith("/api/extensions")) {
-    if (method === "GET") return "extensions.read";
-    return path.includes("/import") || path.includes("/install") ? "extensions.install" : "extensions.manage";
-  }
-  if (path.startsWith("/api/settings/environment/restore")) return "environment.restore";
-  if (path.startsWith("/api/settings/environment")) return method === "GET" ? "environment.read" : "environment.manage";
-  if (path.startsWith("/api/webhook-routes")) return method === "GET" ? "settings.read" : "settings.manage";
-  if (path.startsWith("/api/notifications") || path.startsWith("/api/app-notifications")) return method === "GET" ? "notifications.read" : "notifications.manage";
-  if (path.startsWith("/api/approval-grants") || path.startsWith("/api/approvals")) return method === "GET" ? "approvals.read" : "approvals.decide";
-  if (path.startsWith("/api/settings/storage")) return method === "GET" ? "storage.read" : "storage.manage";
-  if (path.startsWith("/api/settings/backup")) return "backup.read";
-  if (path.startsWith("/api/settings/restore")) return "backup.restore";
-  if (path.startsWith("/api/settings")) return method === "GET" ? "settings.read" : "settings.manage";
-  return null;
-}
-
-function approvalFromRow(row: Record<string, unknown>): ApprovalRecord {
-  let payload: unknown = null;
-  try {
-    payload = JSON.parse(String(row.payload));
-  } catch {
-    payload = null;
-  }
-  return {
-    id: String(row.id),
-    actionType: String(row.action_type) as ApprovalActionType,
-    risk: String(row.risk) as ApprovalRisk,
-    status: String(row.status) as ApprovalStatus,
-    title: String(row.title),
-    description: String(row.description),
-    details: String(row.details),
-    payload,
-    createdAt: String(row.created_at),
-    resolvedAt: row.resolved_at ? String(row.resolved_at) : null,
-    archivedAt: row.archived_at ? String(row.archived_at) : null,
-  };
-}
-
-function publicApproval(approval: ApprovalRecord): ApprovalSummary {
-  const { payload, ...summary } = approval;
-  return { ...summary, related: payload };
-}
-
-function stableJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-  if (value && typeof value === "object") {
-    return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
-
-function approvalGrantKey(actionType: ApprovalActionType, payload: unknown) {
-  const value = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
-  if (actionType === "preview-command-run") {
-    return stableJson({
-      command: value.command,
-      cwd: value.cwd,
-      targetHost: value.targetHost,
-      port: value.port,
-      scopeType: value.scopeType,
-      scopeId: value.scopeId,
-    });
-  }
-  if (actionType === "project-git-operation") return stableJson({ projectId: value.projectId, operation: value.operation });
-  if (actionType === "project-delete-files") return stableJson({ projectId: value.projectId, deleteFiles: true });
-  if (actionType === "room-run-merge") return stableJson({ roomId: value.roomId });
-  if (actionType === "codex-runtime-update") return stableJson(value);
-  return stableJson(value);
-}
-
-function approvalAlwaysAllowed(actionType: ApprovalActionType, payload: unknown) {
-  const grantKey = approvalGrantKey(actionType, payload);
-  return Boolean(db.prepare("select id from approval_grants where action_type = ? and grant_key = ? and (expires_at is null or expires_at > ?)").get(actionType, grantKey, new Date().toISOString()));
-}
-
-function saveApprovalGrant(approval: ApprovalRecord, expiresAt: string | null = null) {
-  const now = new Date().toISOString();
-  db.prepare(`
-    insert into approval_grants (id, action_type, grant_key, title, details, expires_at, created_at)
-    values (?, ?, ?, ?, ?, ?, ?)
-    on conflict(action_type, grant_key) do update set
-      title = excluded.title,
-      details = excluded.details,
-      expires_at = excluded.expires_at,
-      created_at = excluded.created_at
-  `).run(`approval-grant-${randomUUID()}`, approval.actionType, approvalGrantKey(approval.actionType, approval.payload), approval.title, approval.details, expiresAt, now);
-}
-
-function approvalGrantFromRow(row: Record<string, unknown>): ApprovalGrantSummary {
-  return {
-    id: String(row.id),
-    actionType: String(row.action_type) as ApprovalActionType,
-    title: String(row.title),
-    details: String(row.details),
-    createdAt: String(row.created_at),
-    expiresAt: row.expires_at ? String(row.expires_at) : null,
-  };
-}
-
-function listApprovalGrants(limit = 50, cursorValue?: string | null) {
-  const cursor = decodePageCursor(cursorValue);
-  const rows = db.prepare(`
-    select * from approval_grants
-    ${cursor ? "where (created_at < @cursorSort or (created_at = @cursorSort and id < @cursorId))" : ""}
-    order by created_at desc, id desc
-    limit @limit
-  `).all({ cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
-  return pageFromRows(rows.map(approvalGrantFromRow), limit, (item) => item.createdAt);
-}
-
-function listApprovals(status: string | undefined, archived: boolean, limit = 50, cursorValue?: string | null) {
-  const cursor = decodePageCursor(cursorValue);
-  const where = [
-    ...(status ? ["status = @status"] : []),
-    archived ? "archived_at is not null" : "archived_at is null",
-    ...(cursor ? ["(created_at < @cursorSort or (created_at = @cursorSort and id < @cursorId))"] : []),
-  ];
-  const rows = db.prepare(`
-    select * from approvals
-    ${where.length ? `where ${where.join(" and ")}` : ""}
-    order by created_at desc, id desc
-    limit @limit
-  `).all({ status, cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 });
-  return pageFromRows((rows as Array<Record<string, unknown>>).map(approvalFromRow), limit, (item) => item.createdAt);
-}
-
-function getApproval(id: string) {
-  const row = db.prepare("select * from approvals where id = ?").get(id) as Record<string, unknown> | undefined;
-  return row ? approvalFromRow(row) : null;
-}
-
-function createApproval(input: Omit<ApprovalRecord, "id" | "status" | "createdAt" | "resolvedAt">) {
-  const payload = JSON.stringify(input.payload);
-  const existing = db.prepare(`
-    select * from approvals
-    where status = 'pending' and action_type = ? and payload = ?
-    order by created_at desc
-    limit 1
-  `).get(input.actionType, payload) as Record<string, unknown> | undefined;
-  if (existing) return approvalFromRow(existing);
-  const approval: ApprovalRecord = {
-    ...input,
-    id: randomUUID(),
-    status: "pending",
-    createdAt: new Date().toISOString(),
-    resolvedAt: null,
-  };
-  db.prepare(`
-    insert into approvals (id, action_type, risk, status, title, description, details, payload, created_at, resolved_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    approval.id,
-    approval.actionType,
-    approval.risk,
-    approval.status,
-    approval.title,
-    approval.description,
-    approval.details,
-    payload,
-    approval.createdAt,
-    approval.resolvedAt,
-  );
-  emitExternalNotification({
-    eventType: "needs_approval",
-    severity: approval.risk === "critical" || approval.risk === "high" ? "error" : "warning",
-    title: approval.title,
-    message: approval.description || approval.details,
-    sourceType: "approval",
-    sourceId: approval.id,
-    metadata: { actionType: approval.actionType, risk: approval.risk },
-  });
-  return approval;
-}
-
-function resolveApproval(id: string, status: Extract<ApprovalStatus, "approved" | "denied">) {
-  const resolvedAt = new Date().toISOString();
-  db.prepare("update approvals set status = ?, resolved_at = ? where id = ?").run(status, resolvedAt, id);
-  return getApproval(id);
-}
-
-function archiveApproval(id: string) {
-  const archivedAt = new Date().toISOString();
-  db.prepare("update approvals set archived_at = ? where id = ? and status != 'pending'").run(archivedAt, id);
-  return getApproval(id);
-}
-
-function restoreApproval(id: string) {
-  db.prepare("update approvals set archived_at = null where id = ?").run(id);
-  return getApproval(id);
-}
-
-function codexRuntimeRisk(current: CodexRuntimeSettings, next: CodexRuntimeSettings): ApprovalRisk | null {
-  if (next.bypassSandbox && !current.bypassSandbox) return "critical";
-  if (next.sandboxMode === "danger-full-access" && current.sandboxMode !== "danger-full-access") return "high";
-  return null;
-}
-
-function codexRuntimeDetails(next: CodexRuntimeSettings) {
-  return [
-    `sandboxMode=${next.sandboxMode}`,
-    `approvalPolicy=${next.approvalPolicy}`,
-    `bypassSandbox=${String(next.bypassSandbox)}`,
-  ].join("\n");
-}
-
-function applyCodexRuntimeSettings(settings: CodexRuntimeSettings) {
-  codexRuntimeSettings = settings;
-  runtimeSettingsStore.codexRuntime.save(settings);
-  return settings;
-}
-
-function previewCommandRisk(preview: PreviewRecord): ApprovalRisk | null {
-  const command = preview.command?.toLowerCase() ?? "";
-  if (!command) return null;
-  if (preview.port > 0 && preview.port < 1024) return "high";
-  if (/\b(sudo|su|launchctl|osascript)\b/.test(command)) return "critical";
-  if (/\b(docker|podman|kubectl|systemctl|pm2)\b/.test(command)) return "high";
-  if (/\brm\s+-[^&|;]*r[^&|;]*f\b/.test(command)) return "high";
-  return null;
-}
-
-function previewApprovalDetails(preview: PreviewRecord) {
-  return [
-    `preview=${preview.label}`,
-    `target=${preview.targetHost}:${preview.port}`,
-    `cwd=${preview.cwd ?? "(workspace root)"}`,
-    `command=${preview.command ?? ""}`,
-  ].join("\n");
-}
-
-function createPreviewApproval(preview: PreviewRecord, risk: ApprovalRisk) {
-  return createApproval({
-    actionType: "preview-command-run",
-    risk,
-    title: "Preview command requires approval",
-    description: "Run a preview command that crosses a configured risk boundary.",
-    details: previewApprovalDetails(preview),
-    payload: { previewId: preview.id, command: preview.command ?? "", cwd: preview.cwd ?? "", targetHost: preview.targetHost, port: preview.port, scopeType: preview.scopeType, scopeId: preview.scopeId },
-  });
-}
-
-function projectDeleteApprovalDetails(project: ProjectSummary) {
-  return [
-    `project=${project.name}`,
-    `id=${project.id}`,
-    `workspacePath=${project.workspacePath}`,
-  ].join("\n");
-}
-
-function createProjectDeleteApproval(project: ProjectSummary) {
-  return createApproval({
-    actionType: "project-delete-files",
-    risk: "high",
-    title: "Project file deletion requires approval",
-    description: "Delete a project record and recursively remove its workspace directory.",
-    details: projectDeleteApprovalDetails(project),
-    payload: { projectId: project.id, deleteFiles: true },
-  });
-}
-
-function createRoomRunMergeApproval(roomId: string, runId: string, risk: ApprovalRisk, reason: string) {
-  return createApproval({
-    actionType: "room-run-merge",
-    risk,
-    title: "Room run merge requires approval",
-    description: "Apply an Agent run patch back into the project workspace.",
-    details: [`room=${roomId}`, `run=${runId}`, `reason=${reason}`].join("\n"),
-    payload: { roomId, runId },
-  });
-}
-
-function createProjectGitApproval(project: ProjectSummary, operation: ProjectGitOperationType, args: string[], reason: string) {
-  return createApproval({
-    actionType: "project-git-operation",
-    risk: operation === "push" ? "high" : "medium",
-    title: "Project Git operation requires approval",
-    description: `Run git ${operation} for project ${project.name}.`,
-    details: [`project=${project.name}`, `id=${project.id}`, `workspacePath=${project.workspacePath}`, `operation=${operation}`, `args=${args.join(" ")}`, `reason=${reason}`].join("\n"),
-    payload: { projectId: project.id, operation, args },
-  });
-}
-
-function loadAppData(): AppData {
-  const projects = (db.prepare("select * from projects order by name asc").all() as Array<Record<string, unknown>>).map(projectFromRow);
-  const automationSessionIds = new Set([
-    ...(db.prepare("select distinct session_id from automation_runs").all() as Array<{ session_id?: string }>).map((row) => String(row.session_id)).filter(Boolean),
-    ...(db.prepare("select session_id from automations where session_id is not null and session_id != ''").all() as Array<{ session_id?: string }>).map((row) => String(row.session_id)).filter(Boolean),
-  ]);
-  const sessions = (db.prepare("select * from sessions order by updated_at desc").all() as Array<Record<string, unknown>>)
-    .map((row) => sessionFromRow(row, projects));
-  for (const session of sessions) {
-    if (automationSessionIds.has(session.id)) session.conversationType = "automation";
-    const project = session.projectId ? projects.find((item) => item.id === session.projectId) : null;
-    if (session.conversationType === "agent" && session.roomId) {
-      const roomRun = db.prepare("select workspace_path from agent_runs where session_id = ? and workspace_path is not null and workspace_path != '' order by started_at desc limit 1").get(session.id) as { workspace_path?: string | null } | undefined;
-      session.workspacePath = roomRun?.workspace_path ? resolveTerminalCwd(String(roomRun.workspace_path)) : session.workspacePath || ensureScratchSessionWorkspace(session.id);
-      if (!project) session.projectId = null;
-      session.kind = project ? "project" : "scratch";
-    } else if (project) {
-      session.workspacePath = resolveTerminalCwd(project.workspacePath);
-    } else {
-      session.projectId = null;
-      session.kind = "scratch";
-      session.workspacePath = ensureScratchSessionWorkspace(session.id);
-    }
-    upsertSession(session);
-  }
-  const providers = (db.prepare("select * from providers order by name asc").all() as Array<Record<string, unknown>>).map(providerFromRow);
-  const automations = (db.prepare("select * from automations order by updated_at desc").all() as Array<Record<string, unknown>>).map(automationFromRow);
-  return { sessions, projects, providers, automations };
-}
-
-function loadFileMounts() {
-  const rows = db.prepare(`
-    select id, name, root_path, created_at, updated_at
-    from file_mounts
-    order by created_at asc
-  `).all() as Array<Record<string, unknown>>;
-  for (const row of rows) {
-    const mount: FileMountRecord = {
-      id: String(row.id),
-      name: String(row.name),
-      rootPath: String(row.root_path),
-      createdAt: String(row.created_at),
-      updatedAt: String(row.updated_at),
-    };
-    if (mount.id === "default" && (!existsSync(mount.rootPath) || !statSync(mount.rootPath).isDirectory())) {
-      mount.rootPath = workspaceRoot;
-      mount.updatedAt = new Date().toISOString();
-      db.prepare("update file_mounts set root_path = ?, updated_at = ? where id = ?").run(mount.rootPath, mount.updatedAt, mount.id);
-    }
-    fileMounts.set(mount.id, mount);
-  }
-}
-
-function saveAppData() {
-  const save = db.transaction(() => {
-    for (const provider of appData.providers) upsertProvider(provider);
-    for (const project of appData.projects) upsertProject(project);
-    for (const session of appData.sessions) upsertSession(session);
-    for (const automation of appData.automations) upsertAutomation(automation);
-  });
-  save();
-}
-
-function sessionFromRow(row: Record<string, unknown>, projects: ProjectSummary[] = []): SessionSummary {
-  const projectId = row.project_id ? String(row.project_id) : null;
-  const project = projectId ? projects.find((item) => item.id === projectId) : null;
-  const storedWorkspacePath = row.workspace_path ? String(row.workspace_path) : "";
-  const directAgent = db.prepare("select agent_id from agent_sessions where session_id = ?").get(String(row.id)) as { agent_id?: string } | undefined;
-  const session = {
-    id: String(row.id),
-    kind: row.kind as SessionSummary["kind"],
-    conversationType: conversationType(row.conversation_type),
-    roomId: row.room_id ? String(row.room_id) : null,
-    directAgentId: directAgent?.agent_id ?? null,
-    title: String(row.title),
-    projectId,
-    workspacePath: storedWorkspacePath || project?.workspacePath || scratchSessionWorkspacePath(String(row.id)),
-    providerId: row.provider_id ? String(row.provider_id) : null,
-    model: row.model ? String(row.model) : null,
-    codexSessionId: row.codex_session_id ? String(row.codex_session_id) : null,
-    notificationsEnabled: row.notifications_enabled === undefined ? true : Boolean(row.notifications_enabled),
-    status: row.status as SessionSummary["status"],
-    createdAt: row.created_at ? String(row.created_at) : undefined,
-    updatedAt: String(row.updated_at),
-  };
-  return { ...session, goal: activeGoalForSession(session) };
-}
-
-function projectFromRow(row: Record<string, unknown>): ProjectSummary {
-  const checkCommand = row.check_command ? String(row.check_command) : undefined;
-  return {
-    id: String(row.id),
-    name: String(row.name),
-    workspacePath: String(row.workspace_path),
-    runner: row.runner as ProjectSummary["runner"],
-    changedFiles: Number(row.changed_files ?? 0),
-    stagedFiles: 0,
-    modifiedFiles: Number(row.changed_files ?? 0),
-    untrackedFiles: 0,
-    gitStatus: Number(row.changed_files ?? 0) > 0 ? "dirty" : "clean",
-    checkCommand,
-    checkCommands: splitProjectCheckCommands(checkCommand),
-  };
-}
-
-function splitProjectCheckCommands(value?: string | null) {
-  return (value ?? "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
-}
-
-function projectCheckRunFromRow(row: Record<string, unknown>): ProjectCheckRunSummary {
-  return {
-    id: String(row.id),
-    projectId: String(row.project_id),
-    command: String(row.command),
-    cwd: String(row.cwd),
-    status: ["done", "failed", "timed_out"].includes(String(row.status)) ? String(row.status) as ProjectCheckRunSummary["status"] : "running",
-    exitCode: row.exit_code === null || row.exit_code === undefined ? null : Number(row.exit_code),
-    durationMs: Number(row.duration_ms ?? 0),
-    stdout: String(row.stdout ?? ""),
-    stderr: String(row.stderr ?? ""),
-    startedAt: String(row.started_at),
-    finishedAt: row.finished_at ? String(row.finished_at) : undefined,
-  };
-}
-
-function projectGitOperationFromRow(row: Record<string, unknown>): ProjectGitOperationSummary {
-  return {
-    id: String(row.id),
-    projectId: String(row.project_id),
-    operation: String(row.operation) as ProjectGitOperationSummary["operation"],
-    args: jsonArray(row.args),
-    status: String(row.status) as ProjectGitOperationSummary["status"],
-    exitCode: row.exit_code === null || row.exit_code === undefined ? null : Number(row.exit_code),
-    stdout: String(row.stdout ?? ""),
-    stderr: String(row.stderr ?? ""),
-    createdAt: String(row.created_at),
-  };
-}
-
-function defaultProviderCapabilities(kind: ProviderSummary["kind"]): ProviderCapabilities {
-  return {
-    responsesApi: kind === "openai-responses",
-    chatCompletions: kind === "openai-compatible-chat" || kind === "local",
-    tools: kind !== "local",
-    jsonMode: kind !== "local",
-    vision: false,
-    streaming: true,
-  };
-}
-
-function parseProviderCapabilities(value: unknown, kind: ProviderSummary["kind"]): ProviderCapabilities {
-  const defaults = defaultProviderCapabilities(kind);
-  if (typeof value !== "string" || !value.trim()) return defaults;
-  try {
-    const parsed = JSON.parse(value) as Partial<Record<keyof ProviderCapabilities, unknown>>;
-    return {
-      responsesApi: typeof parsed.responsesApi === "boolean" ? parsed.responsesApi : defaults.responsesApi,
-      chatCompletions: typeof parsed.chatCompletions === "boolean" ? parsed.chatCompletions : defaults.chatCompletions,
-      tools: typeof parsed.tools === "boolean" ? parsed.tools : defaults.tools,
-      jsonMode: typeof parsed.jsonMode === "boolean" ? parsed.jsonMode : defaults.jsonMode,
-      vision: typeof parsed.vision === "boolean" ? parsed.vision : defaults.vision,
-      streaming: typeof parsed.streaming === "boolean" ? parsed.streaming : defaults.streaming,
-    };
-  } catch {
-    return defaults;
-  }
-}
-
-function mergeProviderCapabilities(kind: ProviderSummary["kind"], value?: Partial<ProviderCapabilities>): ProviderCapabilities {
-  return { ...defaultProviderCapabilities(kind), ...(value ?? {}) };
-}
-
-function sanitizeProviderRpmLimit(value: unknown) {
-  if (value === null || value === undefined || value === "") return null;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.min(Math.floor(parsed), 100_000) : null;
-}
-
-function sanitizeAutomationRetryMax(value: unknown) {
-  const parsed = Number(value ?? 0);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.min(Math.floor(parsed), 10) : 0;
-}
-
-function sanitizeAutomationRetryDelayMinutes(value: unknown) {
-  const parsed = Number(value ?? 5);
-  return Number.isFinite(parsed) && parsed > 0 ? Math.min(Math.floor(parsed), 24 * 60) : 5;
-}
-
-function sanitizeAutomationOverlapPolicy(value: unknown): NonNullable<AutomationSummary["overlapPolicy"]> {
-  return value === "skip" ? "skip" : "queue";
-}
-
-function providerFromRow(row: Record<string, unknown>): ProviderRecord {
-  const kind = row.kind as ProviderRecord["kind"];
-  return {
-    id: String(row.id),
-    name: String(row.name),
-    kind,
-    defaultModel: String(row.default_model),
-    baseUrl: row.base_url ? String(row.base_url) : undefined,
-    apiKey: row.api_key ? String(row.api_key) : undefined,
-    capabilities: parseProviderCapabilities(row.capabilities, kind),
-    rpmLimit: sanitizeProviderRpmLimit(row.rpm_limit),
-    rpmLimitEnabled: Boolean(row.rpm_limit_enabled),
-    useProxy: Boolean(row.use_proxy),
-  };
-}
-
-function automationRuntimeFields(automation: AutomationSummary): Pick<AutomationSummary, "runningRuns" | "queuedRuns" | "lastRunStatus" | "lastRunAt" | "nextRunAt"> {
-  const counts = db.prepare(`
-    select
-      sum(case when status = 'running' then 1 else 0 end) as running,
-      sum(case when status = 'queued' then 1 else 0 end) as queued
-    from automation_runs
-    where automation_id = ?
-  `).get(automation.id) as { running?: number | null; queued?: number | null } | undefined;
-  const lastRun = db.prepare(`
-    select status, started_at, finished_at
-    from automation_runs
-    where automation_id = ?
-    order by started_at desc, id desc
-    limit 1
-  `).get(automation.id) as { status?: string; started_at?: string; finished_at?: string | null } | undefined;
-  return {
-    runningRuns: Number(counts?.running ?? 0),
-    queuedRuns: Number(counts?.queued ?? 0),
-    lastRunStatus: lastRun?.status === "queued" || lastRun?.status === "running" || lastRun?.status === "done" || lastRun?.status === "failed" || lastRun?.status === "stopped" || lastRun?.status === "skipped" || lastRun?.status === "canceled" ? lastRun.status : null,
-    lastRunAt: lastRun?.finished_at || lastRun?.started_at || null,
-    nextRunAt: nextAutomationRunAt(automation),
-  };
-}
-
-function automationWithRuntimeFields(automation: AutomationSummary): AutomationSummary {
-  return { ...automation, ...automationRuntimeFields(automation) };
-}
-
-function automationFromRow(row: Record<string, unknown>): AutomationSummary {
-  const automation: AutomationSummary = {
-    id: String(row.id),
-    name: String(row.name),
-    projectId: row.project_id ? String(row.project_id) : null,
-    providerId: row.provider_id ? String(row.provider_id) : null,
-    model: row.model ? String(row.model) : null,
-    actionType: row.action_type === "command" ? "command" : "agent",
-    prompt: String(row.prompt),
-    command: row.command ? String(row.command) : null,
-    cwd: row.cwd ? String(row.cwd) : null,
-    commandTimeoutSeconds: row.command_timeout_seconds === null || row.command_timeout_seconds === undefined ? null : Number(row.command_timeout_seconds),
-    retryMax: sanitizeAutomationRetryMax(row.retry_max),
-    retryDelayMinutes: sanitizeAutomationRetryDelayMinutes(row.retry_delay_minutes),
-    overlapPolicy: sanitizeAutomationOverlapPolicy(row.overlap_policy),
-    sessionId: row.session_id ? String(row.session_id) : null,
-    schedule: String(row.schedule),
-    status: row.status === "paused" ? "paused" : "active",
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-  return automationWithRuntimeFields(automation);
-}
-
-function automationRunFromRow(row: Record<string, unknown>): AutomationRunSummary {
-  return {
-    id: String(row.id),
-    automationId: String(row.automation_id),
-    sessionId: String(row.session_id),
-    status: row.status === "queued" || row.status === "done" || row.status === "failed" || row.status === "stopped" || row.status === "skipped" || row.status === "canceled" ? row.status : "running",
-    exitCode: row.exit_code === null || row.exit_code === undefined ? null : Number(row.exit_code),
-    startedAt: String(row.started_at),
-    finishedAt: row.finished_at ? String(row.finished_at) : undefined,
-  };
-}
-
-function providerHealthCheckFromRow(row: Record<string, unknown>): ProviderHealthCheck {
-  return {
-    id: String(row.id),
-    providerId: String(row.provider_id),
-    kind: row.kind === "models" ? "models" : "test",
-    ok: Boolean(row.ok),
-    status: row.status === null || row.status === undefined ? null : Number(row.status),
-    durationMs: Number(row.duration_ms),
-    error: row.error ? String(row.error) : undefined,
-    checkedAt: String(row.checked_at),
-  };
-}
-
-function readJsonFile(path: string) {
-  try {
-    return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
-
-type SkillMetadata = { name?: string; description?: string };
-
-function readSkillMetadataFromContent(content: string): SkillMetadata {
-  const frontMatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---/m)?.[1] ?? "";
-  const frontMatterName = frontMatter.match(/^name:\s*["']?([^"'\n]+)["']?/m)?.[1]?.trim();
-  const frontMatterDescription = content.match(/^---[\s\S]*?\ndescription:\s*["']?([^"'\n]+)["']?/m)?.[1];
-  const title = content.match(/^#\s+(.+)$/m)?.[1]?.trim();
-  const description = frontMatterDescription?.trim()
-    ?? content.split(/\r?\n/).find((line) => line.trim() && !line.startsWith("---") && !line.startsWith("#"))?.trim();
-  return { name: frontMatterName ?? title, description };
-}
-
-function readSkillMetadata(path: string): SkillMetadata {
-  try {
-    const content = readFileSync(path, "utf8");
-    return readSkillMetadataFromContent(content);
-  } catch {
-    return {};
-  }
-}
-
-function readSkillDescription(path: string) {
-  return readSkillMetadata(path).description;
-}
-
-function escapeSkillFrontMatter(value: string) {
-  return value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"").replaceAll(/\r?\n/g, " ").trim();
-}
-
-function renderSkillMarkdown(body: CreateSkillRequest) {
-  const name = body.name.trim();
-  const description = body.description.trim();
-  const instructions = body.instructions.trim();
-  return [
-    "---",
-    `name: "${escapeSkillFrontMatter(name)}"`,
-    `description: "${escapeSkillFrontMatter(description)}"`,
-    "---",
-    "",
-    `# ${name}`,
-    "",
-    description,
-    "",
-    "## Instructions",
-    "",
-    instructions,
-    "",
-  ].join("\n");
-}
-
-function findSkillFiles(root: string, depth = 3): string[] {
-  if (depth < 0 || !existsSync(root)) return [];
-  const results: string[] = [];
-  for (const entry of readdirSync(root, { withFileTypes: true })) {
-    if (entry.name === "node_modules" || entry.name === ".git") continue;
-    const entryPath = join(root, entry.name);
-    if (entry.isFile() && entry.name === "SKILL.md") results.push(entryPath);
-    if (entry.isDirectory()) results.push(...findSkillFiles(entryPath, depth - 1));
-  }
-  return results;
-}
-
-function listSkills(): ExtensionSummary[] {
-  const roots = [join(codexHome, "skills"), join(codexHome, "plugins", "cache")];
-  const seen = new Set<string>();
-  const scannedAt = new Date().toISOString();
-  return roots.flatMap((root) => findSkillFiles(root)).flatMap((skillPath) => {
-    const folder = dirname(skillPath);
-    if (seen.has(folder)) return [];
-    seen.add(folder);
-    const metadata = readSkillMetadata(skillPath);
-    const isPluginCache = folder.includes(`${sep}plugins${sep}cache${sep}`);
-    const isWebManaged = folder.includes(`${sep}skills${sep}web${sep}`);
-    const name = metadata.name ?? basename(folder);
-    return [{
-      id: `skill:${folder}`,
-      type: "skill" as const,
-      name,
-      description: metadata.description,
-      path: folder,
-      source: isPluginCache ? "plugin cache" : isWebManaged ? "web local" : "codex home",
-      sourceType: isPluginCache ? "plugin_cache" as const : "codex_skill" as const,
-      managedBy: isWebManaged ? "web" as const : "codex_cli" as const,
-      syncStatus: "synced" as const,
-      scannedAt,
-      capabilityKinds: ["knowledge" as const],
-      permissions: ["read_context"],
-      enabled: true,
-    }];
-  }).sort((a, b) => a.name.localeCompare(b.name));
-}
-
-function createLocalSkill(body: CreateSkillRequest): ExtensionSummary {
-  const name = body.name.trim().replaceAll(/\s+/g, " ");
-  const description = body.description.trim().replaceAll(/\s+/g, " ");
-  const instructions = body.instructions.trim();
-  if (!name || !description || !instructions) throw new Error("invalid_skill");
-  const folder = join(codexHome, "skills", "web", slugify(name));
-  const skillPath = join(folder, "SKILL.md");
-  if (existsSync(skillPath)) throw new Error("skill_exists");
-  mkdirSync(folder, { recursive: true });
-  writeFileSync(skillPath, renderSkillMarkdown({ name, description, instructions }), "utf8");
-  const scannedAt = new Date().toISOString();
-  return {
-    id: `skill:${folder}`,
-    type: "skill",
-    name,
-    description,
-    path: folder,
-    source: "web local",
-    sourceType: "codex_skill",
-    managedBy: "web",
-    syncStatus: "synced",
-    scannedAt,
-    capabilityKinds: ["knowledge"],
-    permissions: ["read_context"],
-    enabled: true,
-  };
-}
-
-function skillInstructionsFromContent(content: string) {
-  const withoutFrontMatter = content.replace(/^---\r?\n[\s\S]*?\r?\n---\s*/m, "").trim();
-  const instructionMatch = withoutFrontMatter.match(/(?:^|\n)## Instructions\s*\n([\s\S]*)/i);
-  if (instructionMatch?.[1]) return instructionMatch[1].trim();
-  return withoutFrontMatter.replace(/^# .*\n+/, "").trim();
-}
-
-function normalizeImportUrl(url: string) {
-  const githubBlob = url.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+)$/);
-  if (githubBlob) return `https://raw.githubusercontent.com/${githubBlob[1]}/${githubBlob[2]}/${githubBlob[3]}/${githubBlob[4]}`;
-  return url;
-}
-
-async function importSkill(body: ImportSkillRequest): Promise<ImportSkillResponse> {
-  const rawContent = body.content?.trim();
-  const url = body.url?.trim();
-  let content = rawContent ?? "";
-  if (!content && url) {
-    content = await fetch(normalizeImportUrl(url), { redirect: "follow" }).then((response) => {
-      if (!response.ok) throw new Error("skill_import_fetch_failed");
-      return response.text();
-    });
-  }
-  if (!content.trim()) throw new Error("skill_import_empty");
-  const metadata = readSkillMetadataFromContent(content);
-  const name = metadata.name?.trim() || (url ? basename(url).replace(/\.(md|markdown)$/i, "") : "");
-  const description = metadata.description?.trim() || "Imported Skill";
-  const instructions = skillInstructionsFromContent(content);
-  if (!name || !instructions) throw new Error("skill_import_invalid");
-  return { imported: createLocalSkill({ name, description, instructions }) };
-}
-
-function assertWebManagedSkillPath(path: string) {
-  const root = resolve(codexHome, "skills", "web");
-  const folder = resolve(path);
-  if (folder !== root && !folder.startsWith(`${root}${sep}`)) throw new Error("skill_not_web_managed");
-  const skillPath = join(folder, "SKILL.md");
-  if (!existsSync(skillPath)) throw new Error("skill_not_found");
-  return { folder, skillPath };
-}
-
-function updateLocalSkill(body: UpdateSkillRequest): ExtensionSummary {
-  const { folder, skillPath } = assertWebManagedSkillPath(body.path);
-  const name = body.name.trim().replaceAll(/\s+/g, " ");
-  const description = body.description.trim().replaceAll(/\s+/g, " ");
-  const instructions = body.instructions.trim();
-  if (!name || !description || !instructions) throw new Error("invalid_skill");
-  writeFileSync(skillPath, renderSkillMarkdown({ name, description, instructions }), "utf8");
-  return {
-    id: `skill:${folder}`,
-    type: "skill",
-    name,
-    description,
-    path: folder,
-    source: "web local",
-    sourceType: "codex_skill",
-    managedBy: "web",
-    syncStatus: "synced",
-    scannedAt: new Date().toISOString(),
-    capabilityKinds: ["knowledge"],
-    permissions: ["read_context"],
-    enabled: true,
-  };
-}
-
-function deleteLocalSkill(body: DeleteSkillRequest) {
-  const { folder } = assertWebManagedSkillPath(body.path);
-  rmSync(folder, { recursive: true, force: true });
-  return { ok: true, path: folder };
-}
-
-function findPluginManifests(root: string, depth = 4): string[] {
-  if (depth < 0 || !existsSync(root)) return [];
-  const results: string[] = [];
-  for (const entry of readdirSync(root, { withFileTypes: true })) {
-    if (entry.name === "node_modules" || entry.name === ".git") continue;
-    const entryPath = join(root, entry.name);
-    if (entry.isFile() && entry.name === "plugin.json" && basename(dirname(entryPath)) === ".codex-plugin") results.push(entryPath);
-    if (entry.isDirectory()) results.push(...findPluginManifests(entryPath, depth - 1));
-  }
-  return results;
-}
-
-function listPlugins(): ExtensionSummary[] {
-  const roots = [join(codexHome, "plugins"), join(codexHome, "plugins", "cache")];
-  const seen = new Set<string>();
-  return roots.flatMap((root) => findPluginManifests(root)).flatMap((manifestPath) => {
-    const pluginRoot = dirname(dirname(manifestPath));
-    if (seen.has(pluginRoot)) return [];
-    seen.add(pluginRoot);
-    const manifest = readJsonFile(manifestPath);
-    return [{
-      id: `plugin:${pluginRoot}`,
-      type: "plugin" as const,
-      name: String(manifest?.name ?? basename(pluginRoot)),
-      description: manifest?.description ? String(manifest.description) : undefined,
-      path: pluginRoot,
-      source: pluginRoot.includes("/plugins/cache/") ? "plugin cache" : "codex home",
-      enabled: true,
-    }];
-  }).sort((a, b) => a.name.localeCompare(b.name));
-}
-
-function createLocalPlugin(body: CreatePluginRequest): ExtensionSummary {
-  const name = body.name.trim().replaceAll(/\s+/g, " ");
-  if (!name) throw new Error("invalid_plugin");
-  const description = body.description?.trim() || "";
-  const pluginRoot = join(codexHome, "plugins", "web", slugify(name));
-  const manifestDir = join(pluginRoot, ".codex-plugin");
-  const manifestPath = join(manifestDir, "plugin.json");
-  if (existsSync(manifestPath)) throw new Error("plugin_exists");
-  mkdirSync(manifestDir, { recursive: true });
-  writeFileSync(manifestPath, JSON.stringify({
-    name,
-    version: "0.1.0",
-    description,
-  }, null, 2), "utf8");
-  return {
-    id: `plugin:${pluginRoot}`,
-    type: "plugin",
-    name,
-    description,
-    path: pluginRoot,
-    source: "web local",
-    sourceType: "codex_plugin",
-    managedBy: "web",
-    syncStatus: "synced",
-    scannedAt: new Date().toISOString(),
-    capabilityKinds: ["tool"],
-    enabled: true,
-  };
-}
-
-function listMcpServers(): ExtensionSummary[] {
-  const configPath = join(codexHome, "config.toml");
-  if (!existsSync(configPath)) return [];
-  const content = readFileSync(configPath, "utf8");
-  const matches = Array.from(content.matchAll(/^\[mcp_servers\.(?:"((?:\\.|[^"])*)"|([^\]]+))\]/gm));
-  return matches.map((match) => ({
-    id: `mcp:${match[1] ? JSON.parse(`"${match[1]}"`) : match[2]}`,
-    type: "mcp" as const,
-    name: match[1] ? JSON.parse(`"${match[1]}"`) : match[2],
-    path: configPath,
-    source: "config.toml",
-    enabled: true,
-  })).sort((a, b) => a.name.localeCompare(b.name));
-}
-
-function extensionTomlString(value: string) {
-  return JSON.stringify(value);
-}
-
-function extensionTomlArray(values: string[]) {
-  return `[${values.map(extensionTomlString).join(", ")}]`;
-}
-
-function renderMcpServerToml(body: CreateMcpServerRequest) {
-  const args = body.args ?? [];
-  const env = body.env ?? {};
-  const lines = [
-    `[mcp_servers.${extensionTomlString(body.name.trim())}]`,
-    `command = ${extensionTomlString(body.command.trim())}`,
-  ];
-  if (args.length) lines.push(`args = ${extensionTomlArray(args)}`);
-  if (Object.keys(env).length) {
-    lines.push("env = { " + Object.entries(env).map(([key, value]) => `${key} = ${extensionTomlString(value)}`).join(", ") + " }");
-  }
-  return lines.join("\n");
-}
-
-function decodeHtmlEntities(value: string) {
-  return value
-    .replaceAll("&quot;", "\"")
-    .replaceAll("&#34;", "\"")
-    .replaceAll("&apos;", "'")
-    .replaceAll("&#39;", "'")
-    .replaceAll("&amp;", "&")
-    .replaceAll("&lt;", "<")
-    .replaceAll("&gt;", ">");
-}
-
-const builtInMarketplaceCatalog: MarketplaceCatalog = {
-  schemaVersion: 1,
-  source: {
-    id: "agentim-built-in",
-    name: "AgentIM Built-in Catalog",
-  },
-  items: [],
-};
-const marketplaceCatalogSettingsKey = "marketplace_catalog";
-
-function loadMarketplaceCatalog(): MarketplaceCatalogResponse {
-  const catalog = loadJsonSetting<MarketplaceCatalog>(marketplaceCatalogSettingsKey, builtInMarketplaceCatalog);
-  if (catalog?.schemaVersion !== 1 || !catalog.source?.id || !catalog.source?.name || !Array.isArray(catalog.items)) {
-    return {
-      source: builtInMarketplaceCatalog.source,
-      items: builtInMarketplaceCatalog.items,
-      fetchedAt: new Date().toISOString(),
-    };
-  }
-  return {
-    source: catalog.source,
-    items: catalog.items.map(assertMarketplaceItem),
-    fetchedAt: new Date().toISOString(),
-  };
-}
-
-function saveMarketplaceCatalog(response: MarketplaceCatalogResponse) {
-  const catalog: MarketplaceCatalog = {
-    schemaVersion: 1,
-    source: response.source,
-    items: response.items.map(assertMarketplaceItem),
-  };
-  saveJsonSetting(marketplaceCatalogSettingsKey, catalog);
-  return response;
-}
-
-function deleteMarketplaceCatalogItems(ids: string[]): MarketplaceCatalogResponse {
-  const idSet = new Set(ids.map((value) => value.trim()).filter(Boolean));
-  if (!idSet.size) return loadMarketplaceCatalog();
-  const catalog = loadMarketplaceCatalog();
-  return saveMarketplaceCatalog({
-    ...catalog,
-    items: catalog.items.filter((item) => !idSet.has(item.id)),
-    fetchedAt: new Date().toISOString(),
-  });
-}
-
-function clearMarketplaceCatalogItems(): MarketplaceCatalogResponse {
-  const catalog = loadMarketplaceCatalog();
-  return saveMarketplaceCatalog({
-    ...catalog,
-    items: [],
-    fetchedAt: new Date().toISOString(),
-  });
-}
-
-function normalizeMarketplaceMcpConfig(config: unknown): CreateMcpServerRequest[] {
-  if (!config || typeof config !== "object") return [];
-  const root = config as Record<string, unknown>;
-  const servers = root.mcpServers && typeof root.mcpServers === "object" ? root.mcpServers as Record<string, unknown> : root;
-  return Object.entries(servers).flatMap(([name, raw]) => {
-    if (!raw || typeof raw !== "object") return [];
-    const server = raw as Record<string, unknown>;
-    const command = typeof server.command === "string" ? server.command.trim() : "";
-    if (!command) return [];
-    const args = Array.isArray(server.args) ? server.args.map(String) : [];
-    const env = server.env && typeof server.env === "object"
-      ? Object.fromEntries(Object.entries(server.env as Record<string, unknown>).map(([key, value]) => [key, String(value)]))
-      : {};
-    return [{ name, command, args, env }];
-  });
-}
-
-function assertMarketplaceItem(value: unknown): MarketplaceCatalogItem {
-  if (!value || typeof value !== "object") throw new Error("invalid_marketplace_item");
-  const item = value as MarketplaceCatalogItem;
-  if (!item.id || !item.name || !item.description || !item.type || !item.install) throw new Error("invalid_marketplace_item");
-  if (item.type !== "skill" && item.type !== "mcp" && item.type !== "plugin") throw new Error("invalid_marketplace_type");
-  return item;
-}
-
-function parseMarketplaceCatalog(content: string): MarketplaceCatalogResponse {
-  const parsed = JSON.parse(content) as MarketplaceCatalog;
-  if (parsed?.schemaVersion !== 1 || !parsed.source?.id || !parsed.source?.name || !Array.isArray(parsed.items)) throw new Error("invalid_marketplace_catalog");
-  const items = parsed.items.map(assertMarketplaceItem);
-  return {
-    source: parsed.source,
-    items,
-    fetchedAt: new Date().toISOString(),
-  };
-}
-
-async function importMarketplaceCatalog(body: ImportMarketplaceCatalogRequest): Promise<MarketplaceCatalogResponse> {
-  const rawContent = body.content?.trim();
-  const url = body.url?.trim();
-  let content = rawContent ?? "";
-  if (!content && url) {
-    content = await fetch(url, { redirect: "follow" }).then((response) => {
-      if (!response.ok) throw new Error("marketplace_catalog_fetch_failed");
-      return response.text();
-    });
-  }
-  if (!content.trim()) throw new Error("marketplace_catalog_empty");
-  return parseMarketplaceCatalog(content);
-}
-
-async function installMarketplaceItem(body: InstallMarketplaceItemRequest): Promise<InstallMarketplaceItemResponse> {
-  const item = assertMarketplaceItem(body.item);
-  const install = item.install;
-  if (item.type === "skill" && install.kind === "skill") return { installed: [createLocalSkill(install.skill)] };
-  if (item.type === "skill" && install.kind === "skillUrl") {
-    const result = await importSkill({ url: install.url });
-    return { installed: [result.imported] };
-  }
-  if (item.type === "mcp" && install.kind === "mcpServers") {
-    const candidates = normalizeMarketplaceMcpConfig(install.config);
-    if (!candidates.length) throw new Error("marketplace_mcp_empty");
-    return { installed: candidates.map((candidate) => createMcpServer(candidate)) };
-  }
-  if (item.type === "plugin" && install.kind === "plugin") return { installed: [createLocalPlugin(install.manifest)] };
-  throw new Error("marketplace_install_mismatch");
-}
-
-function mcpCandidatesFromConfig(value: unknown): CreateMcpServerRequest[] {
-  if (!value || typeof value !== "object") return [];
-  const root = value as Record<string, unknown>;
-  const servers = root.mcpServers && typeof root.mcpServers === "object" ? root.mcpServers as Record<string, unknown> : null;
-  if (!servers) return [];
-  return Object.entries(servers).flatMap(([name, raw]) => {
-    if (!raw || typeof raw !== "object") return [];
-    const server = raw as Record<string, unknown>;
-    const command = typeof server.command === "string" ? server.command : "";
-    if (!command.trim()) return [];
-    const args = Array.isArray(server.args) ? server.args.map(String) : [];
-    const env = server.env && typeof server.env === "object"
-      ? Object.fromEntries(Object.entries(server.env as Record<string, unknown>).map(([key, val]) => [key, String(val)]))
-      : {};
-    return [{ name, command, args, env }];
-  });
-}
-
-function tryParseMcpJson(value: string) {
-  try {
-    return mcpCandidatesFromConfig(JSON.parse(value));
-  } catch {
-    return [];
-  }
-}
-
-function extractMcpCandidates(content: string): CreateMcpServerRequest[] {
-  const decoded = decodeHtmlEntities(content);
-  const candidates: CreateMcpServerRequest[] = [];
-  const seen = new Set<string>();
-  const push = (items: CreateMcpServerRequest[]) => {
-    for (const item of items) {
-      const key = `${item.name}\n${item.command}\n${(item.args ?? []).join("\n")}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      candidates.push(item);
-    }
-  };
-  push(tryParseMcpJson(decoded));
-  for (const fence of decoded.matchAll(/```(?:json|jsonc)?\s*([\s\S]*?)```/gi)) push(tryParseMcpJson(fence[1].trim()));
-  for (const match of decoded.matchAll(/"mcpServers"\s*:/g)) {
-    const start = decoded.lastIndexOf("{", match.index);
-    if (start < 0) continue;
-    for (let end = decoded.indexOf("}", match.index); end > 0 && end < decoded.length; end = decoded.indexOf("}", end + 1)) {
-      const snippet = decoded.slice(start, end + 1);
-      const parsed = tryParseMcpJson(snippet);
-      if (parsed.length) {
-        push(parsed);
-        break;
-      }
-    }
-  }
-  return candidates;
-}
-
-function createMcpServer(body: CreateMcpServerRequest): ExtensionSummary {
-  const name = body.name.trim();
-  const command = body.command.trim();
-  if (!name || !/^[A-Za-z0-9_.-]+$/.test(name) || !command) throw new Error("invalid_mcp_server");
-  const configPath = join(codexHome, "config.toml");
-  mkdirSync(dirname(configPath), { recursive: true });
-  const current = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
-  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const escapedQuotedName = extensionTomlString(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const sectionPattern = new RegExp(`^\\[mcp_servers\\.(?:${escapedQuotedName}|${escapedName})\\][\\s\\S]*?(?=^\\[|\\s*$)`, "m");
-  const section = renderMcpServerToml({ ...body, name, command });
-  const next = sectionPattern.test(current)
-    ? current.replace(sectionPattern, section)
-    : [current.trimEnd(), section].filter(Boolean).join("\n\n");
-  writeFileSync(configPath, `${next.trimEnd()}\n`, "utf8");
-  return {
-    id: `mcp:${name}`,
-    type: "mcp",
-    name,
-    path: configPath,
-    source: "config.toml",
-    sourceType: "mcp_config",
-    managedBy: "web",
-    syncStatus: "synced",
-    scannedAt: new Date().toISOString(),
-    capabilityKinds: ["connector"],
-    enabled: true,
-  };
-}
-
-async function importMcpServers(body: ImportMcpServerRequest): Promise<ImportMcpServerResponse> {
-  const rawContent = body.content?.trim();
-  const url = body.url?.trim();
-  let content = rawContent ?? "";
-  if (!content && url) {
-    content = await fetch(url, { redirect: "follow" }).then((response) => {
-      if (!response.ok) throw new Error("mcp_import_fetch_failed");
-      return response.text();
-    });
-  }
-  if (!content.trim()) throw new Error("mcp_import_empty");
-  const candidates = extractMcpCandidates(content);
-  if (!candidates.length) throw new Error("mcp_import_no_candidates");
-  const imported = candidates.map((candidate) => createMcpServer(candidate));
-  return { imported, candidates };
-}
-
-function pageExtensions(items: ExtensionSummary[], limit = 20, cursorValue?: string | null, q = "") {
-  const cursor = decodePageCursor(cursorValue);
-  const query = q.trim().toLowerCase();
-  const filtered = items
-    .filter((item) => !query || [item.name, item.description, item.path, item.source, item.type].some((value) => value?.toLowerCase().includes(query)))
-    .filter((item) => !cursor || item.name > cursor.sortValue || (item.name === cursor.sortValue && item.id > cursor.id))
-    .slice(0, limit + 1);
-  return pageFromRows(filtered, limit, (item) => item.name);
-}
-
-function assertInsideCodexHome(path: string) {
-  const absolutePath = resolve(path);
-  const relativePath = relative(codexHome, absolutePath);
-  if (relativePath.startsWith("..") || resolve(relativePath) === relativePath) throw new Error("path_outside_codex_home");
-  return absolutePath;
-}
-
-function readMcpConfigSection(name: string) {
-  const configPath = join(codexHome, "config.toml");
-  const content = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
-  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const escapedQuotedName = extensionTomlString(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = content.match(new RegExp(`^\\[mcp_servers\\.(?:${escapedQuotedName}|${escapedName})\\][\\s\\S]*?(?=^\\[|\\s*$)`, "m"));
-  return match?.[0]?.trim() || "";
-}
-
-function readExtensionDetail(type: ExtensionSummary["type"], name: string, path?: string): ExtensionDetail {
-  if (type === "mcp") {
-    const item: ExtensionSummary = {
-      id: `mcp:${name}`,
-      type,
-      name,
-      path: join(codexHome, "config.toml"),
-      source: "config.toml",
-      enabled: true,
-    };
-    return { item, format: "toml", content: readMcpConfigSection(name) };
-  }
-  if (!path) throw new Error("path_required");
-  const rootPath = assertInsideCodexHome(path);
-  if (type === "skill") {
-    const skillPath = join(rootPath, "SKILL.md");
-    const metadata = readSkillMetadata(skillPath);
-    const isPluginCache = rootPath.includes(`${sep}plugins${sep}cache${sep}`);
-    const isWebManaged = rootPath.includes(`${sep}skills${sep}web${sep}`);
-    const item: ExtensionSummary = {
-      id: `skill:${rootPath}`,
-      type,
-      name: name || metadata.name || basename(rootPath),
-      description: metadata.description,
-      path: rootPath,
-      source: isPluginCache ? "plugin cache" : isWebManaged ? "web local" : "codex home",
-      sourceType: isPluginCache ? "plugin_cache" : "codex_skill",
-      managedBy: isWebManaged ? "web" : "codex_cli",
-      syncStatus: "synced",
-      scannedAt: new Date().toISOString(),
-      capabilityKinds: ["knowledge"],
-      permissions: ["read_context"],
-      enabled: true,
-    };
-    return { item, format: "markdown", content: readFileSync(skillPath, "utf8") };
-  }
-  const manifestPath = join(rootPath, ".codex-plugin", "plugin.json");
-  const manifest = readJsonFile(manifestPath);
-  const item: ExtensionSummary = {
-    id: `plugin:${rootPath}`,
-    type,
-    name: String(manifest?.name ?? name ?? basename(rootPath)),
-    description: manifest?.description ? String(manifest.description) : undefined,
-    path: rootPath,
-    source: rootPath.includes("/plugins/cache/") ? "plugin cache" : "codex home",
-    enabled: true,
-  };
-  return { item, format: "json", content: readFileSync(manifestPath, "utf8") };
-}
-
 function upsertSession(session: SessionSummary) {
   db.prepare(`
     insert into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, status, created_at, updated_at)
@@ -2982,125 +2933,6 @@ function createInboundEmailSession(senderEmail: string, senderName: string, subj
   appData.sessions.unshift(session);
   saveAppData();
   return session;
-}
-
-function listWebhookSessionSummaries(limit = 20) {
-  return appData.sessions.slice(0, limit).map((session) => ({
-    id: session.id,
-    title: session.title,
-    status: session.status,
-    conversationType: session.conversationType,
-    roomId: session.roomId ?? null,
-    projectId: session.projectId ?? null,
-    updatedAt: session.updatedAt,
-  }));
-}
-
-function listWebhookAgentSummaries(limit = 20) {
-  return listAgents(limit).items.map((agent) => ({
-    id: agent.id,
-    name: agent.name,
-    enabled: agent.enabled,
-    roleId: agent.roleId,
-    model: agent.model ?? null,
-    workspaceMode: agent.workspaceMode,
-    projectAccessMode: agent.projectAccessMode,
-    updatedAt: agent.updatedAt,
-  }));
-}
-
-function listWebhookRoomSummaries(limit = 20) {
-  return listRooms(undefined, limit).items.map((room) => ({
-    id: room.id,
-    name: room.name,
-    status: room.status,
-    sessionId: room.sessionId ?? null,
-    groupId: room.groupId ?? null,
-    circleId: room.circleId ?? null,
-    updatedAt: room.updatedAt,
-  }));
-}
-
-function slugifyWebhookRouteName(value: string) {
-  return value
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 24) || "webhook";
-}
-
-function webhookSecretIsSafe(secret: string) {
-  return secret !== "INSECURE_NO_AUTH" || host === "127.0.0.1" || host === "localhost" || host === "::1";
-}
-
-function normalizeWebhookRouteSecret(secret?: string | null) {
-  const value = String(secret ?? "").trim();
-  if (value) return value;
-  return `whsec_${randomBytes(18).toString("base64url")}`;
-}
-
-function webhookRouteFromRow(row: Record<string, unknown>): WebhookRouteSummary {
-  const sessionId = row.session_id ? String(row.session_id) : null;
-  const session = sessionId ? appData.sessions.find((item) => item.id === sessionId) ?? null : null;
-  const routeKey = String(row.route_key);
-  const secret = String(row.secret ?? "");
-  const publicBaseUrl = host.startsWith("0.0.0.0") || host === "127.0.0.1" || host === "::1"
-    ? "http://localhost:5173"
-    : `http://${host}:5173`;
-  return {
-    id: String(row.id),
-    routeKey,
-    name: String(row.name),
-    enabled: Boolean(row.enabled),
-    secret,
-    curlExample: `curl "${publicBaseUrl}/api/webhook/${routeKey}?command=sessions" -H "X-Webhook-Token: ${secret}"`,
-    sessionId,
-    sessionTitle: session?.title ?? null,
-    commandTemplate: String(row.prompt_template ?? ""),
-    promptTemplate: String(row.prompt_template ?? ""),
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function listWebhookRoutes() {
-  return (db.prepare("select * from webhook_routes order by updated_at desc, id desc").all() as Array<Record<string, unknown>>).map(webhookRouteFromRow);
-}
-
-function upsertWebhookRoute(route: {
-  id: string;
-  routeKey: string;
-  name: string;
-  enabled: boolean;
-  secret: string;
-  sessionId?: string | null;
-  promptTemplate: string;
-  createdAt: string;
-  updatedAt: string;
-}) {
-  db.prepare(`
-    insert into webhook_routes (id, route_key, name, enabled, secret, session_id, prompt_template, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    on conflict(id) do update set
-      route_key = excluded.route_key,
-      name = excluded.name,
-      enabled = excluded.enabled,
-      secret = excluded.secret,
-      session_id = excluded.session_id,
-      prompt_template = excluded.prompt_template,
-      updated_at = excluded.updated_at
-  `).run(
-    route.id,
-    route.routeKey,
-    route.name,
-    route.enabled ? 1 : 0,
-    route.secret,
-    route.sessionId ?? null,
-    route.promptTemplate,
-    route.createdAt,
-    route.updatedAt,
-  );
 }
 
 function upsertProject(project: ProjectSummary) {
@@ -3203,2129 +3035,6 @@ function finishAutomationRun(sessionId: string, exitCode: number | null, stopped
   const automationId = run.automation_id;
   if (automationId && status === "failed") scheduleAutomationRetry(automationId, sessionId);
   if (automationId) setTimeout(() => startNextQueuedAutomationRun(automationId), 0);
-}
-
-function setRoomParentSessionStatus(roomId: string, status: SessionSummary["status"], updatedAt = new Date().toISOString()) {
-  const room = db.prepare("select session_id from rooms where id = ?").get(roomId) as { session_id?: string | null } | undefined;
-  if (!room?.session_id) return;
-  const parentSession = appData.sessions.find((item) => item.id === room.session_id);
-  if (!parentSession || parentSession.status === status) return;
-  parentSession.status = status;
-  parentSession.updatedAt = updatedAt;
-  upsertSession(parentSession);
-  publishTaskEvent(parentSession.id, status === "running" ? { type: "started", session: parentSession } : { type: "done", session: parentSession, exitCode: null });
-}
-
-function mentionsRoomUser(value: string) {
-  return /(^|\s)@user\b/i.test(value);
-}
-
-function roomTaskShouldNotifyUser(roomId?: string | null, taskId?: string | null, assistantContent = "") {
-  if (!roomId || !taskId) return false;
-  if (mentionsRoomUser(assistantContent)) return true;
-  const task = db.prepare("select prompt, payload from room_tasks where room_id = ? and id = ?").get(roomId, taskId) as { prompt?: string; payload?: string | null } | undefined;
-  const payload = jsonPayload(task?.payload) as { mentionsUser?: boolean };
-  if (payload.mentionsUser === true || mentionsRoomUser(task?.prompt ?? "")) return true;
-  const rows = db.prepare("select payload from room_events where room_id = ? order by created_at desc, id desc limit 80").all(roomId) as Array<{ payload?: string | null }>;
-  return rows.some((row) => {
-    const eventPayload = jsonPayload(row.payload) as { mentionsUser?: boolean; taskIds?: unknown[]; taskId?: unknown };
-    if (eventPayload.mentionsUser !== true) return false;
-    if (String(eventPayload.taskId ?? "") === taskId) return true;
-    return Array.isArray(eventPayload.taskIds) && eventPayload.taskIds.map(String).includes(taskId);
-  });
-}
-
-function finishAgentRun(sessionId: string, exitCode: number | null, stopped: boolean) {
-  const status = stopped ? "stopped" : exitCode === 0 ? "done" : "failed";
-  const now = new Date().toISOString();
-  const run = db.prepare("select * from agent_runs where session_id = ? and status = 'running'").get(sessionId) as Record<string, unknown> | undefined;
-  db.prepare(`
-    update agent_runs
-    set status = ?, exit_code = ?, finished_at = ?
-    where session_id = ? and status = 'running'
-  `).run(status, exitCode, now, sessionId);
-  if (run?.task_id) {
-    const taskStatus = status === "done" ? "done" : status === "stopped" ? "cancelled" : "failed";
-    db.prepare("update room_tasks set status = ?, finished_at = ?, updated_at = ? where id = ?").run(taskStatus, now, now, String(run.task_id));
-    const goalTask = db.prepare("select goal_item_id from room_tasks where id = ?").get(String(run.task_id)) as { goal_item_id?: string | null } | undefined;
-    if (goalTask?.goal_item_id) {
-      const goalItemStatusValue: GoalItemStatus = taskStatus === "done" ? "completed" : taskStatus === "cancelled" ? "cancelled" : "failed";
-      const item = db.prepare("select goal_id from goal_items where id = ?").get(String(goalTask.goal_item_id)) as { goal_id?: string } | undefined;
-      if (item?.goal_id) updateGoalItem(String(item.goal_id), String(goalTask.goal_item_id), { status: goalItemStatusValue }, "system");
-    }
-    const roomSession = db.prepare("select session_id from rooms where id = ?").get(String(run.room_id)) as { session_id?: string | null } | undefined;
-    const agent = db.prepare("select name from agents where id = ?").get(String(run.agent_id)) as { name?: string } | undefined;
-    const task = db.prepare("select payload from room_tasks where id = ?").get(String(run.task_id)) as { payload?: string | null } | undefined;
-    let taskPayload: Record<string, unknown> = {};
-    try {
-      taskPayload = task?.payload ? JSON.parse(task.payload) as Record<string, unknown> : {};
-    } catch {
-      taskPayload = {};
-    }
-    const latestAssistant = db.prepare("select content from messages where session_id = ? and role = 'assistant' order by created_at desc, id desc limit 1").get(sessionId) as { content?: string } | undefined;
-    if (status === "done" && roomSession?.session_id) {
-      const agentName = agent?.name || String(run.agent_id);
-      const content = latestAssistant?.content?.trim()
-        ? `${agentName}:\n${latestAssistant.content.trim()}`
-        : taskPayload.kind === "listen"
-          ? `${agentName}:\n已收到，我会继续关注。`
-          : "";
-      if (content) {
-        const message = appendSessionMessage(roomSession.session_id, "assistant", content);
-        roomEvent(String(run.room_id), "agent.message", { runId: run.id, taskId: run.task_id, sessionId, messageId: message.id, content, agentId: run.agent_id }, String(run.agent_id));
-        const parentSession = appData.sessions.find((item) => item.id === roomSession.session_id);
-        if (parentSession) {
-          parentSession.updatedAt = message.createdAt;
-          upsertSession(parentSession);
-          publishTaskEvent(parentSession.id, { type: "message", message, session: parentSession });
-          scheduleSessionAutoCompaction(parentSession, "room-agent-message");
-        }
-      }
-    }
-    if (status === "done") createRoomRunMergeCandidate(run);
-    const eventType = status === "done" ? "agent.completed" : status === "stopped" ? "agent.stopped" : "agent.failed";
-    roomEvent(String(run.room_id), eventType, { runId: run.id, taskId: run.task_id, exitCode }, null, String(run.agent_id));
-    const activeRuns = db.prepare("select count(*) as count from agent_runs where room_id = ? and status = 'running'").get(String(run.room_id)) as { count?: number } | undefined;
-    if (!activeRuns?.count) setRoomParentSessionStatus(String(run.room_id), "paused", now);
-    orchestrateRoom(String(run.room_id), eventType);
-  }
-}
-
-function stopOrphanRoomAgentRun(sessionId: string) {
-  codexTaskStopRequested.add(sessionId);
-  markTaskRunStopRequested(sessionId);
-  finishTaskRun(sessionId, "stopped", null, "user_stopped");
-  const session = appData.sessions.find((item) => item.id === sessionId);
-  if (session) {
-    session.status = session.status === "running" ? "paused" : session.status;
-    session.updatedAt = new Date().toISOString();
-    appendCodexOutput(session.id, "\n[room task stopped]\n");
-    saveAppData();
-    publishTaskEvent(session.id, { type: "done", session, exitCode: null });
-  }
-  finishAgentRun(sessionId, null, true);
-  codexTaskStopRequested.delete(sessionId);
-}
-
-function runGitSync(cwd: string, args: string[], input?: string) {
-  const result = spawnSync("git", args, { cwd, input, encoding: "utf8", maxBuffer: 10 * 1024 * 1024 });
-  return {
-    exitCode: result.status,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? result.error?.message ?? "",
-  };
-}
-
-function roomProject(roomId: string) {
-  const row = db.prepare("select project_id from rooms where id = ?").get(roomId) as { project_id?: string } | undefined;
-  return row?.project_id ? appData.projects.find((project) => project.id === row.project_id) ?? null : null;
-}
-
-function createRoomRunMergeCandidate(run: Record<string, unknown>) {
-  const roomId = String(run.room_id);
-  const project = roomProject(roomId);
-  const workspacePath = run.workspace_path ? String(run.workspace_path) : "";
-  if (!project || !workspacePath || !existsSync(workspacePath)) return;
-  const diff = runGitSync(workspacePath, ["diff", "--"]);
-  const status = runGitSync(workspacePath, ["status", "--short"]);
-  if (!diff.stdout.trim() && !status.stdout.trim()) {
-    db.prepare(`
-      insert into room_run_merges (run_id, room_id, project_id, workspace_path, status, summary, created_at, updated_at)
-      values (?, ?, ?, ?, 'merged', 'No workspace changes', ?, ?)
-      on conflict(run_id) do update set status = excluded.status, summary = excluded.summary, updated_at = excluded.updated_at
-    `).run(String(run.id), roomId, project.id, workspacePath, new Date().toISOString(), new Date().toISOString());
-    return;
-  }
-  const check = diff.stdout.trim() ? runGitSync(resolveTerminalCwd(project.workspacePath), ["apply", "--check", "-"], diff.stdout) : { exitCode: 0, stdout: "", stderr: "" };
-  const mergeStatus = check.exitCode === 0 ? "pending" : "conflict";
-  const summary = runGitSync(workspacePath, ["diff", "--stat"]).stdout.trim() || status.stdout.trim();
-  db.prepare(`
-    insert into room_run_merges (run_id, room_id, project_id, workspace_path, status, summary, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?)
-    on conflict(run_id) do update set status = excluded.status, summary = excluded.summary, updated_at = excluded.updated_at
-  `).run(String(run.id), roomId, project.id, workspacePath, mergeStatus, summary, new Date().toISOString(), new Date().toISOString());
-  const payload = { runId: String(run.id), taskId: run.task_id ? String(run.task_id) : null, status: mergeStatus, summary, workspacePath, projectId: project.id };
-  createRoomArtifact(roomId, {
-    agentId: run.agent_id ? String(run.agent_id) : null,
-    kind: "file-change",
-    title: mergeStatus === "pending" ? "Agent changes ready for review" : "Agent changes need conflict review",
-    payload,
-  });
-  if (run.session_id) appendMessageCard(String(run.session_id), "file-change", mergeStatus === "pending" ? "Changes ready for review" : "Changes need conflict review", payload);
-}
-
-function latestExecutionContextForSession(sessionId: string) {
-  const row = db.prepare(`
-    select * from execution_contexts
-    where session_id = ?
-    order by created_at desc, id desc
-    limit 1
-  `).get(sessionId) as Record<string, unknown> | undefined;
-  return row ? executionContextFromRow(row) : null;
-}
-
-function agentPermissionsForRun(run: Record<string, unknown>) {
-  const agentRow = db.prepare("select * from agents where id = ?").get(String(run.agent_id)) as Record<string, unknown> | undefined;
-  return agentRow ? resolvedAgentPermissions(agentFromRow(agentRow)) : defaultAgentPermissions;
-}
-
-function roomGroupForRoom(roomId: string) {
-  const row = db.prepare(`
-    select agent_groups.*
-    from rooms
-    join agent_groups on agent_groups.id = rooms.group_id
-    where rooms.id = ?
-  `).get(roomId) as Record<string, unknown> | undefined;
-  return row ? agentGroupFromRow(row) : null;
-}
-
-function applyRoomRunMerge(roomId: string, runId: string): RoomRunMergeResponse {
-  const run = db.prepare("select * from agent_runs where id = ? and room_id = ?").get(runId, roomId) as Record<string, unknown> | undefined;
-  if (!run) throw new Error("agent_run_not_found");
-  const project = roomProject(roomId);
-  if (!project) throw new Error("room_project_not_found");
-  const workspacePath = run.workspace_path ? String(run.workspace_path) : "";
-  const diff = workspacePath ? runGitSync(workspacePath, ["diff", "--"]) : { exitCode: 1, stdout: "", stderr: "workspace_not_found" };
-  if (diff.exitCode !== 0 || !diff.stdout.trim()) throw new Error(diff.stderr || "empty_diff");
-  const projectPath = resolveTerminalCwd(project.workspacePath);
-  const check = runGitSync(projectPath, ["apply", "--check", "-"], diff.stdout);
-  if (check.exitCode !== 0) {
-    db.prepare("update room_run_merges set status = 'conflict', summary = ?, updated_at = ? where run_id = ?").run(check.stderr || "merge conflict", new Date().toISOString(), runId);
-    roomEvent(roomId, "audit.operation", { action: "merge-conflict", runId, error: check.stderr || "merge_conflict" }, run.agent_id ? String(run.agent_id) : null);
-    return { run: agentRunFromRow(run), ok: false, message: check.stderr || "merge_conflict" };
-  }
-  const gateCommands = splitProjectCheckCommands(project.checkCommand);
-  for (const gateCommand of gateCommands) {
-    const startedAt = new Date().toISOString();
-    const gate = spawnSync("/bin/zsh", ["-lc", gateCommand], { cwd: projectPath, env: managedChildEnv(), encoding: "utf8", timeout: 30_000, maxBuffer: 128 * 1024 });
-    const result = {
-      command: gateCommand,
-      cwd: toTerminalPath(projectPath),
-      exitCode: gate.status,
-      stdout: gate.stdout ?? "",
-      stderr: gate.stderr ?? gate.error?.message ?? "",
-      durationMs: 0,
-      timedOut: gate.error?.message?.includes("ETIMEDOUT") ?? false,
-    };
-    const saved = saveProjectCheckRun(project.id, result, startedAt);
-    if (saved.status !== "done") {
-      createRoomDecision(roomId, {
-        title: "Merge blocked by failed project check",
-        status: "open",
-        payload: { runId, projectId: project.id, checkRunId: saved.id, command: gateCommand, status: saved.status },
-      });
-      roomEvent(roomId, "audit.operation", { action: "merge-blocked-by-check", runId, checkRunId: saved.id, status: saved.status }, run.agent_id ? String(run.agent_id) : null);
-      return { run: agentRunFromRow(run), ok: false, message: "project_check_failed_before_merge" };
-    }
-  }
-  const apply = runGitSync(projectPath, ["apply", "-"], diff.stdout);
-  const status = apply.exitCode === 0 ? "merged" : "error";
-  db.prepare(`
-    insert into room_run_merges (run_id, room_id, project_id, workspace_path, status, summary, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?)
-    on conflict(run_id) do update set status = excluded.status, summary = excluded.summary, updated_at = excluded.updated_at
-  `).run(runId, roomId, project.id, workspacePath, status, apply.stderr || "Applied patch to project workspace", new Date().toISOString(), new Date().toISOString());
-  roomEvent(roomId, "audit.operation", { action: apply.exitCode === 0 ? "merge-applied" : "merge-failed", runId, status, error: apply.stderr || null }, run.agent_id ? String(run.agent_id) : null);
-  createRoomDecision(roomId, {
-    title: apply.exitCode === 0 ? "Merge applied" : "Merge failed",
-    status: apply.exitCode === 0 ? "approved" : "open",
-    payload: { runId, status, message: apply.stderr || null },
-    resolvedAt: apply.exitCode === 0 ? new Date().toISOString() : null,
-  });
-  return { run: agentRunFromRow(run), ok: apply.exitCode === 0, message: apply.stderr || undefined };
-}
-
-function startRoomTaskRun(roomId: string, taskId: string) {
-  const room = db.prepare("select * from rooms where id = ?").get(roomId) as Record<string, unknown> | undefined;
-  if (!room) throw new Error("room_not_found");
-  const task = db.prepare("select * from room_tasks where id = ? and room_id = ?").get(taskId, roomId) as Record<string, unknown> | undefined;
-  if (!task) throw new Error("room_task_not_found");
-  const taskStatus = String(task.status);
-  if (taskStatus === "running" || taskStatus === "done") throw new Error("room_task_not_startable");
-  if (task.depends_on_task_id) {
-    const dependency = db.prepare("select status from room_tasks where id = ? and room_id = ?").get(String(task.depends_on_task_id), roomId) as { status?: string } | undefined;
-    if (dependency?.status !== "done") throw new Error("room_task_dependency_pending");
-  }
-  const assignedAgentId = task.assigned_agent_id ? String(task.assigned_agent_id) : "";
-  if (!assignedAgentId) throw new Error("room_task_unassigned");
-  const membership = db.prepare("select agent_id from room_agents where room_id = ? and agent_id = ?").get(roomId, assignedAgentId);
-  if (!membership) throw new Error("room_agent_not_member");
-  const agentRow = db.prepare("select * from agents where id = ?").get(assignedAgentId) as Record<string, unknown> | undefined;
-  if (!agentRow) throw new Error("agent_not_found");
-  const agent = agentFromRow(agentRow);
-  if (!agent.enabled) throw new Error("agent_disabled");
-  const group = room.group_id ? db.prepare("select * from agent_groups where id = ?").get(String(room.group_id)) as Record<string, unknown> | undefined : undefined;
-  if (group) {
-    const runningRoomCount = db.prepare("select count(*) as count from agent_runs where room_id = ? and status = 'running'").get(roomId) as { count: number } | undefined;
-    const maxConcurrentAgents = Math.max(1, Number(group.max_concurrent_agents ?? 1) || 1);
-    if ((runningRoomCount?.count ?? 0) >= maxConcurrentAgents) throw new Error("room_concurrency_limit");
-  }
-  const runningCount = db.prepare("select count(*) as count from agent_runs where agent_id = ? and status = 'running'").get(agent.id) as { count: number } | undefined;
-  if ((runningCount?.count ?? 0) >= agent.maxConcurrentRuns) throw new Error("agent_concurrency_limit");
-  const roleRow = db.prepare("select * from agent_roles where id = ?").get(agent.roleId) as Record<string, unknown> | undefined;
-  if (!roleRow) throw new Error("agent_role_not_found");
-  const role = agentRoleFromRow(roleRow);
-  const provider = agent.providerId ? appData.providers.find((item) => item.id === agent.providerId) : appData.providers[0];
-  const selectedModel = agent.model ?? provider?.defaultModel ?? null;
-  const workspace = ensureRoomRunWorkspace(room, agent, taskId);
-  const workspaceContext = [
-    "Room/project workspace map:",
-    room.project_id ? `- bound project id: ${String(room.project_id)}` : "- bound project: none. This is a no-project Room.",
-    workspace.projectPath ? `- bound project directory: ${workspace.projectPath}` : "",
-    `- current agent working directory: ${workspace.agentWorkspace}`,
-    workspace.projectPath && resolve(workspace.agentWorkspace) !== resolve(workspace.projectPath)
-      ? "- current agent working directory is an isolated git worktree for the bound project. Treat this worktree as the project workspace for code changes."
-      : "",
-    !room.project_id
-      ? "- no real project directory is bound to this Room. Treat the current agent working directory as a scratch workspace, not as the Codex Web source repository."
-      : "",
-    room.project_id && !workspace.projectPath
-      ? "- the bound project could not be mounted as an independent git worktree. Treat the current agent working directory as a fallback scratch workspace."
-      : "",
-    `- room shared workspace: ${workspace.shared}`,
-    "- Use the current agent working directory for files you create or edit. Use the room shared workspace only for shared notes, plans, reports, handoffs, and decisions.",
-    "- Do not treat any ancestor directory or parent Git repository as the project unless it is explicitly listed above as the bound project directory.",
-  ].filter(Boolean).join("\n");
-  const existingThread = readRoomAgentThread(roomId, agent.id);
-  const existingThreadId = existingThread && (!existingThread.workspacePath || resolve(existingThread.workspacePath) === resolve(workspace.agentWorkspace)) ? existingThread.codexSessionId : null;
-  const skippedThreadReason = existingThread && !existingThreadId ? `Previous Codex thread ${existingThread.codexSessionId} used workspace ${existingThread.workspacePath}; this run uses ${workspace.agentWorkspace}, so a new thread is started to avoid cwd confusion.` : "";
-  const now = new Date().toISOString();
-  const sessionId = `task-${randomUUID()}`;
-  const session: SessionSummary = {
-    id: sessionId,
-    kind: room.project_id ? "project" : "scratch",
-    conversationType: "agent",
-    roomId,
-    title: `${agent.name}: ${String(task.title)}`.slice(0, 80),
-    projectId: room.project_id ? String(room.project_id) : null,
-    workspacePath: workspace.agentWorkspace,
-    providerId: provider?.id ?? null,
-    model: selectedModel,
-    codexSessionId: existingThreadId,
-    status: "running",
-    createdAt: now,
-    updatedAt: now,
-  };
-  appData.sessions.unshift(session);
-  upsertSession(session);
-  const runId = `agent-run-${randomUUID()}`;
-  const taskGoal = task.goal_item_id
-    ? db.prepare("select goal_id from goal_items where id = ?").get(String(task.goal_item_id)) as { goal_id?: string } | undefined
-    : null;
-  db.prepare(`
-    insert into agent_runs (id, room_id, agent_id, task_id, goal_id, session_id, status, provider_id, model, workspace_path, started_at)
-    values (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)
-  `).run(runId, roomId, agent.id, taskId, taskGoal?.goal_id ?? null, sessionId, provider?.id ?? null, selectedModel, workspace.agentWorkspace, now);
-  db.prepare("update room_tasks set status = 'running', started_at = ?, updated_at = ? where id = ?").run(now, now, taskId);
-  setRoomParentSessionStatus(roomId, "running", now);
-  roomEvent(roomId, "agent.started", { runId, taskId, sessionId }, null, agent.id);
-  const prompt = [
-    role.systemPrompt,
-    agent.extraPrompt ? `\n\nAgent extra instructions:\n${agent.extraPrompt}` : "",
-    groupContextForRoom(room),
-    room.shared_context ? `Room shared context:\n${String(room.shared_context)}` : "",
-    recentRoomContext(roomId),
-    skippedThreadReason,
-    `\n\n${workspaceContext}`,
-    `\n\nTask:\n${String(task.prompt)}`,
-  ].filter(Boolean).join("\n");
-  deleteSessionMessages(session.id);
-  const userMessage = appendSessionMessage(session.id, "user", String(task.prompt));
-  startCodexTask(session, prompt, workspace.agentWorkspace, provider, selectedModel, !existingThreadId, [workspace.shared], {
-    sourceType: "room-task",
-    agentId: agent.id,
-    roomId,
-    createdBy: "system",
-    permissionProfileId: agent.permissionProfileId ?? null,
-    resolvedPermissions: resolvedAgentPermissions(agent),
-    currentMessageId: userMessage.id,
-  });
-  return { run: agentRunFromRow(db.prepare("select * from agent_runs where id = ?").get(runId) as Record<string, unknown>), session };
-}
-
-function recordProviderHealthCheck(providerId: string, kind: ProviderHealthCheck["kind"], result: ProviderTestResponse | ProviderModelsResponse) {
-  db.prepare(`
-    insert into provider_health_checks (id, provider_id, kind, ok, status, duration_ms, error, checked_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    `provider-check-${randomUUID()}`,
-    providerId,
-    kind,
-    result.ok ? 1 : 0,
-    result.status,
-    result.durationMs,
-    result.error ?? null,
-    new Date().toISOString(),
-  );
-}
-
-function builtinWebhookChannel(
-  id: string,
-  name: string,
-  description: string,
-  bodyTemplate: string,
-  accountFields: string[] = ["url"],
-): NotificationChannelDefinition {
-  return {
-    id,
-    kind: "webhook",
-    adapter: "webhook",
-    authType: "none",
-    name,
-    description,
-    builtin: true,
-    method: "POST",
-    urlTemplate: "{{url}}",
-    bodyTemplate,
-    accountFields,
-  };
-}
-
-function builtinNotificationChannel(
-  id: string,
-  kind: NotificationChannelKind,
-  adapter: NotificationChannelAdapter,
-  name: string,
-  description: string,
-  accountFields: string[],
-): NotificationChannelDefinition {
-  return {
-    id,
-    kind,
-    adapter,
-    authType: "none",
-    name,
-    description,
-    builtin: true,
-    accountFields,
-  };
-}
-
-const notificationChannels: NotificationChannelDefinition[] = [
-  builtinWebhookChannel(
-    "webhook",
-    "Webhook",
-    "Send a JSON or templated HTTP request.",
-    JSON.stringify({
-      title: "{{title}}",
-      message: "{{message}}",
-      severity: "{{severity}}",
-      eventType: "{{eventType}}",
-      sourceType: "{{sourceType}}",
-      sourceId: "{{sourceId}}",
-    }),
-  ),
-  {
-    id: "bark",
-    kind: "webhook",
-    adapter: "webhook",
-    authType: "none",
-    name: "Bark",
-    description: "Send iOS push notifications through a Bark-compatible webhook endpoint.",
-    builtin: true,
-    method: "POST",
-    urlTemplate: "{{serverUrl}}/push",
-    bodyTemplate: JSON.stringify({
-      device_key: "{{deviceKey}}",
-      title: "{{title}}",
-      body: "{{message}}",
-      group: "{{group}}",
-      sound: "{{sound}}",
-      icon: "{{icon}}",
-      url: "{{url}}",
-    }),
-    accountFields: ["serverUrl", "deviceKey", "group", "sound", "icon", "url"],
-  },
-  builtinWebhookChannel(
-    "weixin-webhook",
-    "Weixin Bot",
-    "Send notifications to a Weixin-compatible webhook bridge.",
-    JSON.stringify({
-      msgtype: "text",
-      text: {
-        content: "{{title}}\n\n{{message}}",
-      },
-    }),
-  ),
-  builtinWebhookChannel(
-    "wecom",
-    "WeCom AI Bot",
-    "Send notifications to a WeCom AI Bot webhook.",
-    JSON.stringify({
-      msgtype: "text",
-      text: {
-        content: "{{title}}\n\n{{message}}",
-      },
-    }),
-  ),
-  builtinWebhookChannel(
-    "feishu",
-    "Feishu / Lark Bot",
-    "Send notifications to a Feishu or Lark bot webhook.",
-    JSON.stringify({
-      msg_type: "text",
-      content: {
-        text: "{{title}}\n\n{{message}}",
-      },
-    }),
-  ),
-  builtinNotificationChannel("wecom-bot", "wecom", "wecom", "WeCom AI Bot", "Send WeCom AI Bot messages through an AI Bot gateway.", ["botId", "secret", "websocketUrl", "dmPolicy", "allowFrom", "groupPolicy", "groupAllowFrom", "defaultSessionId", "testChatId", "language"]),
-  builtinNotificationChannel("qq-bot", "qq", "qq", "QQ Bot", "Send QQ Bot notifications through an app ID, client secret, and target ID.", ["appId", "clientSecret", "targetType", "targetId"]),
-  { id: "email", kind: "email", adapter: "email", authType: "none", name: "Email SMTP", description: "Send email through an SMTP sender account.", builtin: true, accountFields: ["host", "port", "username", "password", "fromEmail"] },
-  { id: "telegram", kind: "telegram", adapter: "telegram", authType: "none", name: "Telegram Bot", description: "Send Telegram messages through a bot token.", builtin: true, accountFields: ["botToken", "proxyUrl"] },
-  { id: "weixin", kind: "weixin", adapter: "weixin", authType: "none", name: "Weixin Bot", description: "Send personal Weixin messages through iLink Bot.", builtin: true, accountFields: ["botToken", "baseUrl"] },
-  builtinNotificationChannel("dingtalk", "dingtalk", "dingtalk", "DingTalk Bot", "Send DingTalk robot messages through a bot token and secret.", ["botToken", "botSecret", "baseUrl"]),
-  builtinNotificationChannel("feishu-bot", "feishu", "feishu", "Feishu Bot", "Send Feishu messages through an app ID and app secret.", ["appId", "appSecret", "domain", "testChatId"]),
-];
-
-startEmailPlatform();
-feishuPlatform.start();
-wecomPlatform.start();
-qqPlatform.start();
-weixinPlatform.start();
-startTelegramPlatform();
-
-const notificationSeverityRank: Record<NotificationSeverity, number> = { info: 0, success: 1, warning: 2, error: 3 };
-const notificationEventTypes: NotificationEventType[] = ["task_completed", "task_failed", "task_interrupted", "needs_approval", "task_health_issue", "provider_check_failed", "backup_failed", "restore_failed", "auth_login"];
-
-type NotificationAccountRecord = NotificationAccountSummary;
-type NotificationEventInput = {
-  eventType: NotificationEventType;
-  severity: NotificationSeverity;
-  title: string;
-  message: string;
-  sourceType?: string;
-  sourceId?: string;
-  metadata?: Record<string, unknown>;
-};
-
-function notificationChannelFromRow(row: Record<string, unknown>): NotificationChannelDefinition {
-  return {
-    id: String(row.id),
-    kind: String(row.kind) as NotificationChannelKind,
-    adapter: String(row.adapter ?? "webhook") as NotificationChannelAdapter,
-    authType: String(row.auth_type ?? "none") as NotificationChannelAuthType,
-    name: String(row.name),
-    description: String(row.description ?? ""),
-    builtin: Boolean(row.builtin),
-    method: String(row.method ?? "POST"),
-    urlTemplate: String(row.url_template ?? ""),
-    headersTemplate: String(row.headers_template ?? ""),
-    bodyTemplate: String(row.body_template ?? ""),
-    accountFields: parseJsonValue<string[]>(row.account_fields, []),
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function listNotificationChannels() {
-  const custom = (db.prepare("select * from notification_channels order by updated_at desc, id desc").all() as Array<Record<string, unknown>>).map(notificationChannelFromRow);
-  return [...notificationChannels, ...custom];
-}
-
-function getNotificationChannel(id?: string | null) {
-  if (!id) return null;
-  return notificationChannels.find((channel) => channel.id === id)
-    ?? ((db.prepare("select * from notification_channels where id = ?").get(id) as Record<string, unknown> | undefined) ? notificationChannelFromRow(db.prepare("select * from notification_channels where id = ?").get(id) as Record<string, unknown>) : null);
-}
-
-function parseJsonValue<T>(value: unknown, fallback: T): T {
-  if (typeof value !== "string" || !value.trim()) return fallback;
-  try {
-    return JSON.parse(value) as T;
-  } catch {
-    return fallback;
-  }
-}
-
-function publicNotificationConfig(kind: NotificationAccountSummary["channelKind"], config: Record<string, unknown>) {
-  const copy: Record<string, unknown> = { ...config };
-  for (const key of ["password", "imapPassword", "deviceKey", "token", "secret", "botToken", "botSecret", "corpSecret", "accessToken", "bearerToken", "appSecret", "clientSecret", "encryptKey", "verificationToken"]) {
-    if (copy[key]) copy[key] = "********";
-  }
-  if (kind === "webhook" && copy.headers && typeof copy.headers === "object") {
-    copy.headers = Object.fromEntries(Object.entries(copy.headers as Record<string, unknown>).map(([key, value]) => [
-      key,
-      /authorization|token|secret|key/i.test(key) && value ? "********" : value,
-    ]));
-  }
-  return copy;
-}
-
-function notificationLanguageFromConfig(config?: Record<string, unknown> | null): "zh-CN" | "en-US" {
-  return String(config?.language ?? "").trim() === "en-US" ? "en-US" : "zh-CN";
-}
-
-function notificationLocaleText(language: "zh-CN" | "en-US", zh: string, en: string) {
-  return language === "en-US" ? en : zh;
-}
-
-function sanitizeNotificationPermissions(input?: NotificationPermissionPolicy | Record<string, unknown> | null): NotificationPermissionPolicy {
-  const list = (value: unknown) => Array.isArray(value) ? value.map((item) => String(item).trim()).filter(Boolean) : [];
-  return {
-    allowedAgentIds: list(input?.allowedAgentIds),
-    allowedRoomIds: list(input?.allowedRoomIds),
-    allowedProjectIds: list(input?.allowedProjectIds),
-  };
-}
-
-function notificationAccountFromRow(row: Record<string, unknown>, exposeSecrets = false): NotificationAccountRecord {
-  const channelId = row.channel_id ? String(row.channel_id) : null;
-  const channelFromId = channelId ? getNotificationChannel(channelId) : null;
-  const channelKind = channelFromId?.kind
-    ?? (notificationChannels.some((channel) => channel.kind === row.channel_kind) ? row.channel_kind as NotificationAccountSummary["channelKind"] : "webhook");
-  const config = parseJsonValue<Record<string, unknown>>(row.config, {});
-  return {
-    id: String(row.id),
-    name: String(row.name),
-    channelId,
-    channelKind,
-    enabled: Boolean(row.enabled),
-    config: exposeSecrets ? config : publicNotificationConfig(channelKind, config),
-    permissions: sanitizeNotificationPermissions(parseJsonValue<NotificationPermissionPolicy>(row.permissions, {})),
-    lastTestStatus: row.last_test_status ? String(row.last_test_status) as NotificationDeliveryStatus : null,
-    lastError: row.last_error ? String(row.last_error) : null,
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function notificationRecipientFromRow(row: Record<string, unknown>, exposeSecrets = false): NotificationRecipientSummary {
-  const kind = ["email", "webhook", "bark", "telegram", "weixin", "wecom", "dingtalk", "feishu", "qq"].includes(String(row.kind)) ? String(row.kind) as NotificationRecipientSummary["kind"] : "webhook";
-  const config = parseJsonValue<Record<string, unknown>>(row.config, {});
-  return {
-    id: String(row.id),
-    name: String(row.name),
-    kind,
-    enabled: Boolean(row.enabled),
-    senderAccountId: row.sender_account_id ? String(row.sender_account_id) : null,
-    channelId: row.channel_id ? String(row.channel_id) : null,
-    config: exposeSecrets ? config : publicNotificationConfig(kind === "email" ? "email" : kind === "bark" ? "bark" : kind === "telegram" ? "telegram" : kind === "weixin" ? "weixin" : kind === "wecom" ? "wecom" : kind === "dingtalk" ? "dingtalk" : kind === "feishu" ? "feishu" : kind === "qq" ? "qq" : "webhook", config),
-    permissions: sanitizeNotificationPermissions(parseJsonValue<NotificationPermissionPolicy>(row.permissions, {})),
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function notificationRuleFromRow(row: Record<string, unknown>): NotificationRuleSummary {
-  return {
-    id: String(row.id),
-    name: String(row.name),
-    enabled: Boolean(row.enabled),
-    eventTypes: parseJsonValue<NotificationEventType[]>(row.event_types, []).filter((type) => notificationEventTypes.includes(type)),
-    minSeverity: notificationSeverityRank[String(row.min_severity) as NotificationSeverity] !== undefined ? String(row.min_severity) as NotificationSeverity : "info",
-    targets: sanitizeNotificationTargets(parseJsonValue<NotificationRuleTarget[]>(row.targets, [])),
-    dedupeMinutes: Math.max(0, Number(row.dedupe_minutes) || 0),
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function notificationDeliveryFromRow(row: Record<string, unknown>): NotificationDeliverySummary {
-  return {
-    id: String(row.id),
-    ruleId: row.rule_id ? String(row.rule_id) : null,
-    accountId: row.account_id ? String(row.account_id) : null,
-    eventType: String(row.event_type) as NotificationEventType,
-    severity: String(row.severity) as NotificationSeverity,
-    title: String(row.title),
-    message: String(row.message),
-    status: String(row.status) as NotificationDeliveryStatus,
-    attempts: Number(row.attempts) || 0,
-    responseStatus: row.response_status === null || row.response_status === undefined ? null : Number(row.response_status),
-    lastError: row.last_error ? String(row.last_error) : null,
-    metadata: parseJsonValue<Record<string, unknown>>(row.metadata, {}),
-    createdAt: String(row.created_at),
-    sentAt: row.sent_at ? String(row.sent_at) : null,
-  };
-}
-
-function notificationEphemeralRuleFromRow(row: Record<string, unknown>): NotificationEphemeralRuleSummary {
-  const scopeType = String(row.scope_type);
-  return {
-    id: String(row.id),
-    scopeType: scopeType === "task" || scopeType === "room_task" || scopeType === "automation" ? scopeType : "session",
-    scopeId: String(row.scope_id),
-    eventTypes: parseJsonValue<NotificationEventType[]>(row.event_types, []).filter((type) => notificationEventTypes.includes(type)),
-    targets: sanitizeNotificationTargets(parseJsonValue<NotificationRuleTarget[]>(row.targets, [])),
-    enabled: Boolean(row.enabled),
-    expireMode: String(row.expire_mode) as NotificationEphemeralRuleSummary["expireMode"],
-    createdAt: String(row.created_at),
-    expiresAt: row.expires_at ? String(row.expires_at) : null,
-    triggeredAt: row.triggered_at ? String(row.triggered_at) : null,
-  };
-}
-
-function appNotificationFromRow(row: Record<string, unknown>): AppNotificationSummary {
-  return {
-    id: String(row.id),
-    eventType: String(row.event_type) as NotificationEventType,
-    severity: String(row.severity) as NotificationSeverity,
-    title: String(row.title),
-    message: String(row.message),
-    sourceType: row.source_type ? String(row.source_type) : null,
-    sourceId: row.source_id ? String(row.source_id) : null,
-    metadata: parseJsonValue<Record<string, unknown>>(row.metadata, {}),
-    readAt: row.read_at ? String(row.read_at) : null,
-    createdAt: String(row.created_at),
-  };
-}
-
-function createAppNotification(event: NotificationEventInput) {
-  const id = `app-notification-${randomUUID()}`;
-  const createdAt = new Date().toISOString();
-  db.prepare(`
-    insert into app_notifications (id, event_type, severity, title, message, source_type, source_id, metadata, created_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    id,
-    event.eventType,
-    event.severity,
-    event.title,
-    event.message,
-    event.sourceType ?? null,
-    event.sourceId ?? null,
-    JSON.stringify(event.metadata ?? {}),
-    createdAt,
-  );
-  const notification = appNotificationFromRow(db.prepare("select * from app_notifications where id = ?").get(id) as Record<string, unknown>);
-  publishAppNotificationEvent({ type: "notification", notification, unreadCount: appNotificationUnreadCount() });
-  return notification;
-}
-
-function listAppNotifications(limit = 30): AppNotificationsResponse {
-  const rows = db.prepare(`
-    select * from app_notifications
-    order by created_at desc, id desc
-    limit ?
-  `).all(Math.max(1, Math.min(100, limit))) as Array<Record<string, unknown>>;
-  const unread = db.prepare("select count(*) as count from app_notifications where read_at is null").get() as { count?: number } | undefined;
-  return {
-    items: rows.map(appNotificationFromRow),
-    unreadCount: unread?.count ?? 0,
-  };
-}
-
-function appNotificationUnreadCount() {
-  const row = db.prepare("select count(*) as count from app_notifications where read_at is null").get() as { count?: number } | undefined;
-  return row?.count ?? 0;
-}
-
-function publishAppNotificationEvent(event: AppNotificationStreamEvent) {
-  for (const subscriber of [...appNotificationSubscribers]) {
-    try {
-      subscriber(event);
-    } catch {
-      appNotificationSubscribers.delete(subscriber);
-    }
-  }
-}
-
-function publishAppNotificationsSnapshot() {
-  publishAppNotificationEvent({ type: "snapshot", ...listAppNotifications(30) });
-}
-
-function subscribeAppNotifications(subscriber: (event: AppNotificationStreamEvent) => void) {
-  appNotificationSubscribers.add(subscriber);
-  return () => appNotificationSubscribers.delete(subscriber);
-}
-
-function listNotificationAccounts(exposeSecrets = false) {
-  return (db.prepare("select * from notification_accounts order by updated_at desc, id desc").all() as Array<Record<string, unknown>>).map((row) => notificationAccountFromRow(row, exposeSecrets));
-}
-
-function readNotificationRecipients(exposeSecrets = false) {
-  return (db.prepare("select * from notification_recipients order by updated_at desc, id desc").all() as Array<Record<string, unknown>>).map((row) => notificationRecipientFromRow(row, exposeSecrets));
-}
-
-function defaultRecipientConfigForAccount(account: NotificationAccountSummary) {
-  const config = account.config as Record<string, unknown>;
-  if (account.channelKind === "email") {
-    const email = String(config.fromEmail ?? "").trim();
-    return email ? { email } : null;
-  }
-  if (account.channelKind === "telegram") {
-    const chatId = String(config.testChatId ?? "").trim();
-    return chatId ? { chatId } : null;
-  }
-  if (account.channelKind === "weixin") {
-    const chatId = String(config.testChatId ?? config.userId ?? config.accountId ?? "").trim();
-    return chatId ? { chatId } : null;
-  }
-  if (account.channelKind === "wecom") {
-    const chatId = String(config.testChatId ?? "").trim();
-    return chatId ? { chatId } : null;
-  }
-  if (account.channelKind === "qq") {
-    const chatId = String(config.testChatId ?? config.testTargetId ?? config.targetId ?? config.openId ?? "").trim();
-    return chatId ? { chatId } : null;
-  }
-  return null;
-}
-
-function syncDefaultNotificationRecipients() {
-  const existing = readNotificationRecipients(true);
-  const existingKeys = new Set(existing.map((recipient) => `${recipient.kind}:${recipient.senderAccountId ?? ""}`));
-  const accounts = listNotificationAccounts(true).filter((account) => account.enabled && ["email", "telegram", "weixin", "wecom", "qq"].includes(account.channelKind));
-  const now = new Date().toISOString();
-  let changed = false;
-  for (const account of accounts) {
-    const key = `${account.channelKind}:${account.id}`;
-    if (existingKeys.has(key)) continue;
-    const config = defaultRecipientConfigForAccount(account);
-    if (!config) continue;
-    const language = notificationLanguageFromConfig(account.config as Record<string, unknown> | null);
-    const recipientSuffix = notificationLocaleText(language, "接收者", "recipient");
-    const id = `notification-recipient-${randomUUID()}`;
-    db.prepare(`
-      insert into notification_recipients (id, name, kind, enabled, sender_account_id, channel_id, config, permissions, created_at, updated_at)
-      values (?, ?, ?, 1, ?, null, ?, ?, ?, ?)
-    `).run(
-      id,
-      `${account.name} ${recipientSuffix}`,
-      account.channelKind,
-      account.id,
-      JSON.stringify(config),
-      JSON.stringify({}),
-      now,
-      now,
-    );
-    changed = true;
-  }
-  return changed;
-}
-
-function listNotificationRecipients(exposeSecrets = false) {
-  syncDefaultNotificationRecipients();
-  return readNotificationRecipients(exposeSecrets);
-}
-
-function listAllNotificationRules() {
-  return (db.prepare("select * from notification_rules order by updated_at desc, id desc").all() as Array<Record<string, unknown>>).map(notificationRuleFromRow);
-}
-
-function listNotificationRules(limit = 50, cursorValue?: string | null, filters: { enabled?: boolean } = {}) {
-  const cursor = decodePageCursor(cursorValue);
-  const where = [
-    ...(filters.enabled === undefined ? [] : ["enabled = @enabled"]),
-    ...(cursor ? ["(updated_at < @cursorSort or (updated_at = @cursorSort and id < @cursorId))"] : []),
-  ];
-  const rows = db.prepare(`
-    select * from notification_rules
-    ${where.length ? `where ${where.join(" and ")}` : ""}
-    order by updated_at desc, id desc
-    limit @limit
-  `).all({ enabled: filters.enabled === undefined ? undefined : filters.enabled ? 1 : 0, cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
-  return pageFromRows(rows.map(notificationRuleFromRow), limit, (item) => item.updatedAt);
-}
-
-function listNotificationEphemeralRules(limit = 50, cursorValue?: string | null) {
-  const cursor = decodePageCursor(cursorValue);
-  const rows = db.prepare(`
-    select * from notification_ephemeral_rules
-    ${cursor ? "where (created_at < @cursorSort or (created_at = @cursorSort and id < @cursorId))" : ""}
-    order by created_at desc, id desc
-    limit @limit
-  `).all({ cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
-  return pageFromRows(rows.map(notificationEphemeralRuleFromRow), limit, (item) => item.createdAt);
-}
-
-function createNotificationEphemeralRule(input: {
-  scopeType?: "session" | "task" | "room_task" | "automation";
-  scopeId?: string;
-  eventTypes?: NotificationEventType[];
-  targets?: NotificationRuleTarget[];
-  expireMode?: "after_trigger" | "session_end" | "manual";
-}) {
-  const scopeType = input.scopeType === "task" || input.scopeType === "room_task" || input.scopeType === "automation" ? input.scopeType : "session";
-  const scopeId = input.scopeId?.trim();
-  const eventTypes = (input.eventTypes ?? []).filter((type) => notificationEventTypes.includes(type));
-  const targets = sanitizeNotificationTargets(input.targets ?? []);
-  const expireMode = input.expireMode === "session_end" || input.expireMode === "manual" ? input.expireMode : "after_trigger";
-  if (!scopeId || !eventTypes.length || !targets.length) return null;
-  const id = `notification-ephemeral-${randomUUID()}`;
-  const now = new Date().toISOString();
-  db.prepare(`
-    insert into notification_ephemeral_rules (id, scope_type, scope_id, event_types, targets, enabled, expire_mode, created_at)
-    values (?, ?, ?, ?, ?, 1, ?, ?)
-  `).run(id, scopeType, scopeId, JSON.stringify(eventTypes), JSON.stringify(targets), expireMode, now);
-  return {
-    id,
-    scopeType,
-    scopeId,
-    eventTypes,
-    targets,
-    enabled: true,
-    expireMode,
-    createdAt: now,
-  } satisfies NotificationEphemeralRuleSummary;
-}
-
-function listNotificationDeliveries(limit = 50, cursorValue?: string | null, filters: { eventType?: NotificationEventType; status?: NotificationDeliveryStatus; severity?: NotificationSeverity } = {}) {
-  const cursor = decodePageCursor(cursorValue);
-  const where = [
-    ...(filters.eventType ? ["event_type = @eventType"] : []),
-    ...(filters.status ? ["status = @status"] : []),
-    ...(filters.severity ? ["severity = @severity"] : []),
-    ...(cursor ? ["(created_at < @cursorSort or (created_at = @cursorSort and id < @cursorId))"] : []),
-  ];
-  const rows = db.prepare(`
-    select * from notification_deliveries
-    ${where.length ? `where ${where.join(" and ")}` : ""}
-    order by created_at desc, id desc
-    limit @limit
-  `).all({ eventType: filters.eventType, status: filters.status, severity: filters.severity, cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
-  return pageFromRows(rows.map(notificationDeliveryFromRow), limit, (item) => item.createdAt);
-}
-
-function sanitizeNotificationConfig(kind: NotificationAccountSummary["channelKind"], input?: Record<string, unknown>, previous?: Record<string, unknown>) {
-  const config = input ?? {};
-  const list = (value: unknown) => Array.isArray(value)
-    ? value.map((item) => String(item).trim()).filter(Boolean)
-    : String(value ?? "").split(",").map((item) => item.trim()).filter(Boolean);
-  if (kind === "email") {
-    const password = String(config.password ?? "").trim();
-    const imapPassword = String(config.imapPassword ?? "").trim();
-    return {
-      host: String(config.host ?? previous?.host ?? "").trim(),
-      port: Number(config.port ?? previous?.port ?? 587) || 587,
-      secure: config.secure === true,
-      username: String(config.username ?? previous?.username ?? "").trim(),
-      password: password && password !== "********" ? password : String(previous?.password ?? ""),
-      fromName: String(config.fromName ?? previous?.fromName ?? "Codex Web").trim(),
-      fromEmail: String(config.fromEmail ?? previous?.fromEmail ?? "").trim(),
-      testEmailTo: list(config.testEmailTo ?? previous?.testEmailTo),
-      inboundEnabled: config.inboundEnabled === true,
-      imapHost: String(config.imapHost ?? previous?.imapHost ?? config.host ?? previous?.host ?? "").trim(),
-      imapPort: Number(config.imapPort ?? previous?.imapPort ?? 993) || 993,
-      imapSecure: config.imapSecure === true || (config.imapSecure === undefined && Number(config.imapPort ?? previous?.imapPort ?? 993) === 993),
-      imapUsername: String(config.imapUsername ?? previous?.imapUsername ?? config.username ?? previous?.username ?? "").trim(),
-      imapPassword: imapPassword && imapPassword !== "********" ? imapPassword : String(previous?.imapPassword ?? previous?.password ?? ""),
-      inboundMailbox: String(config.inboundMailbox ?? previous?.inboundMailbox ?? "INBOX").trim() || "INBOX",
-      allowedSenderEmails: list(config.allowedSenderEmails ?? previous?.allowedSenderEmails),
-      defaultSessionId: String(config.defaultSessionId ?? previous?.defaultSessionId ?? "").trim(),
-    };
-  }
-  if (kind === "telegram") {
-    const botToken = String(config.botToken ?? "").trim();
-    return {
-      botToken: botToken && botToken !== "********" ? botToken : String(previous?.botToken ?? ""),
-      proxyUrl: String(config.proxyUrl ?? previous?.proxyUrl ?? "").trim(),
-      language: String(config.language ?? previous?.language ?? "zh-CN").trim() === "en-US" ? "en-US" : "zh-CN",
-      inboundEnabled: config.inboundEnabled === true,
-      allowedChatIds: list(config.allowedChatIds ?? previous?.allowedChatIds),
-      allowedUserIds: list(config.allowedUserIds ?? previous?.allowedUserIds),
-      defaultSessionId: String(config.defaultSessionId ?? previous?.defaultSessionId ?? "").trim(),
-      testChatId: String(config.testChatId ?? previous?.testChatId ?? "").trim(),
-    };
-  }
-  if (kind === "weixin") {
-    const botToken = String(config.botToken ?? "").trim();
-    return {
-      botToken: botToken && botToken !== "********" ? botToken : String(previous?.botToken ?? ""),
-      baseUrl: String(config.baseUrl ?? previous?.baseUrl ?? "https://ilinkai.weixin.qq.com").trim(),
-      accountId: String(config.accountId ?? previous?.accountId ?? "").trim(),
-      userId: String(config.userId ?? previous?.userId ?? "").trim(),
-      language: String(config.language ?? previous?.language ?? "zh-CN").trim() === "en-US" ? "en-US" : "zh-CN",
-      inboundEnabled: config.inboundEnabled === true,
-      allowedChatIds: list(config.allowedChatIds ?? previous?.allowedChatIds),
-      allowedUserIds: list(config.allowedUserIds ?? previous?.allowedUserIds),
-      defaultSessionId: String(config.defaultSessionId ?? previous?.defaultSessionId ?? "").trim(),
-      testChatId: String(config.testChatId ?? previous?.testChatId ?? "").trim(),
-    };
-  }
-  if (kind === "feishu") {
-    const appSecret = String(config.appSecret ?? "").trim();
-    return {
-      appId: String(config.appId ?? previous?.appId ?? "").trim(),
-      appSecret: appSecret && appSecret !== "********" ? appSecret : String(previous?.appSecret ?? ""),
-      domain: String(config.domain ?? previous?.domain ?? "feishu").trim() || "feishu",
-      connectionMode: String(config.connectionMode ?? previous?.connectionMode ?? "websocket").trim() || "websocket",
-      language: String(config.language ?? previous?.language ?? "zh-CN").trim() === "en-US" ? "en-US" : "zh-CN",
-      testChatId: String(config.testChatId ?? previous?.testChatId ?? "").trim(),
-      encryptKey: String(config.encryptKey ?? previous?.encryptKey ?? "").trim(),
-      verificationToken: String(config.verificationToken ?? previous?.verificationToken ?? "").trim(),
-      defaultSessionId: String(config.defaultSessionId ?? previous?.defaultSessionId ?? "").trim(),
-      allowedChatIds: list(config.allowedChatIds ?? previous?.allowedChatIds),
-      allowedUserIds: list(config.allowedUserIds ?? previous?.allowedUserIds),
-    };
-  }
-  if (kind === "wecom") {
-    const secret = String(config.secret ?? config.botSecret ?? "").trim();
-    return {
-      botId: String(config.botId ?? previous?.botId ?? "").trim(),
-      secret: secret && secret !== "********" ? secret : String(previous?.secret ?? previous?.botSecret ?? ""),
-      websocketUrl: String(config.websocketUrl ?? config.websocket_url ?? previous?.websocketUrl ?? previous?.websocket_url ?? "wss://openws.work.weixin.qq.com").trim() || "wss://openws.work.weixin.qq.com",
-      dmPolicy: String(config.dmPolicy ?? previous?.dmPolicy ?? "open").trim().toLowerCase() || "open",
-      allowFrom: list(config.allowFrom ?? config.allow_from ?? previous?.allowFrom ?? previous?.allow_from),
-      groupPolicy: String(config.groupPolicy ?? previous?.groupPolicy ?? "open").trim().toLowerCase() || "open",
-      groupAllowFrom: list(config.groupAllowFrom ?? config.group_allow_from ?? previous?.groupAllowFrom ?? previous?.group_allow_from),
-      inboundEnabled: config.inboundEnabled === true,
-      defaultSessionId: String(config.defaultSessionId ?? previous?.defaultSessionId ?? "").trim(),
-      testChatId: String(config.testChatId ?? previous?.testChatId ?? "").trim(),
-      language: String(config.language ?? previous?.language ?? "zh-CN").trim() === "en-US" ? "en-US" : "zh-CN",
-    };
-  }
-  if (kind === "qq") {
-    const clientSecret = String(config.clientSecret ?? config.appSecret ?? "").trim();
-    return {
-      appId: String(config.appId ?? previous?.appId ?? "").trim(),
-      clientSecret: clientSecret && clientSecret !== "********" ? clientSecret : String(previous?.clientSecret ?? previous?.appSecret ?? ""),
-      targetType: String(config.targetType ?? previous?.targetType ?? "user").trim().toLowerCase() || "user",
-      targetId: String(config.targetId ?? config.openId ?? previous?.targetId ?? previous?.openId ?? "").trim(),
-      testTargetId: String(config.testTargetId ?? config.testChatId ?? previous?.testTargetId ?? previous?.testChatId ?? previous?.targetId ?? previous?.openId ?? "").trim(),
-      language: String(config.language ?? previous?.language ?? "zh-CN").trim() === "en-US" ? "en-US" : "zh-CN",
-      inboundEnabled: config.inboundEnabled === true,
-      allowedChatIds: list(config.allowedChatIds ?? previous?.allowedChatIds),
-      allowedUserIds: list(config.allowedUserIds ?? previous?.allowedUserIds),
-      defaultSessionId: String(config.defaultSessionId ?? previous?.defaultSessionId ?? "").trim(),
-      testChatId: String(config.testChatId ?? previous?.testChatId ?? "").trim(),
-    };
-  }
-  if (kind === "bark") {
-    const deviceKey = String(config.deviceKey ?? "").trim();
-    return {
-      serverUrl: String(config.serverUrl ?? previous?.serverUrl ?? "https://api.day.app").trim(),
-      deviceKey: deviceKey && deviceKey !== "********" ? deviceKey : String(previous?.deviceKey ?? ""),
-      sound: String(config.sound ?? previous?.sound ?? "").trim(),
-      group: String(config.group ?? previous?.group ?? "Codex Web").trim(),
-      icon: String(config.icon ?? previous?.icon ?? "").trim(),
-      url: String(config.url ?? previous?.url ?? "").trim(),
-    };
-  }
-  if (["webhook", "weixin", "feishu"].includes(kind)) {
-    return {
-      url: String(config.url ?? previous?.url ?? "").trim(),
-      method: String(config.method ?? previous?.method ?? "POST").trim().toUpperCase() || "POST",
-      headers: typeof config.headers === "object" && config.headers && !Array.isArray(config.headers) ? config.headers : previous?.headers ?? {},
-      bodyTemplate: String(config.bodyTemplate ?? previous?.bodyTemplate ?? "").trim(),
-    };
-  }
-  return {
-    url: String(config.url ?? previous?.url ?? "").trim(),
-    method: String(config.method ?? previous?.method ?? "POST").trim().toUpperCase() || "POST",
-    headers: typeof config.headers === "object" && config.headers && !Array.isArray(config.headers) ? config.headers : previous?.headers ?? {},
-    bodyTemplate: String(config.bodyTemplate ?? previous?.bodyTemplate ?? "").trim(),
-  };
-}
-
-function sanitizeNotificationTargets(targets?: NotificationRuleTarget[]) {
-  return (targets ?? [])
-    .map((target) => ({
-      accountId: target.accountId ? String(target.accountId).trim() : undefined,
-      recipientId: target.recipientId ? String(target.recipientId).trim() : undefined,
-      senderAccountId: target.senderAccountId ? String(target.senderAccountId).trim() : undefined,
-      chatId: target.chatId ? String(target.chatId).trim() : undefined,
-      emailTo: Array.isArray(target.emailTo) ? target.emailTo.map((item) => String(item).trim()).filter(Boolean) : undefined,
-    }))
-    .filter((target) => target.accountId || target.recipientId);
-}
-
-function cleanupNotificationTargetsForDeletedReferences(input: { accountIds?: string[]; recipientIds?: string[] }) {
-  const accountIds = new Set((input.accountIds ?? []).map((item) => item.trim()).filter(Boolean));
-  const recipientIds = new Set((input.recipientIds ?? []).map((item) => item.trim()).filter(Boolean));
-  if (!accountIds.size && !recipientIds.size) return;
-
-  const cleanTargets = (rawTargets: unknown) => {
-    const mapped: Array<NotificationRuleTarget | null> = sanitizeNotificationTargets(parseJsonValue<NotificationRuleTarget[]>(rawTargets, []))
-    .map((target): NotificationRuleTarget | null => {
-      if (target.accountId && accountIds.has(target.accountId)) return null;
-      if (target.recipientId && recipientIds.has(target.recipientId)) return null;
-      const next = { ...target };
-      if (next.senderAccountId && accountIds.has(next.senderAccountId)) delete next.senderAccountId;
-      return next;
-    });
-    return mapped.filter((target): target is NotificationRuleTarget => Boolean(target));
-  };
-
-  const rules = db.prepare("select id, targets from notification_rules").all() as Array<{ id?: string; targets?: unknown }>;
-  for (const rule of rules) {
-    const targets = cleanTargets(rule.targets);
-    if (!targets.length) db.prepare("delete from notification_rules where id = ?").run(String(rule.id));
-    else db.prepare("update notification_rules set targets = ?, updated_at = ? where id = ?").run(JSON.stringify(targets), new Date().toISOString(), String(rule.id));
-  }
-
-  const ephemeralRules = db.prepare("select id, targets from notification_ephemeral_rules").all() as Array<{ id?: string; targets?: unknown }>;
-  for (const rule of ephemeralRules) {
-    const targets = cleanTargets(rule.targets);
-    if (!targets.length) db.prepare("delete from notification_ephemeral_rules where id = ?").run(String(rule.id));
-    else db.prepare("update notification_ephemeral_rules set targets = ? where id = ?").run(JSON.stringify(targets), String(rule.id));
-  }
-}
-
-function deleteNotificationAccount(accountId: string, options: { deleteLinkedRecipients?: boolean } = {}) {
-  const linkedRecipients = (db.prepare("select id from notification_recipients where sender_account_id = ?").all(accountId) as Array<{ id?: string }>)
-    .map((row) => String(row.id ?? "").trim())
-    .filter(Boolean);
-  const result = db.prepare("delete from notification_accounts where id = ?").run(accountId);
-  if (!result.changes) return { deleted: false, linkedRecipientIds: [] as string[] };
-  if (options.deleteLinkedRecipients) {
-    db.prepare("delete from notification_recipients where sender_account_id = ?").run(accountId);
-    cleanupNotificationTargetsForDeletedReferences({ accountIds: [accountId], recipientIds: linkedRecipients });
-    return { deleted: true, linkedRecipientIds: linkedRecipients };
-  }
-  db.prepare("update notification_recipients set sender_account_id = null, updated_at = ? where sender_account_id = ?").run(new Date().toISOString(), accountId);
-  cleanupNotificationTargetsForDeletedReferences({ accountIds: [accountId] });
-  return { deleted: true, linkedRecipientIds: linkedRecipients };
-}
-
-function renderNotificationTemplate(template: string, event: NotificationEventInput, extra: Record<string, unknown> = {}) {
-  const values: Record<string, unknown> = {
-    ...extra,
-    title: event.title,
-    message: event.message,
-    severity: event.severity,
-    eventType: event.eventType,
-    sourceType: event.sourceType ?? "",
-    sourceId: event.sourceId ?? "",
-    createdAt: new Date().toISOString(),
-    metadata: event.metadata ?? {},
-  };
-  return template.replace(/\{\{\s*([\w.]+)\s*\}\}/g, (_, path: string) => {
-    const value = path.split(".").reduce<unknown>((current, key) => current && typeof current === "object" ? (current as Record<string, unknown>)[key] : undefined, values);
-    return value === undefined || value === null ? "" : String(value);
-  });
-}
-
-function parseNotificationHeaders(template: string, event: NotificationEventInput, extra: Record<string, unknown>) {
-  return Object.fromEntries(String(template ?? "").split("\n").map((line) => {
-    const rendered = renderNotificationTemplate(line, event, extra);
-    const index = rendered.indexOf(":");
-    return index > 0 ? [rendered.slice(0, index).trim(), rendered.slice(index + 1).trim()] : ["", ""];
-  }).filter(([key]) => key));
-}
-
-function parseWebhookPayload(request: Request, rawBody: Buffer) {
-  const contentType = request.headers.get("content-type")?.toLowerCase() ?? "";
-  const text = rawBody.toString("utf8");
-  if (contentType.includes("application/json") || text.trim().startsWith("{") || text.trim().startsWith("[")) {
-    try {
-      return JSON.parse(text) as Record<string, unknown>;
-    } catch {
-      return { body: text };
-    }
-  }
-  if (contentType.includes("application/x-www-form-urlencoded")) {
-    const params = new URLSearchParams(text);
-    return Object.fromEntries(params.entries());
-  }
-  return { body: text };
-}
-
-function validateWebhookToken(secret: string, request: Request) {
-  if (secret === "INSECURE_NO_AUTH") return host === "127.0.0.1" || host === "localhost" || host === "::1";
-  const provided = [
-    request.headers.get("x-webhook-token"),
-    request.headers.get("authorization")?.replace(/^Bearer\s+/i, ""),
-    new URL(request.url).searchParams.get("token"),
-  ].find((value) => Boolean(value))?.trim();
-  return Boolean(provided && provided === secret);
-}
-
-function normalizeWebhookConfig(config: Record<string, unknown>) {
-  const copy = { ...config };
-  if (copy.serverUrl) copy.serverUrl = String(copy.serverUrl).replace(/\/+$/, "");
-  if (!copy.serverUrl && copy.deviceKey) copy.serverUrl = "https://api.day.app";
-  if (!copy.group) copy.group = "Codex Web";
-  return copy;
-}
-
-async function sendWebhookNotification(channel: NotificationChannelDefinition | null, config: Record<string, unknown>, event: NotificationEventInput) {
-  const webhookConfig = normalizeWebhookConfig(config);
-  const method = String(channel?.method ?? webhookConfig.method ?? "POST").toUpperCase();
-  const headers = {
-    "content-type": "application/json",
-    ...(typeof webhookConfig.headers === "object" && webhookConfig.headers ? webhookConfig.headers as Record<string, string> : {}),
-    ...parseNotificationHeaders(channel?.headersTemplate ?? "", event, webhookConfig),
-  };
-  const urlTemplate = channel?.urlTemplate || String(webhookConfig.url ?? "");
-  if (!urlTemplate.trim()) throw new Error("webhook_url_required");
-  const renderedUrl = new URL(renderNotificationTemplate(urlTemplate, event, webhookConfig));
-  if (channel?.authType === "bearer") {
-    const token = String(webhookConfig.token ?? webhookConfig.accessToken ?? webhookConfig.bearerToken ?? "").trim();
-    if (!token) throw new Error("webhook_bearer_token_required");
-    headers.authorization = `Bearer ${token}`;
-  }
-  if (channel?.authType === "query_token") {
-    const token = String(webhookConfig.token ?? webhookConfig.accessToken ?? "").trim();
-    if (!token) throw new Error("webhook_query_token_required");
-    renderedUrl.searchParams.set(String(webhookConfig.tokenParam ?? "access_token"), token);
-  }
-  if (channel?.authType === "token_request") {
-    throw new Error("webhook_token_request_auth_not_configured");
-  }
-  const bodyTemplate = channel?.bodyTemplate || String(webhookConfig.bodyTemplate ?? "") || JSON.stringify(event);
-  const init: RequestInit = {
-    method,
-    headers,
-  };
-  if (method !== "GET" && method !== "HEAD") init.body = renderNotificationTemplate(bodyTemplate, event, webhookConfig);
-  const response = await fetch(renderedUrl.toString(), init);
-  const text = await response.text().catch(() => "");
-  if (!response.ok) throw new Error(text.slice(0, 500) || `webhook_http_${response.status}`);
-  if (channel?.id === "bark" && text && /"code"\s*:\s*(?!200\b)\d+/i.test(text)) throw new Error(text.slice(0, 500) || `bark_http_${response.status}`);
-  return { responseStatus: response.status };
-}
-
-async function sendNotificationToAccount(account: NotificationAccountRecord, event: NotificationEventInput, target?: NotificationRuleTarget) {
-  const config = account.config;
-  const customChannel = account.channelId ? getNotificationChannel(account.channelId) : null;
-  if (account.channelKind === "webhook" && customChannel?.id && customChannel.id !== "webhook") return sendWebhookNotification(customChannel, config, event);
-  if (account.channelKind === "email") return sendEmailNotification(account, event, target);
-  if (account.channelKind === "telegram") {
-    if (!config.botToken) throw new Error("telegram_bot_token_required");
-    if (!target?.chatId) throw new Error("telegram_chat_id_required");
-    const response = await telegramBotApi(account, "sendMessage", {
-      chat_id: target.chatId,
-      text: `${event.title}\n\n${event.message}`,
-      disable_web_page_preview: true,
-    });
-    const text = await response.text().catch(() => "");
-    if (!response.ok) throw new Error(text.slice(0, 500) || `telegram_http_${response.status}`);
-    return { responseStatus: response.status };
-  }
-  if (account.channelKind === "weixin") return weixinPlatform.sendNotification(account, event, target);
-  if (account.channelKind === "wecom") return wecomPlatform.sendNotification(account, event, target);
-  if (account.channelKind === "dingtalk") return dingtalkPlatform.sendNotification(account, event);
-  if (account.channelKind === "feishu") return feishuPlatform.sendNotification(account, event, target);
-  if (account.channelKind === "qq") return qqPlatform.sendNotification(account, event, target);
-  if (account.channelKind === "bark") return sendWebhookNotification(getNotificationChannel("bark"), config, event);
-  return sendWebhookNotification(customChannel, config, event);
-}
-
-function telegramApiBase(account: NotificationAccountRecord) {
-  const config = account.config as Record<string, unknown>;
-  const proxyUrl = String(config.proxyUrl ?? "").trim();
-  return (proxyUrl || "https://api.telegram.org").replace(/\/+$/, "");
-}
-
-async function telegramBotApi(account: NotificationAccountRecord, method: string, payload: Record<string, unknown>) {
-  const config = account.config as Record<string, unknown>;
-  if (!config.botToken) throw new Error("telegram_bot_token_required");
-  return fetch(`${telegramApiBase(account)}/bot${String(config.botToken)}/${method}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
-  });
-}
-
-async function syncTelegramBotCommands(account: NotificationAccountRecord) {
-  if (account.channelKind !== "telegram") return;
-  const config = account.config as Record<string, unknown>;
-  if (!config.botToken || config.botToken === "********") return;
-  const language = notificationLanguageFromConfig(config);
-  const commands = language === "en-US" ? [
-    { command: "start", description: "Show bot help" },
-    { command: "sessions", description: "List recent sessions" },
-    { command: "agents", description: "List agents" },
-    { command: "rooms", description: "List rooms" },
-    { command: "files", description: "Browse files" },
-    { command: "terminal", description: "Run a terminal command" },
-    { command: "bind", description: "Bind this chat to a session" },
-    { command: "unbind", description: "Clear the bound session" },
-    { command: "send", description: "Send a message to a session" },
-    { command: "help", description: "Show help" },
-  ] : [
-    { command: "start", description: "显示机器人帮助" },
-    { command: "sessions", description: "列出最近会话" },
-    { command: "agents", description: "列出代理" },
-    { command: "rooms", description: "列出 Room" },
-    { command: "files", description: "浏览文件" },
-    { command: "terminal", description: "运行终端命令" },
-    { command: "bind", description: "把当前聊天绑定到会话" },
-    { command: "unbind", description: "清除绑定的会话" },
-    { command: "send", description: "向会话发送消息" },
-    { command: "help", description: "显示帮助" },
-  ];
-  if (account.enabled && config.inboundEnabled === true) {
-    await telegramBotApi(account, "setMyCommands", {
-      commands,
-    });
-    await telegramBotApi(account, "setChatMenuButton", {
-      menu_button: { type: "commands" },
-    });
-    return;
-  }
-  await telegramBotApi(account, "deleteMyCommands", {});
-  await telegramBotApi(account, "setChatMenuButton", {
-    menu_button: { type: "default" },
-  });
-}
-
-function notificationDeliveryMetadata(account: NotificationAccountRecord, event: NotificationEventInput, target?: NotificationRuleTarget, recipient?: NotificationRecipientSummary) {
-  return {
-    eventMetadata: event.metadata ?? {},
-    sourceType: event.sourceType ?? null,
-    sourceId: event.sourceId ?? null,
-    target: target ? {
-      accountId: target.accountId ?? null,
-      recipientId: target.recipientId ?? null,
-      senderAccountId: target.senderAccountId ?? null,
-      chatId: target.chatId ?? null,
-      emailToCount: target.emailTo?.length ?? 0,
-      emailTo: target.emailTo ?? [],
-    } : null,
-    account: {
-      id: account.id,
-      name: account.name,
-      kind: account.channelKind,
-      channelId: account.channelId ?? null,
-    },
-    recipient: recipient ? {
-      id: recipient.id,
-      name: recipient.name,
-      kind: recipient.kind,
-      senderAccountId: recipient.senderAccountId ?? null,
-      channelId: recipient.channelId ?? null,
-    } : null,
-  };
-}
-
-async function deliverNotification(account: NotificationAccountRecord, event: NotificationEventInput, ruleId: string | null, target?: NotificationRuleTarget, recipient?: NotificationRecipientSummary) {
-  const id = `notification-delivery-${randomUUID()}`;
-  const createdAt = new Date().toISOString();
-  db.prepare(`
-    insert into notification_deliveries (id, rule_id, account_id, event_type, severity, title, message, status, attempts, metadata, created_at)
-    values (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
-  `).run(id, ruleId, account.id, event.eventType, event.severity, event.title, event.message, JSON.stringify(notificationDeliveryMetadata(account, event, target, recipient)), createdAt);
-  try {
-    const result = await sendNotificationToAccount(account, event, target);
-    db.prepare("update notification_deliveries set status = 'sent', attempts = 1, response_status = ?, sent_at = ? where id = ?").run(result.responseStatus ?? null, new Date().toISOString(), id);
-    return true;
-  } catch (error) {
-    db.prepare("update notification_deliveries set status = 'failed', attempts = 1, last_error = ? where id = ?").run(error instanceof Error ? error.message : String(error), id);
-    return false;
-  }
-}
-
-function chooseEmailNotificationSender(recipient: NotificationRecipientSummary, target?: NotificationRuleTarget) {
-  const emailSenders = listNotificationAccounts(true).filter((account) => account.enabled && account.channelKind === "email");
-  return (target?.senderAccountId ? emailSenders.find((account) => account.id === target.senderAccountId) : null)
-    ?? (recipient.senderAccountId ? emailSenders.find((account) => account.id === recipient.senderAccountId) : null)
-    ?? (emailSenders.length === 1 ? emailSenders[0] : null);
-}
-
-function chooseTelegramNotificationSender(recipient: NotificationRecipientSummary, target?: NotificationRuleTarget) {
-  const telegramSenders = listNotificationAccounts(true).filter((account) => account.enabled && account.channelKind === "telegram");
-  return (target?.senderAccountId ? telegramSenders.find((account) => account.id === target.senderAccountId) : null)
-    ?? (recipient.senderAccountId ? telegramSenders.find((account) => account.id === recipient.senderAccountId) : null)
-    ?? (telegramSenders.length === 1 ? telegramSenders[0] : null);
-}
-
-function chooseWeixinNotificationSender(recipient: NotificationRecipientSummary, target?: NotificationRuleTarget) {
-  const weixinSenders = listNotificationAccounts(true).filter((account) => account.enabled && account.channelKind === "weixin");
-  return (target?.senderAccountId ? weixinSenders.find((account) => account.id === target.senderAccountId) : null)
-    ?? (recipient.senderAccountId ? weixinSenders.find((account) => account.id === recipient.senderAccountId) : null)
-    ?? (weixinSenders.length === 1 ? weixinSenders[0] : null);
-}
-
-function chooseWeComNotificationSender(recipient: NotificationRecipientSummary, target?: NotificationRuleTarget) {
-  const wecomSenders = listNotificationAccounts(true).filter((account) => account.enabled && account.channelKind === "wecom");
-  return (target?.senderAccountId ? wecomSenders.find((account) => account.id === target.senderAccountId) : null)
-    ?? (recipient.senderAccountId ? wecomSenders.find((account) => account.id === recipient.senderAccountId) : null)
-    ?? (wecomSenders.length === 1 ? wecomSenders[0] : null);
-}
-
-function chooseDingtalkNotificationSender(recipient: NotificationRecipientSummary, target?: NotificationRuleTarget) {
-  const dingtalkSenders = listNotificationAccounts(true).filter((account) => account.enabled && account.channelKind === "dingtalk");
-  return (target?.senderAccountId ? dingtalkSenders.find((account) => account.id === target.senderAccountId) : null)
-    ?? (recipient.senderAccountId ? dingtalkSenders.find((account) => account.id === recipient.senderAccountId) : null)
-    ?? (dingtalkSenders.length === 1 ? dingtalkSenders[0] : null);
-}
-
-function chooseFeishuNotificationSender(recipient: NotificationRecipientSummary, target?: NotificationRuleTarget) {
-  const feishuSenders = listNotificationAccounts(true).filter((account) => account.enabled && account.channelKind === "feishu");
-  return (target?.senderAccountId ? feishuSenders.find((account) => account.id === target.senderAccountId) : null)
-    ?? (recipient.senderAccountId ? feishuSenders.find((account) => account.id === recipient.senderAccountId) : null)
-    ?? (feishuSenders.length === 1 ? feishuSenders[0] : null);
-}
-
-function chooseQQNotificationSender(recipient: NotificationRecipientSummary, target?: NotificationRuleTarget) {
-  const qqSenders = listNotificationAccounts(true).filter((account) => account.enabled && account.channelKind === "qq");
-  return (target?.senderAccountId ? qqSenders.find((account) => account.id === target.senderAccountId) : null)
-    ?? (recipient.senderAccountId ? qqSenders.find((account) => account.id === recipient.senderAccountId) : null)
-    ?? (qqSenders.length === 1 ? qqSenders[0] : null);
-}
-
-async function deliverNotificationToRecipient(recipient: NotificationRecipientSummary, event: NotificationEventInput, ruleId: string | null, target?: NotificationRuleTarget) {
-  if (recipient.kind === "email") {
-    const sender = chooseEmailNotificationSender(recipient, target);
-    if (!sender) throw new Error("email_sender_required");
-    return deliverNotification(sender, event, ruleId, { recipientId: recipient.id, accountId: sender.id, emailTo: [String(recipient.config.email ?? "")].filter(Boolean) }, recipient);
-  }
-  if (recipient.kind === "telegram") {
-    const sender = chooseTelegramNotificationSender(recipient, target);
-    if (!sender) throw new Error("telegram_sender_required");
-    return deliverNotification(sender, event, ruleId, { recipientId: recipient.id, accountId: sender.id, chatId: String(recipient.config.chatId ?? "") }, recipient);
-  }
-  if (recipient.kind === "weixin") {
-    const sender = chooseWeixinNotificationSender(recipient, target);
-    if (!sender) throw new Error("weixin_sender_required");
-    return deliverNotification(sender, event, ruleId, { recipientId: recipient.id, accountId: sender.id, chatId: String(recipient.config.chatId ?? "") }, recipient);
-  }
-  if (recipient.kind === "wecom") {
-    const sender = chooseWeComNotificationSender(recipient, target);
-    if (!sender) throw new Error("wecom_sender_required");
-    return deliverNotification(sender, event, ruleId, { recipientId: recipient.id, accountId: sender.id, chatId: String(recipient.config.chatId ?? "") }, recipient);
-  }
-  if (recipient.kind === "dingtalk") {
-    const sender = chooseDingtalkNotificationSender(recipient, target);
-    if (!sender) throw new Error("dingtalk_sender_required");
-    return deliverNotification(sender, event, ruleId, { recipientId: recipient.id, accountId: sender.id }, recipient);
-  }
-  if (recipient.kind === "qq") {
-    const sender = chooseQQNotificationSender(recipient, target);
-    if (!sender) throw new Error("qq_sender_required");
-    return deliverNotification(sender, event, ruleId, { recipientId: recipient.id, accountId: sender.id, chatId: String(recipient.config.chatId ?? "") }, recipient);
-  }
-  if (recipient.kind === "feishu") {
-    const sender = chooseFeishuNotificationSender(recipient, target);
-    if (!sender) throw new Error("feishu_sender_required");
-    return deliverNotification(sender, event, ruleId, { recipientId: recipient.id, accountId: sender.id, chatId: String(recipient.config.chatId ?? "") }, recipient);
-  }
-  const account: NotificationAccountRecord = {
-    id: recipient.id,
-    name: recipient.name,
-    channelId: recipient.channelId ?? null,
-    channelKind: "webhook",
-    enabled: recipient.enabled,
-    config: recipient.config,
-    createdAt: recipient.createdAt,
-    updatedAt: recipient.updatedAt,
-  };
-  return deliverNotification(account, event, ruleId, { recipientId: recipient.id, accountId: account.id }, recipient);
-}
-
-function notificationRecentlyDelivered(ruleId: string, accountId: string, eventType: NotificationEventType, dedupeMinutes: number) {
-  if (dedupeMinutes <= 0) return false;
-  const since = new Date(Date.now() - dedupeMinutes * 60_000).toISOString();
-  return Boolean(db.prepare(`
-    select id from notification_deliveries
-    where rule_id = ? and account_id = ? and event_type = ? and created_at >= ? and status in ('sent', 'pending')
-    limit 1
-  `).get(ruleId, accountId, eventType, since));
-}
-
-function notificationEventTypesFromPrompt(prompt: string): NotificationEventType[] {
-  const text = prompt.toLowerCase();
-  if (/审批|批准|确认|approval/.test(text)) return ["needs_approval"];
-  if (/失败|报错|错误|fail|error/.test(text)) return ["task_failed"];
-  return ["task_completed"];
-}
-
-function registerEphemeralNotificationsFromPrompt(session: SessionSummary, prompt: string) {
-  const text = prompt.trim();
-  if (!/通知|提醒|notify/i.test(text)) return;
-  const recipients = listNotificationRecipients(true).filter((recipient) => recipient.enabled);
-  const normalized = text.toLowerCase().replace(/\s+/g, "");
-  const matched = recipients.filter((recipient) => {
-    const name = recipient.name.toLowerCase().replace(/\s+/g, "");
-    return name && normalized.includes(name);
-  });
-  const targets = (matched.length ? matched : recipients.length === 1 ? recipients : [])
-    .map((recipient) => ({ recipientId: recipient.id }));
-  if (!targets.length) return;
-  const now = new Date().toISOString();
-  db.prepare(`
-    insert into notification_ephemeral_rules (id, scope_type, scope_id, event_types, targets, enabled, expire_mode, created_at)
-    values (?, 'session', ?, ?, ?, 1, 'after_trigger', ?)
-  `).run(
-    `notification-ephemeral-${randomUUID()}`,
-    session.id,
-    JSON.stringify(notificationEventTypesFromPrompt(text)),
-    JSON.stringify(targets),
-    now,
-  );
-}
-
-function notificationScopesForEvent(event: NotificationEventInput) {
-  const scopes: Array<{ scopeType: "session" | "task" | "room_task" | "automation"; scopeId: string }> = [];
-  if (event.sourceType === "session" && event.sourceId) scopes.push({ scopeType: "session", scopeId: event.sourceId });
-  if (event.sourceType === "automation" && event.sourceId) scopes.push({ scopeType: "automation", scopeId: event.sourceId });
-  const metadataScopes = Array.isArray(event.metadata?.notificationScopes) ? event.metadata.notificationScopes : [];
-  for (const item of metadataScopes) {
-    if (!item || typeof item !== "object") continue;
-    const record = item as Record<string, unknown>;
-    const scopeType = record.scopeType === "session" || record.scopeType === "task" || record.scopeType === "room_task" || record.scopeType === "automation" ? record.scopeType : null;
-    const scopeId = typeof record.scopeId === "string" && record.scopeId.trim() ? record.scopeId.trim() : "";
-    if (scopeType && scopeId) scopes.push({ scopeType, scopeId });
-  }
-  return Array.from(new Map(scopes.map((scope) => [`${scope.scopeType}:${scope.scopeId}`, scope])).values());
-}
-
-function listEphemeralNotificationRulesForEvent(event: NotificationEventInput) {
-  const scopes = notificationScopesForEvent(event);
-  if (!scopes.length) return [];
-  const rows = scopes.flatMap((scope) => db.prepare(`
-    select * from notification_ephemeral_rules
-    where enabled = 1 and scope_type = ? and scope_id = ?
-    order by created_at asc
-  `).all(scope.scopeType, scope.scopeId) as Array<Record<string, unknown>>);
-  return rows
-    .map((row) => ({
-      id: String(row.id),
-      scopeType: String(row.scope_type),
-      scopeId: String(row.scope_id),
-      eventTypes: parseJsonValue<NotificationEventType[]>(row.event_types, []).filter((type) => notificationEventTypes.includes(type)),
-      targets: sanitizeNotificationTargets(parseJsonValue<NotificationRuleTarget[]>(row.targets, [])),
-      expireMode: String(row.expire_mode),
-    }))
-    .filter((rule) => rule.eventTypes.includes(event.eventType) && rule.targets.length);
-}
-
-async function createExternalNotification(event: NotificationEventInput) {
-  const accounts = new Map(listNotificationAccounts(true).filter((account) => account.enabled).map((account) => [account.id, account]));
-  const recipients = new Map(listNotificationRecipients(true).filter((recipient) => recipient.enabled).map((recipient) => [recipient.id, recipient]));
-  const rules = listAllNotificationRules().filter((rule) =>
-    rule.enabled
-    && rule.eventTypes.includes(event.eventType)
-    && notificationSeverityRank[event.severity] >= notificationSeverityRank[rule.minSeverity]
-  );
-  for (const rule of rules) {
-    for (const target of rule.targets) {
-      if (target.recipientId) {
-        const recipient = recipients.get(target.recipientId);
-        if (!recipient || notificationRecentlyDelivered(rule.id, recipient.id, event.eventType, rule.dedupeMinutes)) continue;
-        void deliverNotificationToRecipient(recipient, event, rule.id, target).catch((error) => console.error("recipient notification failed", error));
-        continue;
-      }
-      if (!target.accountId) continue;
-      const account = accounts.get(target.accountId);
-      if (!account || notificationRecentlyDelivered(rule.id, account.id, event.eventType, rule.dedupeMinutes)) continue;
-      void deliverNotification(account, event, rule.id, target);
-    }
-  }
-  for (const rule of listEphemeralNotificationRulesForEvent(event)) {
-    for (const target of rule.targets) {
-      if (!target.recipientId) continue;
-      const recipient = recipients.get(target.recipientId);
-      if (!recipient) continue;
-      void deliverNotificationToRecipient(recipient, event, rule.id, target).catch((error) => console.error("ephemeral recipient notification failed", error));
-    }
-    if (rule.expireMode === "after_trigger") {
-      db.prepare("update notification_ephemeral_rules set enabled = 0, triggered_at = ? where id = ?").run(new Date().toISOString(), rule.id);
-    }
-  }
-}
-
-function sessionNotificationsEnabled(session?: SessionSummary | null) {
-  return session?.notificationsEnabled !== false;
-}
-
-function roomSessionForRoomId(roomId?: string | null) {
-  if (!roomId) return null;
-  const room = db.prepare("select session_id from rooms where id = ?").get(roomId) as { session_id?: string | null } | undefined;
-  return room?.session_id ? appData.sessions.find((session) => session.id === room.session_id) ?? null : null;
-}
-
-function notificationsEnabledForEvent(event: NotificationEventInput) {
-  const sourceSession = event.sourceType === "session" && event.sourceId
-    ? appData.sessions.find((session) => session.id === event.sourceId)
-    : null;
-  if (sourceSession && !sessionNotificationsEnabled(sourceSession)) return false;
-  const metadataRoomId = typeof event.metadata?.roomId === "string" ? event.metadata.roomId : null;
-  const roomSession = roomSessionForRoomId(metadataRoomId ?? sourceSession?.roomId ?? null);
-  if (roomSession && !sessionNotificationsEnabled(roomSession)) return false;
-  return true;
-}
-
-function emitExternalNotification(event: NotificationEventInput) {
-  if (!notificationsEnabledForEvent(event)) return;
-  createAppNotification(event);
-  void createExternalNotification(event).catch((error) => console.error("notification dispatch failed", error));
-}
-
-function automationRanInMinute(automationId: string, minuteKey: string) {
-  const row = db.prepare(`
-    select id from automation_runs
-    where automation_id = ? and substr(started_at, 1, 16) = ?
-    limit 1
-  `).get(automationId, minuteKey) as Record<string, unknown> | undefined;
-  return Boolean(row);
-}
-
-function automationHasRunningRun(automationId: string) {
-  const row = db.prepare("select id from automation_runs where automation_id = ? and status = 'running' limit 1").get(automationId) as Record<string, unknown> | undefined;
-  return Boolean(row);
-}
-
-function cronFieldMatches(field: string, value: number, min: number, max: number) {
-  return field.split(",").some((part) => {
-    const item = part.trim();
-    if (!item) return false;
-    if (item === "*") return true;
-    const stepMatch = item.match(/^\*\/(\d+)$/);
-    if (stepMatch) {
-      const step = Number(stepMatch[1]);
-      return step > 0 && (value - min) % step === 0;
-    }
-    const rangeMatch = item.match(/^(\d+)-(\d+)$/);
-    if (rangeMatch) {
-      const start = Number(rangeMatch[1]);
-      const end = Number(rangeMatch[2]);
-      return start <= value && value <= end;
-    }
-    const exact = Number(item);
-    return Number.isInteger(exact) && exact >= min && exact <= max && exact === value;
-  });
-}
-
-function cronMatches(expression: string, now: Date) {
-  const fields = expression.trim().split(/\s+/);
-  if (fields.length !== 5) return false;
-  const [minute, hour, dayOfMonth, month, dayOfWeek] = fields;
-  return cronFieldMatches(minute, now.getMinutes(), 0, 59)
-    && cronFieldMatches(hour, now.getHours(), 0, 23)
-    && cronFieldMatches(dayOfMonth, now.getDate(), 1, 31)
-    && cronFieldMatches(month, now.getMonth() + 1, 1, 12)
-    && cronFieldMatches(dayOfWeek, now.getDay(), 0, 7);
-}
-
-function nextAutomationRunAt(automation: AutomationSummary, from = new Date()) {
-  if (automation.status !== "active") return null;
-  const schedule = automation.schedule.trim().toLowerCase();
-  if (schedule === "manual") return null;
-  if (schedule === "startup") return null;
-  const next = new Date(from);
-  next.setSeconds(0, 0);
-  next.setMinutes(next.getMinutes() + 1);
-  if (schedule === "hourly") {
-    next.setMinutes(0, 0, 0);
-    if (next <= from) next.setHours(next.getHours() + 1);
-    return next.toISOString();
-  }
-  const daily = schedule.match(/^daily\s+([0-2]\d):([0-5]\d)$/);
-  if (daily) {
-    next.setHours(Number(daily[1]), Number(daily[2]), 0, 0);
-    if (next <= from) next.setDate(next.getDate() + 1);
-    return next.toISOString();
-  }
-  const weekly = schedule.match(/^weekly\s+([0-7])\s+([0-2]\d):([0-5]\d)$/);
-  if (weekly) {
-    const targetDay = Number(weekly[1]) % 7;
-    next.setHours(Number(weekly[2]), Number(weekly[3]), 0, 0);
-    const delta = (targetDay - next.getDay() + 7) % 7;
-    next.setDate(next.getDate() + delta);
-    if (next <= from) next.setDate(next.getDate() + 7);
-    return next.toISOString();
-  }
-  if (schedule.startsWith("cron ")) {
-    const expression = schedule.slice(5);
-    const probe = new Date(next);
-    for (let i = 0; i < 366 * 24 * 60; i++) {
-      if (cronMatches(expression, probe)) return probe.toISOString();
-      probe.setMinutes(probe.getMinutes() + 1);
-    }
-  }
-  return null;
-}
-
-function shouldRunAutomationNow(automation: AutomationSummary, now = new Date()) {
-  if (automation.status !== "active") return false;
-  const schedule = automation.schedule.trim().toLowerCase();
-  if (!schedule || schedule === "manual" || schedule === "startup") return false;
-  const minuteKey = now.toISOString().slice(0, 16);
-  if (automationRanInMinute(automation.id, minuteKey)) return false;
-  if (schedule === "hourly") return now.getMinutes() === 0;
-  const daily = schedule.match(/^daily\s+([0-2]\d):([0-5]\d)$/);
-  if (daily) return now.getHours() === Number(daily[1]) && now.getMinutes() === Number(daily[2]);
-  const weekly = schedule.match(/^weekly\s+([0-7])\s+([0-2]\d):([0-5]\d)$/);
-  if (weekly) {
-    const day = Number(weekly[1]) % 7;
-    return now.getDay() === day && now.getHours() === Number(weekly[2]) && now.getMinutes() === Number(weekly[3]);
-  }
-  if (schedule.startsWith("cron ")) return cronMatches(schedule.slice(5), now);
-  return false;
-}
-
-function isValidAutomationSchedule(schedule: string) {
-  const value = schedule.trim().toLowerCase();
-  return value === "manual"
-    || value === "startup"
-    || value === "hourly"
-    || /^daily\s+[0-2]\d:[0-5]\d$/.test(value)
-    || /^weekly\s+[0-7]\s+[0-2]\d:[0-5]\d$/.test(value)
-    || (value.startsWith("cron ") && value.slice(5).trim().split(/\s+/).length === 5);
-}
-
-function latestAutomationSession(automationId: string) {
-  const linked = db.prepare("select session_id from automations where id = ?").get(automationId) as { session_id?: string | null } | undefined;
-  if (linked?.session_id) {
-    const session = appData.sessions.find((item) => item.id === linked.session_id);
-    if (session) return session;
-    db.prepare("update automations set session_id = null where id = ?").run(automationId);
-  }
-  const existingRun = db.prepare(`
-    select session_id from automation_runs
-    where automation_id = ?
-    order by started_at desc, id desc
-    limit 1
-  `).get(automationId) as { session_id?: string | null } | undefined;
-  if (!existingRun?.session_id) return null;
-  const session = appData.sessions.find((item) => item.id === existingRun.session_id) ?? null;
-  if (session) linkAutomationSession(automationId, session.id);
-  return session;
-}
-
-function linkAutomationSession(automationId: string, sessionId: string) {
-  db.prepare("update automations set session_id = ? where id = ?").run(sessionId, automationId);
-}
-
-function automationIdForSession(sessionId: string) {
-  const row = db.prepare("select id from automations where session_id = ?").get(sessionId) as { id?: string } | undefined;
-  return row?.id ?? null;
-}
-
-function sessionHasExistingAutomationOwner(sessionId: string) {
-  if (appData.automations.some((automation) => automation.sessionId === sessionId)) return true;
-  const row = db.prepare(`
-    select automation_runs.automation_id
-    from automation_runs
-    inner join automations on automations.id = automation_runs.automation_id
-    where automation_runs.session_id = ?
-    limit 1
-  `).get(sessionId) as { automation_id?: string } | undefined;
-  return Boolean(row?.automation_id);
-}
-
-function sessionVisibleInChatTools(session: SessionSummary) {
-  if (session.conversationType === "agent" && session.roomId) return false;
-  if (session.conversationType === "automation" && sessionHasExistingAutomationOwner(session.id)) return false;
-  return true;
-}
-
-function ensureAutomationSession(automation: AutomationSummary) {
-  const project = automation.projectId ? appData.projects.find((item) => item.id === automation.projectId) : null;
-  const provider = automation.providerId
-    ? appData.providers.find((item) => item.id === automation.providerId) ?? appData.providers[0]
-    : appData.providers[0];
-  const selectedModel = automation.model ?? provider?.defaultModel ?? null;
-  const existingSession = latestAutomationSession(automation.id);
-  const id = existingSession?.id ?? `task-${randomUUID()}`;
-  const workspacePath = automation.cwd?.trim()
-    ? resolveTerminalCwd(automation.cwd)
-    : project?.workspacePath ? resolveTerminalCwd(project.workspacePath) : ensureScratchSessionWorkspace(id);
-  const now = new Date().toISOString();
-  const session: SessionSummary = existingSession ? {
-    ...existingSession,
-    kind: project ? "project" : "scratch",
-    conversationType: "automation",
-    title: automation.name,
-    projectId: project?.id ?? null,
-    workspacePath,
-    providerId: provider?.id ?? existingSession.providerId ?? null,
-    model: selectedModel ?? existingSession.model ?? null,
-    updatedAt: now,
-  } : {
-    id,
-    kind: project ? "project" : "scratch",
-    conversationType: "automation",
-    title: automation.name,
-    projectId: project?.id ?? null,
-    workspacePath,
-    providerId: provider?.id ?? null,
-    model: selectedModel,
-    status: "paused",
-    createdAt: now,
-    updatedAt: now,
-  };
-  appData.sessions = [session, ...appData.sessions.filter((item) => item.id !== session.id)];
-  linkAutomationSession(automation.id, session.id);
-  return { session, project, provider, selectedModel, workspacePath };
-}
-
-type AutomationRunStartResult = {
-  session: SessionSummary;
-  runStatus: AutomationRunSummary["status"];
-};
-
-function queueAutomationRun(automation: AutomationSummary) {
-  const { session } = ensureAutomationSession(automation);
-  appendSessionMessage(session.id, "system", `Automation run queued: ${automation.name} (${new Date().toISOString()})`);
-  createAutomationRun(automation.id, session.id, "queued");
-  saveAppData();
-  return { session, runStatus: "queued" as const };
-}
-
-function skipAutomationRun(automation: AutomationSummary) {
-  const { session } = ensureAutomationSession(automation);
-  const now = new Date().toISOString();
-  appendSessionMessage(session.id, "system", `Automation run skipped because a previous run is still active: ${automation.name} (${now})`);
-  createAutomationRun(automation.id, session.id, "skipped", now, now);
-  saveAppData();
-  return { session, runStatus: "skipped" as const };
-}
-
-function notificationSnippet(value: string, maxLength = 1800) {
-  const cleaned = value
-    .replace(/\u001b\[[0-9;]*m/g, "")
-    .replace(/\r/g, "")
-    .trim();
-  if (!cleaned) return "";
-  if (cleaned.length <= maxLength) return cleaned;
-  return `${cleaned.slice(0, Math.floor(maxLength / 2)).trimEnd()}\n...\n${cleaned.slice(-Math.floor(maxLength / 2)).trimStart()}`;
-}
-
-function notificationDurationLabel(durationMs?: number | null) {
-  if (!durationMs || !Number.isFinite(durationMs) || durationMs < 0) return "";
-  if (durationMs < 1000) return `${Math.round(durationMs)}ms`;
-  if (durationMs < 60_000) return `${(durationMs / 1000).toFixed(1)}s`;
-  const minutes = Math.floor(durationMs / 60_000);
-  const seconds = Math.round((durationMs % 60_000) / 1000);
-  return `${minutes}m ${seconds}s`;
-}
-
-function automationStatusLabel(input: { exitCode: number | null; stopped?: boolean; timedOut?: boolean }) {
-  if (input.stopped) return "已停止";
-  if (input.timedOut) return "超时";
-  return input.exitCode === 0 ? "成功" : "失败";
-}
-
-function buildAutomationNotificationMessage(input: {
-  automation: AutomationSummary;
-  session: SessionSummary;
-  exitCode: number | null;
-  stopped?: boolean;
-  timedOut?: boolean;
-  durationMs?: number | null;
-  command?: string | null;
-  cwd?: string | null;
-  stdout?: string | null;
-  stderr?: string | null;
-  assistantResult?: string | null;
-  errorSummary?: string | null;
-}) {
-  const duration = notificationDurationLabel(input.durationMs);
-  const lines = [
-    `自动化：${input.automation.name}`,
-    `类型：${input.automation.actionType === "command" ? "系统命令" : "Agent"}`,
-    `状态：${automationStatusLabel(input)}`,
-    `退出码：${input.exitCode ?? "null"}`,
-    duration ? `耗时：${duration}` : "",
-    input.cwd || input.session.workspacePath ? `工作目录：${input.cwd ?? input.session.workspacePath}` : "",
-    `会话：${input.session.title}`,
-    `会话 ID：${input.session.id}`,
-  ].filter(Boolean);
-
-  if (input.command) {
-    lines.push("", "命令：", notificationSnippet(input.command, 800));
-  }
-
-  const stdout = notificationSnippet(input.stdout ?? "", 1600);
-  const stderr = notificationSnippet(input.stderr ?? "", 1600);
-  const assistantResult = notificationSnippet(input.assistantResult ?? "", 2200);
-  const errorSummary = notificationSnippet(input.errorSummary ?? "", 1800);
-
-  if (assistantResult) lines.push("", "执行结果：", assistantResult);
-  if (stdout) lines.push("", "stdout：", stdout);
-  if (stderr) lines.push("", "stderr：", stderr);
-  if (!assistantResult && !stdout && !stderr && errorSummary) lines.push("", "错误摘要：", errorSummary);
-  if (!assistantResult && !stdout && !stderr && !errorSummary) lines.push("", "执行结果：", "没有捕获到可展示的输出。");
-  return lines.join("\n");
-}
-
-function automationForSession(sessionId: string) {
-  const automationId = automationIdForSession(sessionId);
-  return automationId ? appData.automations.find((item) => item.id === automationId) ?? null : null;
-}
-
-function emitAutomationCommandNotification(automation: AutomationSummary, session: SessionSummary, result: { exitCode: number | null; timedOut?: boolean; stopped?: boolean; command?: string; cwd?: string; stdout?: string; stderr?: string; durationMs?: number }) {
-  const stopped = Boolean(result.stopped);
-  const success = result.exitCode === 0 && !result.timedOut && !stopped;
-  const message = buildAutomationNotificationMessage({
-    automation,
-    session,
-    exitCode: result.exitCode,
-    stopped,
-    timedOut: Boolean(result.timedOut),
-    durationMs: result.durationMs,
-    command: result.command ?? automation.command ?? null,
-    cwd: result.cwd ?? session.workspacePath ?? null,
-    stdout: result.stdout ?? null,
-    stderr: result.stderr ?? null,
-  });
-  emitExternalNotification({
-    eventType: stopped ? "task_interrupted" : success ? "task_completed" : "task_failed",
-    severity: stopped ? "warning" : success ? "success" : "error",
-    title: success ? `自动化完成：${automation.name}` : `自动化异常：${automation.name}`,
-    message,
-    sourceType: "session",
-    sourceId: session.id,
-      metadata: {
-        automationId: automation.id,
-        automationName: automation.name,
-        actionType: automation.actionType ?? "agent",
-        command: result.command ?? automation.command ?? null,
-      cwd: result.cwd ?? session.workspacePath ?? null,
-      exitCode: result.exitCode,
-      timedOut: Boolean(result.timedOut),
-        stopped,
-        workspacePath: session.workspacePath,
-        notificationScopes: [
-          { scopeType: "session", scopeId: session.id },
-          { scopeType: "automation", scopeId: automation.id },
-        ],
-      },
-    });
-}
-
-function consecutiveAutomationFailures(automationId: string) {
-  const rows = db.prepare(`
-    select status
-    from automation_runs
-    where automation_id = ?
-    order by started_at desc, id desc
-    limit 20
-  `).all(automationId) as Array<{ status?: string }>;
-  let count = 0;
-  for (const row of rows) {
-    if (row.status !== "failed") break;
-    count += 1;
-  }
-  return count;
-}
-
-function scheduleAutomationRetry(automationId: string, sessionId: string) {
-  const automation = appData.automations.find((item) => item.id === automationId);
-  if (!automation || automation.status !== "active") return;
-  const retryMax = sanitizeAutomationRetryMax(automation.retryMax);
-  if (!retryMax) return;
-  const failures = consecutiveAutomationFailures(automationId);
-  if (failures > retryMax) return;
-  const retryAt = new Date(Date.now() + sanitizeAutomationRetryDelayMinutes(automation.retryDelayMinutes) * 60_000).toISOString();
-  createAutomationRun(automationId, sessionId, "queued", retryAt);
-  appendSessionMessage(sessionId, "system", `Automation retry queued: ${automation.name} (${retryAt})`);
-  saveAppData();
-}
-
-function startNextQueuedAutomationRun(automationId: string) {
-  if (automationHasRunningRun(automationId)) return;
-  const queued = db.prepare(`
-    select id from automation_runs
-    where automation_id = ? and status = 'queued' and started_at <= ?
-    order by started_at asc, id asc
-    limit 1
-  `).get(automationId, new Date().toISOString()) as { id?: string } | undefined;
-  if (!queued?.id) return;
-  const automation = appData.automations.find((item) => item.id === automationId);
-  if (!automation || automation.status !== "active") return;
-  runAutomationNow(automation, queued.id);
-}
-
-function startDueQueuedAutomationRuns() {
-  const rows = db.prepare(`
-    select distinct automation_id
-    from automation_runs
-    where status = 'queued' and started_at <= ?
-  `).all(new Date().toISOString()) as Array<{ automation_id?: string }>;
-  for (const row of rows) {
-    if (row.automation_id) startNextQueuedAutomationRun(String(row.automation_id));
-  }
-}
-
-function runAutomationNow(automation: AutomationSummary, queuedRunId?: string): AutomationRunStartResult {
-  if (!queuedRunId && automationHasRunningRun(automation.id)) {
-    return sanitizeAutomationOverlapPolicy(automation.overlapPolicy) === "skip" ? skipAutomationRun(automation) : queueAutomationRun(automation);
-  }
-  const { session, provider, selectedModel, workspacePath } = ensureAutomationSession(automation);
-  const now = new Date().toISOString();
-  session.status = "running";
-  session.updatedAt = now;
-  appData.sessions = [session, ...appData.sessions.filter((item) => item.id !== session.id)];
-  const isCommand = automation.actionType === "command";
-  const command = automation.command?.trim() ?? "";
-  const content = isCommand ? command : automation.prompt;
-  appendSessionMessage(session.id, "system", `Automation run started: ${automation.name} (${now})`);
-  const userMessage = appendSessionMessage(session.id, "user", content);
-  if (queuedRunId) {
-    db.prepare("update automation_runs set status = 'running', session_id = ?, started_at = ?, finished_at = null, exit_code = null where id = ?").run(session.id, now, queuedRunId);
-  } else {
-    createAutomationRun(automation.id, session.id);
-  }
-  saveAppData();
-  if (isCommand) {
-    const timeoutSeconds = automationCommandTimeoutSeconds(automation.commandTimeoutSeconds);
-    void runLoggedShellCommand(session, command, workspacePath, { timeoutMs: timeoutSeconds === null ? null : timeoutSeconds * 1000, source: "automation" }).then((result) => {
-      appendSessionMessage(session.id, "assistant", formatShellCommandOutput(result, timeoutSeconds));
-      session.status = result.exitCode === 0 && !result.timedOut && !result.stopped ? "done" : "interrupted";
-      session.updatedAt = new Date().toISOString();
-      upsertSession(session);
-      finishAutomationRun(session.id, result.exitCode, Boolean(result.stopped));
-      emitAutomationCommandNotification(automation, session, result);
-      publishTaskEvent(session.id, { type: "done", session, exitCode: result.exitCode });
-    }).catch((error) => {
-      appendSessionMessage(session.id, "assistant", error instanceof Error ? error.message : "Command automation failed");
-      session.status = "interrupted";
-      session.updatedAt = new Date().toISOString();
-      upsertSession(session);
-      finishAutomationRun(session.id, 1, false);
-      emitAutomationCommandNotification(automation, session, { exitCode: 1, command, cwd: workspacePath });
-      publishTaskEvent(session.id, { type: "done", session, exitCode: 1 });
-    });
-  } else {
-    startCodexTask(session, automation.prompt, workspacePath, provider, selectedModel, !session.codexSessionId, [], { currentMessageId: userMessage.id, sourceType: "automation" });
-  }
-  return { session, runStatus: "running" };
-}
-
-function checkScheduledAutomations() {
-  startDueQueuedAutomationRuns();
-  const now = new Date();
-  for (const automation of appData.automations) {
-    if (!shouldRunAutomationNow(automation, now)) continue;
-    try {
-      runAutomationNow(automation);
-    } catch (error) {
-      console.error("automation schedule failed", automation.id, error);
-    }
-  }
-}
-
-function runStartupAutomations() {
-  for (const automation of appData.automations) {
-    if (automation.status !== "active" || automation.schedule.trim().toLowerCase() !== "startup") continue;
-    try {
-      runAutomationNow(automation);
-    } catch (error) {
-      console.error("automation startup failed", automation.id, error);
-    }
-  }
-}
-
-function checkDueRoomSchedules() {
-  const nowDate = new Date();
-  const now = nowDate.toISOString();
-  const schedules = db.prepare(`
-    select * from room_schedules
-    where status = 'active'
-      and schedule_type = 'once'
-      and run_at is not null
-    order by run_at asc, id asc
-    limit 20
-  `).all() as Array<Record<string, unknown>>;
-  for (const schedule of schedules) {
-    const dueAt = new Date(String(schedule.run_at));
-    if (Number.isNaN(dueAt.getTime()) || dueAt > nowDate) continue;
-    const roomId = String(schedule.room_id);
-    const agentId = String(schedule.agent_id);
-    const scheduleId = String(schedule.id);
-    const taskPrompt = String(schedule.task_prompt);
-    const taskId = `room-task-${randomUUID()}`;
-    const taskTitle = taskPrompt.split(/\r?\n/).find((line) => line.trim())?.trim().slice(0, 80) || "Scheduled room task";
-    try {
-      db.prepare(`
-        insert into room_tasks (id, room_id, title, prompt, status, assigned_agent_id, priority, depends_on_task_id, scheduled_at, payload, created_at, updated_at)
-        values (?, ?, ?, ?, 'queued', ?, 0, null, ?, '{}', ?, ?)
-      `).run(taskId, roomId, taskTitle, taskPrompt, agentId, schedule.run_at ?? null, now, now);
-      db.prepare("update room_schedules set status = 'done', updated_at = ? where id = ?").run(now, scheduleId);
-      roomEvent(roomId, "schedule.triggered", { scheduleId, taskId }, agentId);
-      startRoomTaskRun(roomId, taskId);
-    } catch (error) {
-      roomEvent(roomId, "schedule.failed", { scheduleId, taskId, error: error instanceof Error ? error.message : "room_schedule_failed" }, agentId);
-      console.error("room schedule failed", scheduleId, error);
-    }
-  }
-}
-
-function checkScheduledWork() {
-  checkScheduledAutomations();
-  checkDueRoomSchedules();
-}
-
-function messageFromRow(row: Record<string, unknown>): SessionMessage {
-  const replyToMessageId = row.reply_to_message_id ? String(row.reply_to_message_id) : null;
-  const message: SessionMessage = {
-    id: String(row.id),
-    role: row.role as SessionMessage["role"],
-    content: String(row.content),
-    replyToMessageId,
-    createdAt: String(row.created_at),
-  };
-  if (row.reply_id) {
-    message.replyTo = {
-      id: String(row.reply_id),
-      role: row.reply_role as SessionMessage["role"],
-      content: String(row.reply_content),
-    };
-  }
-  return message;
-}
-
-function syncRoomMessagesToSession(session: SessionSummary) {
-  if (session.conversationType !== "room" || !session.roomId) return;
-  const rows = db.prepare(`
-    select id, type, payload, created_at
-    from room_events
-    where room_id = ? and type in ('user.message', 'agent.message')
-    order by created_at asc, id asc
-  `).all(session.roomId) as Array<{ id: string; type: string; payload: string; created_at: string }>;
-  const insert = db.prepare("insert or ignore into messages (id, session_id, role, content, reply_to_message_id, created_at) values (?, ?, ?, ?, ?, ?)");
-  for (const row of rows) {
-    let payload: Record<string, unknown> = {};
-    try {
-      payload = JSON.parse(row.payload) as Record<string, unknown>;
-    } catch {
-      payload = {};
-    }
-    const content = typeof payload.content === "string" ? payload.content.trim() : "";
-    if (!content) continue;
-    const messageId = typeof payload.messageId === "string" && payload.messageId ? payload.messageId : `room-message-${row.id}`;
-    const replyToMessageId = typeof payload.replyToMessageId === "string" ? payload.replyToMessageId : null;
-    const result = insert.run(messageId, session.id, row.type === "agent.message" ? "assistant" : "user", content, replyToMessageId, row.created_at);
-    if (row.type === "agent.message" && result.changes > 0) appendUrlCardsForMessage(session, messageId, content);
-  }
-}
-
-function appendSessionMessage(sessionId: string, role: SessionMessage["role"], content: string, replyToMessageId?: string | null) {
-  const message: SessionMessage = {
-    id: randomUUID(),
-    role,
-    content,
-    replyToMessageId: replyToMessageId ?? null,
-    createdAt: new Date().toISOString(),
-  };
-  db.prepare("insert into messages (id, session_id, role, content, reply_to_message_id, created_at) values (?, ?, ?, ?, ?, ?)").run(
-    message.id,
-    sessionId,
-    role,
-    content,
-    message.replyToMessageId,
-    message.createdAt,
-  );
-  const session = appData.sessions.find((item) => item.id === sessionId);
-  if (session && role === "assistant") {
-    appendUrlCardsForMessage(session, message.id, content);
-    forwardAssistantMessageToEmail(session, message);
-    forwardAssistantMessageToTelegram(session, message);
-    feishuPlatform.forwardAssistantMessageToFeishu(session, message);
-    wecomPlatform.forwardAssistantMessageToWeCom(session, message);
-    qqPlatform.forwardAssistantMessageToQQ(session, message);
-    weixinPlatform.forwardAssistantMessageToWeixin(session, message);
-  }
-  return message;
-}
-
-function getSessionMessage(sessionId: string, messageId?: string | null) {
-  if (!messageId) return null;
-  const row = db.prepare(`
-    select id, role, content, reply_to_message_id, created_at
-    from messages
-    where session_id = ? and id = ?
-  `).get(sessionId, messageId) as Record<string, unknown> | undefined;
-  return row ? messageFromRow(row) : null;
-}
-
-function promptWithReplyContext(sessionId: string, prompt: string, replyToMessageId?: string | null) {
-  const replyTo = getSessionMessage(sessionId, replyToMessageId);
-  if (!replyTo) return prompt;
-  return [
-    "The user is replying to this earlier message:",
-    `Role: ${replyTo.role}`,
-    `Message: ${replyTo.content}`,
-    "",
-    "User reply:",
-    prompt,
-  ].join("\n");
 }
 
 const fallbackContextMessageChars = 1200;
@@ -5677,10 +3386,10 @@ function assignedSkillMarkdown(capabilityId: string) {
   if (!capabilityId.startsWith("skill:")) return "";
   const folder = capabilityId.slice("skill:".length);
   try {
-    const rootPath = assertInsideCodexHome(folder);
+    const rootPath = extensionService.assertInsideCodexHome(folder);
     const skillPath = join(rootPath, "SKILL.md");
     if (!existsSync(skillPath)) return "";
-    const metadata = readSkillMetadata(skillPath);
+    const metadata = extensionService.readSkillMetadata(skillPath);
     const content = readFileSync(skillPath, "utf8").replace(/^---\r?\n[\s\S]*?\r?\n---\s*/m, "").trim();
     return [
       `## ${metadata.name ?? basename(rootPath)}`,
@@ -5697,7 +3406,7 @@ function assignedSkillMarkdown(capabilityId: string) {
 function agentSkillsContext(session: SessionSummary, contextInput?: CodexTaskContextInput) {
   const agentId = contextInput?.agentId ?? directAgentForSession(session.id)?.agent.id ?? null;
   if (!agentId) return "";
-  const skillIds = listSkills().map((skill) => skill.id);
+  const skillIds = extensionService.listSkills().map((skill) => skill.id);
   const sections = skillIds.map(assignedSkillMarkdown).filter(Boolean);
   if (!sections.length) return "";
   return [
@@ -5841,1067 +3550,6 @@ function promptWithManagedContext(
     "",
     "Now complete the current prompt.",
   ].join("\n");
-}
-
-function publishTaskEvent(sessionId: string, event: TaskEvent) {
-  if (event.type === "activity") recordTaskActivity(sessionId, event);
-  for (const subscriber of codexTaskSubscribers.get(sessionId) ?? []) subscriber(event);
-}
-
-function subscribeTaskEvents(sessionId: string, subscriber: (event: TaskEvent) => void) {
-  const subscribers = codexTaskSubscribers.get(sessionId) ?? new Set<(event: TaskEvent) => void>();
-  subscribers.add(subscriber);
-  codexTaskSubscribers.set(sessionId, subscribers);
-  return () => {
-    subscribers.delete(subscriber);
-    if (!subscribers.size) codexTaskSubscribers.delete(sessionId);
-  };
-}
-
-function roomActivitySnapshot(roomId: string) {
-  const roomRow = db.prepare("select * from rooms where id = ?").get(roomId) as Record<string, unknown> | undefined;
-  if (!roomRow) return null;
-  const room = roomFromRow(roomRow);
-  const tasks = (db.prepare("select * from room_tasks where room_id = ? order by priority desc, updated_at desc, id desc limit 30").all(roomId) as Array<Record<string, unknown>>).map(roomTaskFromRow);
-  const runs = (db.prepare("select * from agent_runs where room_id = ? order by started_at desc, id desc limit 30").all(roomId) as Array<Record<string, unknown>>).map(agentRunFromRow);
-  const events = (db.prepare("select * from room_events where room_id = ? order by created_at desc, id desc limit 10").all(roomId) as Array<Record<string, unknown>>).map(roomEventFromRow);
-  const messages = room.sessionId ? allSessionMessages(room.sessionId) : [];
-  return { room, tasks, runs, events, messages };
-}
-
-function publishRoomEvent(roomId: string, event?: RoomEventSummary) {
-  const snapshot = roomActivitySnapshot(roomId);
-  if (!snapshot) return;
-  const payload: RoomStreamEvent = { type: "activity", roomId, event, tasks: snapshot.tasks, runs: snapshot.runs, events: snapshot.events, messages: snapshot.messages };
-  const subscribers = roomEventSubscribers.get(roomId);
-  if (!subscribers) return;
-  for (const subscriber of [...subscribers]) {
-    try {
-      subscriber(payload);
-    } catch {
-      subscribers.delete(subscriber);
-    }
-  }
-  if (!subscribers.size) roomEventSubscribers.delete(roomId);
-}
-
-function subscribeRoomEvents(roomId: string, subscriber: (event: RoomStreamEvent) => void) {
-  const subscribers = roomEventSubscribers.get(roomId) ?? new Set<(event: RoomStreamEvent) => void>();
-  subscribers.add(subscriber);
-  roomEventSubscribers.set(roomId, subscribers);
-  return () => {
-    subscribers.delete(subscriber);
-    if (!subscribers.size) roomEventSubscribers.delete(roomId);
-  };
-}
-
-function publishPreviewLogEvent(previewId: string, event: PreviewLogEvent) {
-  for (const subscriber of previewLogSubscribers.get(previewId) ?? []) subscriber(event);
-}
-
-function subscribePreviewLogEvents(previewId: string, subscriber: (event: PreviewLogEvent) => void) {
-  const subscribers = previewLogSubscribers.get(previewId) ?? new Set<(event: PreviewLogEvent) => void>();
-  subscribers.add(subscriber);
-  previewLogSubscribers.set(previewId, subscribers);
-  return () => {
-    subscribers.delete(subscriber);
-    if (!subscribers.size) previewLogSubscribers.delete(previewId);
-  };
-}
-
-function listSessionMessages(sessionId: string, limit = 20, before?: string): SessionMessagesPage {
-  const session = appData.sessions.find((item) => item.id === sessionId);
-  if (session) syncRoomMessagesToSession(session);
-  const pageSize = Math.min(Math.max(Number(limit) || 20, 1), 100);
-  const cursor = before
-    ? db.prepare("select created_at, id from messages where id = ? and session_id = ?").get(before, sessionId) as
-        | { created_at: string; id: string }
-        | undefined
-    : undefined;
-  const rows = cursor
-    ? db.prepare(`
-      select messages.id, messages.role, messages.content, messages.reply_to_message_id, messages.created_at,
-        reply.id as reply_id, reply.role as reply_role, reply.content as reply_content
-      from messages
-      left join messages reply on reply.id = messages.reply_to_message_id and reply.session_id = messages.session_id
-      where messages.session_id = ? and (messages.created_at < ? or (messages.created_at = ? and messages.id < ?))
-      order by messages.created_at desc, messages.id desc
-      limit ?
-    `).all(sessionId, cursor.created_at, cursor.created_at, cursor.id, pageSize + 1) as Array<Record<string, unknown>>
-    : db.prepare(`
-      select messages.id, messages.role, messages.content, messages.reply_to_message_id, messages.created_at,
-        reply.id as reply_id, reply.role as reply_role, reply.content as reply_content
-      from messages
-      left join messages reply on reply.id = messages.reply_to_message_id and reply.session_id = messages.session_id
-      where messages.session_id = ?
-      order by messages.created_at desc, messages.id desc
-      limit ?
-    `).all(sessionId, pageSize + 1) as Array<Record<string, unknown>>;
-  const hasMore = rows.length > pageSize;
-  return {
-    items: rows.slice(0, pageSize).reverse().map(messageFromRow),
-    nextCursor: hasMore ? String(rows[pageSize - 1].id) : null,
-    hasMore,
-  };
-}
-
-function allSessionMessages(sessionId: string) {
-  return (db.prepare(`
-    select messages.id, messages.role, messages.content, messages.reply_to_message_id, messages.created_at,
-      reply.id as reply_id, reply.role as reply_role, reply.content as reply_content
-    from messages
-    left join messages reply on reply.id = messages.reply_to_message_id and reply.session_id = messages.session_id
-    where messages.session_id = @sessionId
-    order by messages.created_at asc, messages.id asc
-  `).all({ sessionId }) as Array<Record<string, unknown>>).map(messageFromRow);
-}
-
-function sessionCompactionFromRow(row: Record<string, unknown>): SessionCompactionSummary {
-  return {
-    id: String(row.id),
-    sessionId: String(row.session_id),
-    providerId: row.provider_id ? String(row.provider_id) : null,
-    model: row.model ? String(row.model) : null,
-    sourceMessageStartId: row.source_message_start_id ? String(row.source_message_start_id) : null,
-    sourceMessageEndId: row.source_message_end_id ? String(row.source_message_end_id) : null,
-    sourceMessageCount: Number(row.source_message_count ?? 0),
-    sourceChars: Number(row.source_chars ?? 0),
-    promptHash: String(row.prompt_hash),
-    filePath: String(row.file_path),
-    supersedesId: row.supersedes_id ? String(row.supersedes_id) : null,
-    createdAt: String(row.created_at),
-  };
-}
-
-function latestSessionCompaction(sessionId: string) {
-  const row = db.prepare(`
-    select *
-    from session_compactions
-    where session_id = ?
-    order by created_at desc, id desc
-    limit 1
-  `).get(sessionId) as Record<string, unknown> | undefined;
-  return row ? sessionCompactionFromRow(row) : null;
-}
-
-function listSessionCompactions(sessionId: string, limit = 20): SessionCompactionListResponse {
-  const rows = db.prepare(`
-    select *
-    from session_compactions
-    where session_id = ?
-    order by created_at desc, id desc
-    limit ?
-  `).all(sessionId, Math.max(1, Math.min(limit, 100))) as Array<Record<string, unknown>>;
-  return { sessionId, items: rows.map(sessionCompactionFromRow) };
-}
-
-function latestSessionMemoryMarkdown(sessionId: string) {
-  const latest = latestSessionCompaction(sessionId);
-  if (!latest) return "";
-  const fileContent = existsSync(latest.filePath) ? readFileSync(latest.filePath, "utf8") : "";
-  const summary = fileContent.trim();
-  if (!summary) return "";
-  return [
-    "# Persistent Session Memory",
-    `- compaction id: ${latest.id}`,
-    `- created: ${latest.createdAt}`,
-    `- source messages: ${latest.sourceMessageCount}`,
-    latest.providerId ? `- provider: ${latest.providerId}` : "",
-    latest.model ? `- model: ${latest.model}` : "",
-    "",
-    summary,
-  ].filter((line) => line !== "").join("\n");
-}
-
-function messagesAfterCompaction(messages: SessionMessage[], compaction: SessionCompactionSummary | null) {
-  if (!compaction?.sourceMessageEndId) return messages;
-  const index = messages.findIndex((message) => message.id === compaction.sourceMessageEndId);
-  return index >= 0 ? messages.slice(index + 1) : messages;
-}
-
-function sessionCompactionPrompt(session: SessionSummary, messages: SessionMessage[], previousSummary = "") {
-  const transcript = messages.map((message) => [
-    `## ${message.role} ${message.createdAt}`,
-    `- id: ${message.id}`,
-    message.replyToMessageId ? `- replyTo: ${message.replyToMessageId}` : "",
-    "",
-    truncateContextText(message.content, 4000),
-  ].filter((line) => line !== "").join("\n")).join("\n\n");
-  return [
-    "Create a durable session memory summary for Codex Web.",
-    "Return Markdown only. Be concise but preserve information needed for future turns.",
-    "",
-    "Required sections:",
-    "## Stable User Preferences",
-    "## Decisions",
-    "## Current Task State",
-    "## Open Questions",
-    "## Important Files And References",
-    "## Risks Or Constraints",
-    "",
-    "Rules:",
-    "- Preserve concrete decisions, user preferences, task state, blockers, and key file paths.",
-    "- Do not include generic greetings or low-value chatter.",
-    "- Do not invent facts not present in the transcript.",
-    "- Keep the summary bounded; prefer bullets.",
-    previousSummary ? "- Update the previous summary with the new transcript. Return a complete replacement summary, not a delta." : "",
-    "",
-    `Session: ${session.title} (${session.id})`,
-    `Type: ${session.conversationType ?? "codex"}`,
-    "",
-    previousSummary ? "# Previous Persistent Summary" : "",
-    previousSummary ? truncateContextText(previousSummary, 20_000) : "",
-    previousSummary ? "" : "",
-    "# Transcript",
-    truncateContextText(transcript, 80_000),
-  ].join("\n");
-}
-
-function responseOutputText(payload: Record<string, unknown>) {
-  if (typeof payload.output_text === "string") return payload.output_text;
-  const output = Array.isArray(payload.output) ? payload.output : [];
-  return output.map((item) => {
-    if (!item || typeof item !== "object") return "";
-    const record = item as Record<string, unknown>;
-    return textFromResponseContent(record.content);
-  }).filter(Boolean).join("\n").trim();
-}
-
-async function generateSessionCompactionSummary(session: SessionSummary, provider: ProviderRecord, model: string, prompt: string) {
-  if (provider.kind === "local") throw new Error("provider_compaction_unsupported");
-  if (!provider.apiKey) throw new Error("api_key_missing");
-  if (provider.kind === "openai-compatible-chat") {
-    if (!provider.baseUrl) throw new Error("base_url_required");
-    const response = await fetch(joinUrl(provider.baseUrl, "/chat/completions"), {
-      method: "POST",
-      headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: "You summarize software-development conversations into durable session memory." },
-          { role: "user", content: prompt },
-        ],
-        max_tokens: 1200,
-      }),
-    });
-    if (!response.ok) throw new Error(await response.text() || `http_${response.status}`);
-    const payload = await response.json() as Record<string, unknown>;
-    const choice = Array.isArray(payload.choices) ? payload.choices[0] as Record<string, unknown> | undefined : undefined;
-    const message = choice?.message && typeof choice.message === "object" ? choice.message as Record<string, unknown> : {};
-    const content = typeof message.content === "string" ? message.content.trim() : "";
-    if (!content) throw new Error("empty_compaction_summary");
-    return content;
-  }
-  const response = await fetch(joinUrl(provider.baseUrl || "https://api.openai.com/v1", "/responses"), {
-    method: "POST",
-    headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" },
-    body: JSON.stringify({
-      model,
-      input: prompt,
-      max_output_tokens: 1600,
-    }),
-  });
-  if (!response.ok) throw new Error(await response.text() || `http_${response.status}`);
-  const payload = await response.json() as Record<string, unknown>;
-  const content = responseOutputText(payload);
-  if (!content) throw new Error("empty_compaction_summary");
-  return content;
-}
-
-async function createSessionCompaction(session: SessionSummary, body?: CreateSessionCompactionRequest | null, options: { incremental?: boolean } = {}): Promise<SessionCompactionResponse> {
-  const allMessages = allSessionMessages(session.id).filter((message) => message.role !== "system");
-  const previous = latestSessionCompaction(session.id);
-  const previousSummary = options.incremental && previous ? latestSessionMemoryMarkdown(session.id) : "";
-  const messages = options.incremental ? messagesAfterCompaction(allMessages, previous) : allMessages;
-  if (!messages.length) throw new Error("no_messages_to_compact");
-  const provider = appData.providers.find((item) => item.id === body?.providerId)
-    ?? (session.providerId ? appData.providers.find((item) => item.id === session.providerId) : undefined)
-    ?? appData.providers.find((item) => item.kind !== "local" && item.apiKey);
-  if (!provider) throw new Error("provider_required");
-  const model = body?.model?.trim() || session.model || provider.defaultModel;
-  if (!model) throw new Error("model_required");
-  const prompt = sessionCompactionPrompt(session, messages, previousSummary);
-  const promptHash = createHash("sha256").update(prompt).digest("hex").slice(0, 16);
-  const summary = await generateSessionCompactionSummary(session, provider, model, prompt);
-  const id = `compaction-${randomUUID()}`;
-  const now = new Date().toISOString();
-  const memoryRoot = sessionMemoryPath(session.id);
-  mkdirSync(memoryRoot, { recursive: true });
-  const filePath = join(memoryRoot, `${id}.md`);
-  const latestPath = join(memoryRoot, "latest-summary.md");
-  writeFileSync(filePath, summary, "utf8");
-  writeFileSync(latestPath, summary, "utf8");
-  const sourceChars = messages.reduce((sum, message) => sum + message.content.length, 0);
-  db.prepare(`
-    insert into session_compactions (
-      id, session_id, provider_id, model, source_message_start_id, source_message_end_id,
-      source_message_count, source_chars, prompt_hash, file_path, supersedes_id, created_at
-    )
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    id,
-    session.id,
-    provider.id,
-    model,
-    messages[0]?.id ?? null,
-    messages.at(-1)?.id ?? null,
-    messages.length,
-    sourceChars,
-    promptHash,
-    filePath,
-    previous?.id ?? null,
-    now,
-  );
-  return { compaction: latestSessionCompaction(session.id)!, summary };
-}
-
-function updateLatestSessionCompaction(session: SessionSummary, summary: string): SessionCompactionResponse {
-  const previous = latestSessionCompaction(session.id);
-  if (!previous) throw new Error("session_compaction_not_found");
-  const trimmed = summary.trim();
-  if (!trimmed) throw new Error("summary_required");
-  const id = `compaction-${randomUUID()}`;
-  const now = new Date().toISOString();
-  const memoryRoot = sessionMemoryPath(session.id);
-  mkdirSync(memoryRoot, { recursive: true });
-  const filePath = join(memoryRoot, `${id}.md`);
-  writeFileSync(filePath, trimmed, "utf8");
-  writeFileSync(join(memoryRoot, "latest-summary.md"), trimmed, "utf8");
-  const promptHash = createHash("sha256").update(`manual-edit:${trimmed}`).digest("hex").slice(0, 16);
-  db.prepare(`
-    insert into session_compactions (
-      id, session_id, provider_id, model, source_message_start_id, source_message_end_id,
-      source_message_count, source_chars, prompt_hash, file_path, supersedes_id, created_at
-    )
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    id,
-    session.id,
-    null,
-    "manual-edit",
-    previous.sourceMessageStartId ?? null,
-    previous.sourceMessageEndId ?? null,
-    previous.sourceMessageCount,
-    previous.sourceChars,
-    promptHash,
-    filePath,
-    previous.id,
-    now,
-  );
-  return { compaction: latestSessionCompaction(session.id)!, summary: trimmed };
-}
-
-function restoreSessionCompaction(session: SessionSummary, compactionId: string): SessionCompactionResponse {
-  const target = db.prepare("select * from session_compactions where session_id = ? and id = ?").get(session.id, compactionId) as Record<string, unknown> | undefined;
-  if (!target) throw new Error("session_compaction_not_found");
-  const targetCompaction = sessionCompactionFromRow(target);
-  const summary = existsSync(targetCompaction.filePath) ? readFileSync(targetCompaction.filePath, "utf8").trim() : "";
-  if (!summary) throw new Error("summary_missing");
-  const previous = latestSessionCompaction(session.id);
-  const id = `compaction-${randomUUID()}`;
-  const now = new Date().toISOString();
-  const memoryRoot = sessionMemoryPath(session.id);
-  mkdirSync(memoryRoot, { recursive: true });
-  const filePath = join(memoryRoot, `${id}.md`);
-  writeFileSync(filePath, summary, "utf8");
-  writeFileSync(join(memoryRoot, "latest-summary.md"), summary, "utf8");
-  const promptHash = createHash("sha256").update(`manual-restore:${targetCompaction.id}:${summary}`).digest("hex").slice(0, 16);
-  db.prepare(`
-    insert into session_compactions (
-      id, session_id, provider_id, model, source_message_start_id, source_message_end_id,
-      source_message_count, source_chars, prompt_hash, file_path, supersedes_id, created_at
-    )
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    id,
-    session.id,
-    null,
-    "manual-restore",
-    targetCompaction.sourceMessageStartId ?? null,
-    targetCompaction.sourceMessageEndId ?? null,
-    targetCompaction.sourceMessageCount,
-    targetCompaction.sourceChars,
-    promptHash,
-    filePath,
-    previous?.id ?? null,
-    now,
-  );
-  return { compaction: latestSessionCompaction(session.id)!, summary };
-}
-
-const runningAutoCompactions = new Set<string>();
-
-function shouldAutoCompactSession(session: SessionSummary) {
-  if (!sessionCompactionSettings.enabled) return false;
-  if (runningAutoCompactions.has(session.id)) return false;
-  const messages = allSessionMessages(session.id).filter((message) => message.role !== "system");
-  if (!messages.length) return false;
-  const totalChars = messages.reduce((sum, message) => sum + message.content.length, 0);
-  if (messages.length < sessionCompactionSettings.autoCompactMessages && totalChars < sessionCompactionSettings.autoCompactChars) return false;
-  const latest = latestSessionCompaction(session.id);
-  const newMessages = messagesAfterCompaction(messages, latest);
-  if (!newMessages.length) return false;
-  const newChars = newMessages.reduce((sum, message) => sum + message.content.length, 0);
-  if (!latest) return true;
-  return newMessages.length >= sessionCompactionSettings.minNewMessages || newChars >= sessionCompactionSettings.minNewChars;
-}
-
-function scheduleSessionAutoCompaction(session: SessionSummary, reason: string) {
-  if (!shouldAutoCompactSession(session)) return;
-  runningAutoCompactions.add(session.id);
-  void createSessionCompaction(session, null, { incremental: true })
-    .then((result) => {
-      const activity: Extract<TaskEvent, { type: "activity" }> = {
-        type: "activity",
-        kind: "tool",
-        label: "会话记忆已自动压缩",
-        detail: `${reason}; ${result.compaction.sourceMessageCount} new messages`,
-        status: "completed",
-        at: result.compaction.createdAt,
-      };
-      recordTaskActivity(session.id, activity);
-      publishTaskEvent(session.id, activity);
-    })
-    .catch((error) => {
-      appendCodexErrorOutput(session, `\n[session compaction failed] ${error instanceof Error ? error.message : String(error)}\n`);
-      recordTaskActivity(session.id, {
-        type: "activity",
-        kind: "tool",
-        label: "会话记忆自动压缩失败",
-        detail: error instanceof Error ? error.message : String(error),
-        status: "failed",
-        at: new Date().toISOString(),
-      });
-    })
-    .finally(() => {
-      runningAutoCompactions.delete(session.id);
-    });
-}
-
-function deleteSessionMessages(sessionId: string) {
-  db.prepare("delete from messages where session_id = ?").run(sessionId);
-  db.prepare("delete from message_cards where session_id = ?").run(sessionId);
-}
-
-function deleteGoalsForOwner(ownerType: GoalOwnerType, ownerId: string) {
-  const rows = db.prepare("select id from goals where owner_type = ? and owner_id = ?").all(ownerType, ownerId) as Array<{ id: string }>;
-  let deleted = 0;
-  for (const row of rows) {
-    deleted += db.prepare("delete from goal_events where goal_id = ?").run(row.id).changes;
-    deleted += db.prepare("delete from goal_proposals where goal_id = ?").run(row.id).changes;
-    deleted += db.prepare("delete from goal_focuses where goal_id = ?").run(row.id).changes;
-    deleted += db.prepare("delete from goal_items where goal_id = ?").run(row.id).changes;
-    deleted += db.prepare("delete from goals where id = ?").run(row.id).changes;
-  }
-  return deleted;
-}
-
-function deleteSessionDatabaseRows(sessionId: string) {
-  deletePreviewsForScope("session", sessionId);
-  deleteSessionMessages(sessionId);
-  deleteGoalsForOwner("session", sessionId);
-  deleteGoalsForOwner("agent_session", sessionId);
-  db.prepare("delete from message_queue where session_id = ?").run(sessionId);
-  db.prepare("delete from task_activities where session_id = ?").run(sessionId);
-  db.prepare("delete from execution_contexts where session_id = ?").run(sessionId);
-  db.prepare("delete from session_compactions where session_id = ?").run(sessionId);
-  db.prepare("delete from agent_sessions where session_id = ?").run(sessionId);
-  db.prepare("delete from agent_runs where session_id = ?").run(sessionId);
-  db.prepare("delete from sessions where id = ?").run(sessionId);
-}
-
-function messageCardFromRow(row: Record<string, unknown>): MessageCardSummary {
-  let payload: unknown = {};
-  try {
-    payload = JSON.parse(String(row.payload));
-  } catch {
-    payload = {};
-  }
-  return {
-    id: String(row.id),
-    sessionId: String(row.session_id),
-    messageId: row.message_id ? String(row.message_id) : null,
-    type: row.type as MessageCardSummary["type"],
-    title: String(row.title),
-    payload,
-    createdAt: String(row.created_at),
-  };
-}
-
-function appendMessageCard(sessionId: string, type: MessageCardSummary["type"], title: string, payload: unknown, messageId?: string | null) {
-  const card: MessageCardSummary = {
-    id: `card-${randomUUID()}`,
-    sessionId,
-    messageId: messageId ?? null,
-    type,
-    title,
-    payload,
-    createdAt: new Date().toISOString(),
-  };
-  db.prepare(`
-    insert into message_cards (id, session_id, message_id, type, title, payload, created_at)
-    values (?, ?, ?, ?, ?, ?, ?)
-  `).run(card.id, card.sessionId, card.messageId ?? null, card.type, card.title, JSON.stringify(card.payload ?? {}), card.createdAt);
-  return card;
-}
-
-function normalizeMessageUrl(value: string) {
-  let url = value.trim();
-  while (/[),.;:!?]+$/.test(url)) url = url.slice(0, -1);
-  return url;
-}
-
-function messageUrls(value: string) {
-  const urls = new Set<string>();
-  for (const match of value.matchAll(/\bhttps?:\/\/[^\s<>"'`]+/g)) {
-    const url = normalizeMessageUrl(match[0]);
-    if (url) urls.add(url);
-  }
-  return [...urls];
-}
-
-function linkTitle(url: string) {
-  try {
-    const parsed = new URL(url);
-    const path = parsed.pathname && parsed.pathname !== "/" ? parsed.pathname : "";
-    return path ? `${parsed.host}${path}` : parsed.host;
-  } catch {
-    return url;
-  }
-}
-
-function cardPayloadUrl(payload: unknown) {
-  if (!payload || typeof payload !== "object") return null;
-  const record = payload as Record<string, unknown>;
-  return typeof record.url === "string" ? record.url : typeof record.source === "string" ? record.source : null;
-}
-
-function cardPayloadPort(payload: unknown) {
-  if (!payload || typeof payload !== "object") return null;
-  const record = payload as Record<string, unknown>;
-  if (typeof record.port === "number" && Number.isInteger(record.port)) return record.port;
-  if (typeof record.port === "string" && /^\d+$/.test(record.port)) return Number(record.port);
-  for (const key of ["source", "url"]) {
-    const value = record[key];
-    if (typeof value !== "string") continue;
-    try {
-      const parsed = new URL(value);
-      const port = Number(parsed.port);
-      if (Number.isInteger(port)) return port;
-    } catch {
-      // Ignore non-URL payload fields.
-    }
-  }
-  return null;
-}
-
-function cardSuppressionKeys(type: MessageCardSummary["type"], payload: unknown) {
-  const keys = new Set<string>();
-  const url = cardPayloadUrl(payload);
-  if (url) keys.add(`url:${normalizeMessageUrl(url)}`);
-  if (type === "preview" || type === "service") {
-    const port = cardPayloadPort(payload);
-    if (port !== null) keys.add(`preview-port:${port}`);
-    if (payload && typeof payload === "object") {
-      const record = payload as Record<string, unknown>;
-      const previewId = typeof record.previewId === "string" ? record.previewId : typeof record.id === "string" ? record.id : "";
-      if (previewId) keys.add(`preview:${previewId}`);
-    }
-  }
-  return [...keys].filter(Boolean);
-}
-
-function isMessageCardDismissed(sessionId: string, keys: string[]) {
-  if (!keys.length) return false;
-  const read = db.prepare("select 1 from message_card_dismissals where session_id = ? and suppression_key = ? limit 1");
-  return keys.some((key) => Boolean(read.get(sessionId, key)));
-}
-
-function dismissMessageCard(sessionId: string, type: MessageCardSummary["type"], payload: unknown) {
-  const keys = cardSuppressionKeys(type, payload);
-  if (!keys.length) return;
-  const insert = db.prepare("insert or ignore into message_card_dismissals (session_id, suppression_key, dismissed_at) values (?, ?, ?)");
-  const now = new Date().toISOString();
-  for (const key of keys) insert.run(sessionId, key, now);
-}
-
-function isLocalPreviewUrl(url: string) {
-  return /^https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):\d{2,5}(?:\/|$)/.test(url);
-}
-
-function appendUrlCardsForMessage(session: SessionSummary, messageId: string, content: string) {
-  const urls = messageUrls(content);
-  if (!urls.length) return;
-  discoverPreviewUrls(session, content);
-  const existing = (db.prepare(`
-    select payload
-    from message_cards
-    where session_id = ? and type in ('link', 'service', 'preview')
-  `).all(session.id) as Array<{ payload: string }>).map((row) => {
-    try {
-      return cardPayloadUrl(JSON.parse(row.payload));
-    } catch {
-      return null;
-    }
-  }).filter(Boolean);
-  for (const url of urls) {
-    if (isLocalPreviewUrl(url)) continue;
-    if (existing.includes(url)) continue;
-    if (isMessageCardDismissed(session.id, [`url:${url}`])) continue;
-    let payload: Record<string, unknown> = { url };
-    try {
-      const parsed = new URL(url);
-      payload = { url, host: parsed.host, path: parsed.pathname, protocol: parsed.protocol.replace(":", "") };
-    } catch {
-      payload = { url };
-    }
-    appendMessageCard(session.id, "link", linkTitle(url), payload, messageId);
-    existing.push(url);
-  }
-}
-
-function ensureSessionUrlCards(session: SessionSummary) {
-  const rows = db.prepare(`
-    select id, content
-    from messages
-    where session_id = ? and role = 'assistant'
-    order by created_at asc, id asc
-  `).all(session.id) as Array<{ id: string; content: string }>;
-  for (const row of rows) appendUrlCardsForMessage(session, row.id, row.content);
-}
-
-function listSessionCards(sessionId: string): MessageCardSummary[] {
-  const session = appData.sessions.find((item) => item.id === sessionId);
-  if (session) ensureSessionUrlCards(session);
-  const previewCards = Array.from(previews.values())
-    .filter((preview) => preview.scopeType === "session" && preview.scopeId === sessionId)
-    .map((preview) => ({
-      id: `preview:${preview.id}`,
-      sessionId,
-      messageId: null,
-      type: "preview" as const,
-      title: preview.label,
-      payload: publicPreview(preview),
-      createdAt: preview.createdAt,
-    }));
-  const previewIds = new Set(previewCards.map((card) => (card.payload as PreviewSummary).id));
-  const stored = (db.prepare(`
-    select id, session_id, message_id, type, title, payload, created_at
-    from message_cards
-    where session_id = ?
-    order by created_at desc, id desc
-  `).all(sessionId) as Array<Record<string, unknown>>)
-    .map(messageCardFromRow)
-    .filter((card) => {
-      if (card.type !== "service" || !card.payload || typeof card.payload !== "object") return true;
-      const previewId = (card.payload as Record<string, unknown>).previewId;
-      return typeof previewId !== "string" || !previewIds.has(previewId);
-    })
-    .filter((card) => {
-      return !isMessageCardDismissed(sessionId, cardSuppressionKeys(card.type, card.payload));
-    });
-  const seen = new Set<string>();
-  return [...previewCards, ...stored]
-    .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))
-    .filter((card) => {
-      if (isMessageCardDismissed(sessionId, cardSuppressionKeys(card.type, card.payload))) return false;
-      const payload = card.payload && typeof card.payload === "object" ? card.payload as Record<string, unknown> : {};
-      const key = typeof payload.previewId === "string"
-        ? `preview:${payload.previewId}`
-        : typeof payload.url === "string"
-          ? `url:${payload.url}`
-          : `${card.type}:${card.title}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-}
-
-function queuedMessageFromRow(row: Record<string, unknown>): QueuedMessage {
-  return {
-    id: String(row.id),
-    sessionId: String(row.session_id),
-    prompt: String(row.prompt),
-    providerId: row.provider_id ? String(row.provider_id) : null,
-    model: row.model ? String(row.model) : null,
-    replyToMessageId: row.reply_to_message_id ? String(row.reply_to_message_id) : null,
-    orderIndex: Number(row.order_index ?? 0),
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function listQueuedMessages(sessionId: string) {
-  return (db.prepare(`
-    select id, session_id, prompt, provider_id, model, reply_to_message_id, order_index, created_at, updated_at
-    from message_queue
-    where session_id = ?
-    order by order_index asc, created_at asc, id asc
-  `).all(sessionId) as Array<Record<string, unknown>>).map(queuedMessageFromRow);
-}
-
-function getQueuedMessage(sessionId: string, queueId: string) {
-  const row = db.prepare(`
-    select id, session_id, prompt, provider_id, model, reply_to_message_id, order_index, created_at, updated_at
-    from message_queue
-    where session_id = ? and id = ?
-  `).get(sessionId, queueId) as Record<string, unknown> | undefined;
-  return row ? queuedMessageFromRow(row) : null;
-}
-
-function enqueueMessage(session: SessionSummary, input: QueueMessageRequest) {
-  const now = new Date().toISOString();
-  const orderIndex = Number((db.prepare("select coalesce(max(order_index), 0) as max_order from message_queue where session_id = ?").get(session.id) as { max_order?: number } | undefined)?.max_order ?? 0) + 1000;
-  const item: QueuedMessage = {
-    id: randomUUID(),
-    sessionId: session.id,
-    prompt: input.prompt.trim(),
-    providerId: input.providerId ?? session.providerId ?? null,
-    model: input.model ?? session.model ?? null,
-    replyToMessageId: input.replyToMessageId ?? null,
-    orderIndex,
-    createdAt: now,
-    updatedAt: now,
-  };
-  db.prepare(`
-    insert into message_queue (id, session_id, prompt, provider_id, model, reply_to_message_id, order_index, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(item.id, item.sessionId, item.prompt, item.providerId ?? null, item.model ?? null, item.replyToMessageId ?? null, item.orderIndex, item.createdAt, item.updatedAt);
-  publishTaskEvent(session.id, { type: "queue", queue: listQueuedMessages(session.id), session });
-  return item;
-}
-
-function updateQueuedMessage(session: SessionSummary, queueId: string, input: UpdateQueuedMessageRequest) {
-  const current = getQueuedMessage(session.id, queueId);
-  if (!current) return null;
-  const updated: QueuedMessage = {
-    ...current,
-    prompt: input.prompt.trim(),
-    providerId: input.providerId ?? current.providerId ?? session.providerId ?? null,
-    model: input.model ?? current.model ?? session.model ?? null,
-    replyToMessageId: input.replyToMessageId ?? current.replyToMessageId ?? null,
-    updatedAt: new Date().toISOString(),
-  };
-  db.prepare(`
-    update message_queue
-    set prompt = ?, provider_id = ?, model = ?, reply_to_message_id = ?, updated_at = ?
-    where session_id = ? and id = ?
-  `).run(updated.prompt, updated.providerId ?? null, updated.model ?? null, updated.replyToMessageId ?? null, updated.updatedAt, session.id, queueId);
-  publishTaskEvent(session.id, { type: "queue", queue: listQueuedMessages(session.id), session });
-  return updated;
-}
-
-function deleteQueuedMessage(session: SessionSummary, queueId: string) {
-  db.prepare("delete from message_queue where session_id = ? and id = ?").run(session.id, queueId);
-  publishTaskEvent(session.id, { type: "queue", queue: listQueuedMessages(session.id), session });
-}
-
-function reorderQueuedMessages(session: SessionSummary, orderedIds: string[]) {
-  const currentIds = new Set(listQueuedMessages(session.id).map((item) => item.id));
-  const nextIds = orderedIds.filter((id) => currentIds.has(id));
-  if (nextIds.length !== currentIds.size) return null;
-  const updatedAt = new Date().toISOString();
-  const updateOrder = db.prepare("update message_queue set order_index = ?, updated_at = ? where session_id = ? and id = ?");
-  db.transaction(() => {
-    nextIds.forEach((id, index) => updateOrder.run((index + 1) * 1000, updatedAt, session.id, id));
-  })();
-  const queue = listQueuedMessages(session.id);
-  publishTaskEvent(session.id, { type: "queue", queue, session });
-  return queue;
-}
-
-function popNextQueuedMessage(sessionId: string) {
-  const row = db.prepare(`
-    select id, session_id, prompt, provider_id, model, reply_to_message_id, order_index, created_at, updated_at
-    from message_queue
-    where session_id = ?
-    order by order_index asc, created_at asc, id asc
-    limit 1
-  `).get(sessionId) as Record<string, unknown> | undefined;
-  if (!row) return null;
-  const item = queuedMessageFromRow(row);
-  db.prepare("delete from message_queue where id = ?").run(item.id);
-  return item;
-}
-
-function terminalSessionFromRow(row: Record<string, unknown>): TerminalSessionSummary {
-  return {
-    id: String(row.id),
-    name: String(row.name),
-    cwd: String(row.cwd),
-    mode: row.mode === "pipe" ? "pipe" : "pty",
-    status: row.status === "running" ? "running" : "closed",
-    createdAt: String(row.created_at),
-  };
-}
-
-function listTerminalSessionSummaries() {
-  const persisted = (db.prepare(`
-    select id, name, cwd, mode, status, created_at
-    from terminal_sessions
-    order by updated_at desc, created_at desc
-  `).all() as Array<Record<string, unknown>>).map(terminalSessionFromRow);
-  const runtimeIds = new Set(terminalSessions.keys());
-  const runtimeSessions = Array.from(terminalSessions.values()).filter((session) => !session.ephemeral).map(terminalSummary);
-  return [
-    ...runtimeSessions,
-    ...persisted.filter((session) => !runtimeIds.has(session.id)),
-  ];
-}
-
-function upsertTerminalSession(session: TerminalSessionSummary) {
-  db.prepare(`
-    insert into terminal_sessions (id, name, cwd, mode, status, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?)
-    on conflict(id) do update set
-      name = excluded.name,
-      cwd = excluded.cwd,
-      mode = excluded.mode,
-      status = excluded.status,
-      updated_at = excluded.updated_at
-  `).run(session.id, session.name, session.cwd, session.mode, session.status, session.createdAt, new Date().toISOString());
-}
-
-function markTerminalClosed(sessionId: string) {
-  db.prepare("update terminal_sessions set status = 'closed', updated_at = ? where id = ?").run(new Date().toISOString(), sessionId);
-}
-
-function deleteTerminalSessionRecord(sessionId: string) {
-  db.prepare("delete from terminal_sessions where id = ?").run(sessionId);
-}
-
-function closePersistedRunningTerminals() {
-  db.prepare("update terminal_sessions set status = 'closed', updated_at = ? where status = 'running'").run(new Date().toISOString());
-}
-
-function previewFromRow(row: Record<string, unknown>): PreviewRecord {
-  return {
-    id: String(row.id),
-    scopeType: row.scope_type === "session" || row.scope_type === "folder" ? row.scope_type : "project",
-    scopeId: String(row.scope_id),
-    label: String(row.label),
-    targetHost: String(row.target_host),
-    port: Number(row.port),
-    command: row.command ? String(row.command) : undefined,
-    cwd: row.cwd ? String(row.cwd) : undefined,
-    status: row.status === "starting" || row.status === "running" || row.status === "stopped" || row.status === "error" ? row.status : "registered",
-    access: previewAccess(row.access, "public"),
-    token: String(row.token),
-    createdAt: String(row.created_at),
-    updatedAt: row.updated_at ? String(row.updated_at) : String(row.created_at),
-  };
-}
-
-function previewUrl(preview: PreviewRecord) {
-  return `/preview/${encodeURIComponent(preview.id)}/${encodeURIComponent(preview.token)}/`;
-}
-
-function publicPreview(preview: PreviewRecord): PreviewSummary {
-  return {
-    id: preview.id,
-    scopeType: preview.scopeType,
-    scopeId: preview.scopeId,
-    label: preview.label,
-    targetHost: preview.targetHost,
-    port: preview.port,
-    command: preview.command,
-    cwd: preview.cwd,
-    status: preview.status,
-    access: preview.access,
-    url: previewUrl(preview),
-    createdAt: preview.createdAt,
-    updatedAt: preview.updatedAt,
-  };
-}
-
-function loadPreviews() {
-  const rows = db.prepare("select * from previews order by created_at desc").all() as Array<Record<string, unknown>>;
-  for (const row of rows) previews.set(String(row.id), previewFromRow(row));
-}
-
-function loadPreviewLogs() {
-  const rows = db.prepare("select preview_id, logs, label from preview_logs").all() as Array<Record<string, unknown>>;
-  for (const row of rows) previewLogs.set(String(row.preview_id), String(row.logs));
-}
-
-function previewAccessRequestFromRow(row: Record<string, unknown>): PreviewAccessRequest {
-  const status = row.status === "approved" || row.status === "denied" ? row.status : "pending";
-  return {
-    id: String(row.id),
-    previewId: String(row.preview_id),
-    secret: String(row.secret),
-    status,
-    approvedUntil: row.approved_until ? String(row.approved_until) : null,
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function loadPreviewAccessRequests() {
-  const rows = db.prepare("select * from preview_access_requests").all() as Array<Record<string, unknown>>;
-  for (const row of rows) previewAccessRequests.set(String(row.id), previewAccessRequestFromRow(row));
-}
-
-function upsertPreviewAccessRequest(request: PreviewAccessRequest) {
-  db.prepare(`
-    insert into preview_access_requests (id, preview_id, secret, status, approved_until, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?)
-    on conflict(id) do update set
-      preview_id = excluded.preview_id,
-      secret = excluded.secret,
-      status = excluded.status,
-      approved_until = excluded.approved_until,
-      updated_at = excluded.updated_at
-  `).run(request.id, request.previewId, request.secret, request.status, request.approvedUntil ?? null, request.createdAt, request.updatedAt);
-  previewAccessRequests.set(request.id, request);
-}
-
-function expirePreviewAccessRequests() {
-  const cutoff = Date.now() - previewAccessSettings.requestTtlMinutes * 60 * 1000;
-  const expired = Array.from(previewAccessRequests.values()).filter((request) =>
-    request.status === "pending" && new Date(request.createdAt).getTime() < cutoff
-  );
-  for (const request of expired) {
-    request.status = "denied";
-    request.updatedAt = new Date().toISOString();
-    upsertPreviewAccessRequest(request);
-    const rows = db.prepare("select id, payload from approvals where action_type = 'preview-access' and status = 'pending'").all() as Array<{ id: string; payload: string }>;
-    for (const row of rows) {
-      try {
-        const payload = JSON.parse(row.payload) as { requestId?: unknown };
-        if (String(payload.requestId ?? "") === request.id) resolveApproval(row.id, "denied");
-      } catch {
-        continue;
-      }
-    }
-  }
-}
-
-function insertPreview(preview: PreviewRecord) {
-  db.prepare(`
-    insert into previews (id, scope_type, scope_id, label, target_host, port, token, command, cwd, status, access, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(preview.id, preview.scopeType, preview.scopeId, preview.label, preview.targetHost, preview.port, preview.token, preview.command ?? null, preview.cwd ?? null, preview.status, preview.access, preview.createdAt, preview.updatedAt);
-  previews.set(preview.id, preview);
-}
-
-function updatePreview(preview: PreviewRecord) {
-  preview.updatedAt = new Date().toISOString();
-  db.prepare(`
-    update previews
-    set label = ?, target_host = ?, port = ?, command = ?, cwd = ?, status = ?, access = ?, updated_at = ?
-    where id = ?
-  `).run(preview.label, preview.targetHost, preview.port, preview.command ?? null, preview.cwd ?? null, preview.status, preview.access, preview.updatedAt, preview.id);
-  previews.set(preview.id, preview);
-  publishPreviewLogEvent(preview.id, { type: "status", preview: publicPreview(preview) });
-}
-
-async function markPreviewRunningIfReachable(preview: PreviewRecord) {
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 800);
-    const response = await fetch(`http://${preview.targetHost}:${preview.port}/`, { signal: controller.signal }).catch(() => null);
-    clearTimeout(timer);
-    const current = previews.get(preview.id);
-    if (!current || !response) return;
-    current.status = "running";
-    updatePreview(current);
-    appendPreviewLog(current.id, `[discover] upstream responded with ${response.status}\n`);
-  } catch {
-    // Keep discovered previews registered when the upstream is not ready yet.
-  }
-}
-
-function discoverPreviewUrls(session: SessionSummary, value: string) {
-  const context = latestExecutionContextForSession(session.id);
-  if (context && !context.resolvedPermissions.canCreatePreview) return;
-  const matches = value.matchAll(/\bhttps?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{2,5})(?:\/[^\s"'`)]*)?/g);
-  for (const match of matches) {
-    if (shouldIgnoreDiscoveredPreviewUrl(match[0])) continue;
-    const port = Number(match[1]);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) continue;
-    if (isMessageCardDismissed(session.id, [`preview-port:${port}`, `url:${normalizeMessageUrl(match[0])}`])) continue;
-    const existing = Array.from(previews.values()).find((preview) =>
-      preview.scopeType === "session"
-      && preview.scopeId === session.id
-      && preview.targetHost === "127.0.0.1"
-      && preview.port === port
-    );
-    if (existing) continue;
-    const now = new Date().toISOString();
-    const preview: PreviewRecord = {
-      id: `preview-${randomUUID()}`,
-      scopeType: "session",
-      scopeId: session.id,
-      label: `${session.title || "Session"} :${port}`,
-      targetHost: "127.0.0.1",
-      port,
-      token: randomUUID(),
-      command: undefined,
-      cwd: session.workspacePath,
-      status: "registered",
-      access: "private",
-      createdAt: now,
-      updatedAt: now,
-    };
-    insertPreview(preview);
-    appendPreviewLog(preview.id, `[discover] detected ${match[0]} from Codex output\n`);
-    appendMessageCard(session.id, "service", `Detected service on :${port}`, { previewId: preview.id, url: publicPreview(preview).url, port, source: match[0] });
-    void markPreviewRunningIfReachable(preview);
-  }
-}
-
-function shouldIgnoreDiscoveredPreviewUrl(value: string) {
-  try {
-    const parsed = new URL(value);
-    return parsed.pathname.startsWith("/provider-proxy")
-      || parsed.pathname.startsWith("/api/")
-      || parsed.pathname.startsWith("/preview/")
-      || parsed.pathname === "/health";
-  } catch {
-    return false;
-  }
-}
-
-function deletePreview(previewId: string) {
-  stopPreviewProcess(previewId);
-  db.prepare("delete from previews where id = ?").run(previewId);
-  db.prepare("delete from preview_logs where preview_id = ?").run(previewId);
-  previews.delete(previewId);
-  previewLogs.delete(previewId);
-}
-
-function deletePreviewsForScope(scopeType: PreviewRecord["scopeType"], scopeId: string) {
-  let deleted = 0;
-  for (const preview of Array.from(previews.values())) {
-    if (preview.scopeType === scopeType && preview.scopeId === scopeId) {
-      deletePreview(preview.id);
-      deleted += 1;
-    }
-  }
-  return deleted;
-}
-
-function deleteRoomDatabaseRows(roomId: string) {
-  let deleted = 0;
-  deleted += deleteGoalsForOwner("room", roomId);
-  for (const table of [
-    "room_agents",
-    "room_events",
-    "room_tasks",
-    "room_artifacts",
-    "room_handoffs",
-    "room_decisions",
-    "room_schedules",
-    "room_run_merges",
-    "room_agent_threads",
-    "agent_runs",
-  ]) {
-    deleted += db.prepare(`delete from ${table} where room_id = ?`).run(roomId).changes;
-  }
-  deleted += db.prepare("delete from execution_contexts where room_id = ?").run(roomId).changes;
-  deleted += db.prepare("delete from rooms where id = ?").run(roomId).changes;
-  return deleted;
 }
 
 function cleanupDatabaseRedundancy(options: { deleteArchivedApprovals?: boolean; archivedApprovalRetentionDays?: number; deleteApprovalAuditLog?: boolean } = {}): MaintenanceCleanupResponse {
@@ -7048,1347 +3696,6 @@ function cleanupDatabaseRedundancy(options: { deleteArchivedApprovals?: boolean;
   };
 }
 
-function pathStats(targetPath: string, options: { excludeNames?: Set<string> } = {}) {
-  try {
-    const stat = lstatSync(targetPath);
-    if (stat.isSymbolicLink()) {
-      return { bytes: stat.size, updatedAt: stat.mtime.toISOString() };
-    }
-    if (stat.isDirectory()) {
-      let bytes = 0;
-      for (const child of readdirSync(targetPath)) {
-        if (options.excludeNames?.has(child)) continue;
-        bytes += pathStats(join(targetPath, child), options).bytes;
-      }
-      return { bytes, updatedAt: stat.mtime.toISOString() };
-    }
-    return { bytes: stat.size, updatedAt: stat.mtime.toISOString() };
-  } catch {
-    return { bytes: 0, updatedAt: new Date(0).toISOString() };
-  }
-}
-
-function storageItem(
-  type: StorageItemSummary["type"],
-  status: StorageItemSummary["status"],
-  label: string,
-  itemPath: string,
-  relatedId?: string | null,
-  relatedName?: string | null,
-  relatedType?: StorageItemSummary["relatedType"],
-  statsOptions?: { excludeNames?: Set<string> },
-): StorageItemSummary {
-  const stats = pathStats(itemPath, statsOptions);
-  return {
-    id: createHash("sha1").update(`${type}:${itemPath}`).digest("hex"),
-    type,
-    status,
-    label,
-    path: itemPath,
-    bytes: stats.bytes,
-    updatedAt: stats.updatedAt,
-    relatedId: relatedId ?? null,
-    relatedName: relatedName ?? null,
-    relatedType: relatedType ?? null,
-  };
-}
-
-function listStorageItems(): StorageScanResponse {
-  const items: StorageItemSummary[] = [];
-  const sessionIds = new Set(appData.sessions.map((session) => session.id));
-  const sessionById = new Map(appData.sessions.map((session) => [session.id, session]));
-  const projectByWorkspacePath = new Map(appData.projects.map((project) => [resolveTerminalCwd(project.workspacePath), project]));
-  const roomRows = db.prepare("select id, session_id, name from rooms").all() as Array<{ id: string; session_id?: string | null; name: string }>;
-  const roomById = new Map(roomRows.map((room) => [room.id, room]));
-  const activeRoomIds = new Set(roomRows
-    .filter((row) => row.session_id && sessionIds.has(row.session_id))
-    .map((row) => row.id));
-  const activeSessionIds = new Set(appData.sessions
-    .filter((session) => !(session.conversationType === "agent" && session.roomId && !activeRoomIds.has(session.roomId)))
-    .map((session) => session.id));
-  const runWorkspaceRows = db.prepare(`
-    select agent_runs.id, agent_runs.status as run_status, agent_runs.workspace_path, room_run_merges.status as merge_status
-    from agent_runs
-    left join room_run_merges on room_run_merges.run_id = agent_runs.id
-    where agent_runs.workspace_path is not null and agent_runs.workspace_path != ''
-  `).all() as Array<{ id: string; run_status: string; workspace_path: string; merge_status?: string | null }>;
-  const runWorkspaces = new Map(runWorkspaceRows.map((row) => [resolve(row.workspace_path), row]));
-  const previewIds = new Set(Array.from(previews.keys()));
-
-  if (existsSync(internalProjectWorkspaceRoot)) {
-    for (const name of readdirSync(internalProjectWorkspaceRoot)) {
-      const itemPath = join(internalProjectWorkspaceRoot, name);
-      if (!lstatSync(itemPath).isDirectory()) continue;
-      const project = projectByWorkspacePath.get(resolve(itemPath));
-      const metadata = project ? null : readProjectWorkspaceMetadata(itemPath);
-      items.push(storageItem("project-workspace", project ? "active" : "orphan", name, itemPath, project?.id ?? metadata?.id ?? name, project?.name ?? metadata?.name, "project"));
-    }
-  }
-
-  if (existsSync(sessionWorkspaceRoot)) {
-    for (const name of readdirSync(sessionWorkspaceRoot)) {
-      const itemPath = join(sessionWorkspaceRoot, name);
-      if (!lstatSync(itemPath).isDirectory()) continue;
-      const active = activeSessionIds.has(name);
-      const session = sessionById.get(name);
-      const metadata = session ? null : readSessionStorageMetadata(itemPath);
-      items.push(storageItem("session-data", active ? "active" : "orphan", name, itemPath, metadata?.id ?? name, session?.title ?? metadata?.title, "session"));
-    }
-  }
-
-  const roomsRoot = join(dataDir, "rooms");
-  if (existsSync(roomsRoot)) {
-    for (const name of readdirSync(roomsRoot)) {
-      const itemPath = join(roomsRoot, name);
-      if (!lstatSync(itemPath).isDirectory()) continue;
-      const active = activeRoomIds.has(name);
-      const room = roomById.get(name);
-      items.push(storageItem("room-workspace", active ? "active" : "orphan", name, itemPath, name, room?.name, "room"));
-      const worktreesRoot = join(itemPath, "worktrees");
-      if (!existsSync(worktreesRoot)) continue;
-      for (const worktreeName of readdirSync(worktreesRoot)) {
-        const worktreePath = join(worktreesRoot, worktreeName);
-        if (!lstatSync(worktreePath).isDirectory()) continue;
-        const run = runWorkspaces.get(resolve(worktreePath));
-        const mergeStatus = run?.merge_status ?? "none";
-        const isActive = activeRoomIds.has(name) && Boolean(run && (run.run_status === "running" || mergeStatus === "pending" || mergeStatus === "conflict"));
-        items.push(storageItem("room-worktree", isActive ? "active" : "orphan", `${name}/${worktreeName}`, worktreePath, run?.id ?? name, room?.name, run ? "run" : "room"));
-      }
-    }
-  }
-
-  for (const row of db.prepare("select preview_id, updated_at, label from preview_logs").all() as Array<{ preview_id: string; updated_at: string; label?: string | null }>) {
-    const logs = previewLogs.get(row.preview_id) ?? "";
-    const preview = previews.get(row.preview_id);
-    items.push({
-      id: createHash("sha1").update(`preview-log:${row.preview_id}`).digest("hex"),
-      type: "preview-log",
-      status: previewIds.has(row.preview_id) ? "active" : "orphan",
-      label: row.preview_id,
-      path: `sqlite:preview_logs/${row.preview_id}`,
-      bytes: Buffer.byteLength(logs, "utf8"),
-      updatedAt: row.updated_at,
-      relatedId: row.preview_id,
-      relatedName: row.label ?? preview?.label ?? null,
-      relatedType: "preview",
-    });
-  }
-
-  items.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-  return { items, totalBytes: items.reduce((sum, item) => sum + item.bytes, 0) };
-}
-
-function deleteStorageItem(type: string, itemPath: string, force = false) {
-  const item = listStorageItems().items.find((entry) => entry.type === type && entry.path === itemPath);
-  if (item?.status === "active" && !force) throw new Error("storage_item_active");
-  if (type === "preview-log") {
-    const previewId = itemPath.replace(/^sqlite:preview_logs\//, "");
-    previewLogs.delete(previewId);
-    db.prepare("delete from preview_logs where preview_id = ?").run(previewId);
-    return;
-  }
-  const resolvedPath = resolve(itemPath);
-  const allowedRoots = [internalProjectWorkspaceRoot, sessionWorkspaceRoot, join(dataDir, "rooms"), taskLogDir].map((root) => resolve(root));
-  if (!allowedRoots.some((root) => resolvedPath === root || resolvedPath.startsWith(`${root}/`))) {
-    throw new Error("storage_path_not_allowed");
-  }
-  if (type === "session-data") {
-    const sessionId = basename(resolvedPath);
-    const session = appData.sessions.find((entry) => entry.id === sessionId);
-    const orphanRoomAgent = Boolean(session?.conversationType === "agent" && session.roomId && !db.prepare("select id from rooms where id = ?").get(session.roomId));
-    if (orphanRoomAgent) {
-      appData.sessions = appData.sessions.filter((entry) => entry.id !== sessionId);
-      deleteSessionDatabaseRows(sessionId);
-    }
-    rmSync(legacyTaskLogPath(sessionId), { force: true });
-    rmSync(legacyTaskMetaPath(sessionId), { force: true });
-  }
-  rmSync(resolvedPath, { recursive: true, force: true });
-}
-
-function pathWithinRoot(targetPath: string, rootPath: string) {
-  const target = resolve(targetPath);
-  const root = resolve(rootPath);
-  return target === root || target.startsWith(`${root}/`);
-}
-
-function readProjectWorkspaceMetadata(itemPath: string) {
-  try {
-    const metadataPath = join(itemPath, projectWorkspaceMetadataFile);
-    if (!existsSync(metadataPath)) return null;
-    const parsed = JSON.parse(readFileSync(metadataPath, "utf8")) as { id?: unknown; name?: unknown; workspacePath?: unknown; orphanedAt?: unknown };
-    return {
-      id: typeof parsed.id === "string" ? parsed.id : null,
-      name: typeof parsed.name === "string" ? parsed.name : null,
-      workspacePath: typeof parsed.workspacePath === "string" ? parsed.workspacePath : null,
-      orphanedAt: typeof parsed.orphanedAt === "string" ? parsed.orphanedAt : null,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function readSessionStorageMetadata(itemPath: string) {
-  try {
-    const metadataPath = join(itemPath, "metadata.json");
-    if (!existsSync(metadataPath)) return null;
-    const parsed = JSON.parse(readFileSync(metadataPath, "utf8")) as { session?: { id?: unknown; title?: unknown } };
-    return {
-      id: typeof parsed.session?.id === "string" ? parsed.session.id : null,
-      title: typeof parsed.session?.title === "string" ? parsed.session.title : null,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function writeProjectWorkspaceMetadata(project: ProjectSummary, orphanedAt?: string | null) {
-  const workspacePath = resolveTerminalCwd(project.workspacePath);
-  if (!pathWithinRoot(workspacePath, internalProjectWorkspaceRoot)) return;
-  if (!existsSync(workspacePath)) mkdirSync(workspacePath, { recursive: true });
-  writeFileSync(join(workspacePath, projectWorkspaceMetadataFile), `${JSON.stringify({
-    id: project.id,
-    name: project.name,
-    workspacePath,
-    orphanedAt: orphanedAt ?? null,
-    updatedAt: new Date().toISOString(),
-  }, null, 2)}\n`);
-}
-
-function backupTimestamp() {
-  return new Date().toISOString().replace(/[:.]/g, "-");
-}
-
-function safeBackupEntryName(name: string) {
-  const normalized = name.replaceAll("\\", "/");
-  if (!normalized || normalized.startsWith("/") || normalized.includes("\0")) throw new Error("invalid_backup_entry");
-  if (normalized.split("/").some((part) => part === "..")) throw new Error("invalid_backup_entry");
-  return normalized;
-}
-
-function defaultSystemBackupSettings(): SystemBackupSettings {
-  return {
-    ignorePatterns: [
-      "# 备份忽略规则，语法类似 .gitignore",
-      "node_modules/",
-      ".DS_Store",
-    ],
-    updatedAt: new Date().toISOString(),
-  };
-}
-
-function sanitizeSystemBackupSettings(input?: { ignorePatterns?: string[] | string; updatedAt?: string } | null): SystemBackupSettings {
-  const rawPatterns = Array.isArray(input?.ignorePatterns)
-    ? input!.ignorePatterns
-    : typeof input?.ignorePatterns === "string"
-      ? input.ignorePatterns.split(/\r?\n/)
-      : defaultSystemBackupSettings().ignorePatterns;
-  const ignorePatterns = rawPatterns
-    .map((line: string) => String(line).replace(/\r/g, "").slice(0, 500))
-    .slice(0, 500);
-  return {
-    ignorePatterns,
-    updatedAt: typeof input?.updatedAt === "string" ? input.updatedAt : new Date().toISOString(),
-  };
-}
-
-function loadSystemBackupSettings(): SystemBackupSettings {
-  const row = db.prepare("select value from app_settings where key = 'system_backup'").get() as { value: string } | undefined;
-  if (!row) return defaultSystemBackupSettings();
-  try {
-    return sanitizeSystemBackupSettings(JSON.parse(row.value) as Partial<SystemBackupSettings>);
-  } catch {
-    return defaultSystemBackupSettings();
-  }
-}
-
-function saveSystemBackupSettings(settings: SystemBackupSettings) {
-  db.prepare(`
-    insert into app_settings (key, value, updated_at)
-    values ('system_backup', ?, ?)
-    on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at
-  `).run(JSON.stringify(settings), settings.updatedAt);
-}
-
-function loadJsonSetting<T>(key: string, fallback: T): T {
-  const row = db.prepare("select value from app_settings where key = ?").get(key) as { value: string } | undefined;
-  if (!row) return fallback;
-  try {
-    return JSON.parse(row.value) as T;
-  } catch {
-    return fallback;
-  }
-}
-
-function saveJsonSetting(key: string, value: unknown) {
-  const updatedAt = new Date().toISOString();
-  db.prepare(`
-    insert into app_settings (key, value, updated_at)
-    values (?, ?, ?)
-    on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at
-  `).run(key, JSON.stringify(value), updatedAt);
-}
-
-const defaultNotificationTestSettings: NotificationTestSettings = {
-  titleZh: "Codex Web 测试通知",
-  titleEn: "Codex Web test notification",
-  messageZh: "这是一条来自 Codex Web 的测试通知。",
-  messageEn: "This is a test notification from Codex Web.",
-  includeHelp: true,
-  updatedAt: new Date().toISOString(),
-};
-
-function sanitizeNotificationTestSettings(input?: Partial<NotificationTestSettings> | null): NotificationTestSettings {
-  return {
-    titleZh: String(input?.titleZh ?? defaultNotificationTestSettings.titleZh).trim() || defaultNotificationTestSettings.titleZh,
-    titleEn: String(input?.titleEn ?? defaultNotificationTestSettings.titleEn).trim() || defaultNotificationTestSettings.titleEn,
-    messageZh: String(input?.messageZh ?? defaultNotificationTestSettings.messageZh).trim() || defaultNotificationTestSettings.messageZh,
-    messageEn: String(input?.messageEn ?? defaultNotificationTestSettings.messageEn).trim() || defaultNotificationTestSettings.messageEn,
-    includeHelp: input?.includeHelp !== false,
-    updatedAt: String(input?.updatedAt ?? new Date().toISOString()),
-  };
-}
-
-function loadNotificationTestSettings() {
-  return sanitizeNotificationTestSettings(loadJsonSetting<NotificationTestSettings>("notification_test_settings", defaultNotificationTestSettings));
-}
-
-function saveNotificationTestSettings(settings: NotificationTestSettings) {
-  saveJsonSetting("notification_test_settings", settings);
-}
-
-notificationTestSettings = loadNotificationTestSettings();
-
-function decodeTomlQuotedKey(value: string) {
-  try {
-    return JSON.parse(`"${value}"`) as string;
-  } catch {
-    return value;
-  }
-}
-
-function shouldPruneCodexProjectTrustPath(value: string) {
-  const absolutePath = resolve(value);
-  const sessionRoot = resolve(sessionWorkspaceRoot);
-  return absolutePath === sessionRoot || absolutePath.startsWith(`${sessionRoot}${sep}`);
-}
-
-function pruneCodexSessionProjectTrustEntries() {
-  const configPath = join(codexHome, "config.toml");
-  if (!existsSync(configPath)) return 0;
-  const content = readFileSync(configPath, "utf8");
-  const lines = content.split(/\r?\n/);
-  const nextLines: string[] = [];
-  let pruned = 0;
-  for (let index = 0; index < lines.length;) {
-    const line = lines[index];
-    const match = line.match(/^\[projects\.(?:"((?:\\.|[^"])*)"|([^\]]+))\]\s*$/);
-    if (!match) {
-      nextLines.push(line);
-      index += 1;
-      continue;
-    }
-    const projectPath = match[1] ? decodeTomlQuotedKey(match[1]) : match[2];
-    const section: string[] = [line];
-    index += 1;
-    while (index < lines.length && !lines[index].startsWith("[")) {
-      section.push(lines[index]);
-      index += 1;
-    }
-    if (projectPath && shouldPruneCodexProjectTrustPath(projectPath)) {
-      pruned += 1;
-      continue;
-    }
-    nextLines.push(...section);
-  }
-  if (pruned) {
-    writeFileSync(`${configPath}.codex-web-prune.bak`, content, "utf8");
-    writeFileSync(configPath, nextLines.join("\n"), "utf8");
-  }
-  return pruned;
-}
-
-function commandVersion(command: string, args: string[]) {
-  try {
-    const result = spawnSync(command, args, { encoding: "utf8" });
-    if (result.status !== 0) return null;
-    return [result.stdout, result.stderr].join("\n").trim().split(/\r?\n/)[0] || "installed";
-  } catch {
-    return null;
-  }
-}
-
-function miseExecVersion(command: string, args: string[]) {
-  try {
-    const result = spawnSync(resolveMiseCommand(), ["exec", "--", command, ...args], { encoding: "utf8" });
-    if (result.status !== 0) return null;
-    return [result.stdout, result.stderr].join("\n").trim().split(/\r?\n/)[0] || "installed";
-  } catch {
-    return null;
-  }
-}
-
-function miseCommandCandidates() {
-  const home = process.env.HOME;
-  return [
-    process.env.MISE_BIN,
-    process.env.MISE_PATH,
-    "mise",
-    home ? join(home, ".local/bin/mise") : null,
-    home ? join(home, ".mise/bin/mise") : null,
-    "/usr/local/bin/mise",
-    "/opt/homebrew/bin/mise",
-    "/usr/bin/mise",
-  ].filter((item): item is string => Boolean(item));
-}
-
-function resolveMiseCommand() {
-  for (const candidate of miseCommandCandidates()) {
-    try {
-      const result = spawnSync(candidate, ["--version"], { encoding: "utf8" });
-      if (result.status === 0) return candidate;
-    } catch {}
-  }
-  return "mise";
-}
-
-function managedChildEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  const home = process.env.HOME;
-  const additions = [
-    process.env.MISE_SHIMS_DIR,
-    home ? join(home, ".local/share/mise/shims") : null,
-    home ? join(home, ".mise/shims") : null,
-    home ? join(home, ".local/bin") : null,
-    home ? join(home, ".mise/bin") : null,
-    "/usr/local/bin",
-  ].filter((item): item is string => Boolean(item));
-  const currentPath = process.env.PATH ?? "";
-  const currentParts = currentPath.split(delimiter).filter(Boolean);
-  const nextPath = [
-    ...additions.filter((item) => !currentParts.includes(item)),
-    ...currentParts,
-  ].join(delimiter);
-  return {
-    ...process.env,
-    PATH: nextPath,
-    ...extra,
-  };
-}
-
-function isPythonTool(tool?: string | null) {
-  const key = tool?.trim().toLowerCase();
-  return key === "python" || key === "python3";
-}
-
-function isMisePythonAttestationFailure(result: ReturnType<typeof spawnSync>) {
-  const output = [result.stderr, result.stdout].join("\n").toLowerCase();
-  return output.includes("github artifact attestations")
-    || output.includes("mise_python_github_attestations")
-    || output.includes("attestation verification");
-}
-
-function runMiseUseGlobal(tool: string, target: string) {
-  const command = resolveMiseCommand();
-  const result = spawnSync(command, ["use", "-g", target], { encoding: "utf8" });
-  if (result.status === 0 || !isPythonTool(tool) || !isMisePythonAttestationFailure(result)) return result;
-  return spawnSync(command, ["use", "-g", target], {
-    encoding: "utf8",
-    env: managedChildEnv({ MISE_PYTHON_GITHUB_ATTESTATIONS: "false" }),
-  });
-}
-
-function detectToolVersion(tool: string) {
-  const key = tool.trim().toLowerCase();
-  if (!key) return null;
-  if (key === "node") return commandVersion("node", ["-v"]) ?? miseExecVersion("node", ["-v"]);
-  if (key === "pnpm") return commandVersion("pnpm", ["-v"]) ?? miseExecVersion("pnpm", ["-v"]);
-  if (key === "python" || key === "python3") return commandVersion("python3", ["--version"]) ?? commandVersion("python", ["--version"]) ?? miseExecVersion("python", ["--version"]);
-  if (key === "git") return commandVersion("git", ["--version"]) ?? miseExecVersion("git", ["--version"]);
-  if (key === "uv") return commandVersion("uv", ["--version"]) ?? miseExecVersion("uv", ["--version"]);
-  if (key === "ffmpeg") return commandVersion("ffmpeg", ["-version"]) ?? miseExecVersion("ffmpeg", ["-version"]);
-  if (key === "go") return commandVersion("go", ["version"]) ?? miseExecVersion("go", ["version"]);
-  if (key === "bun") return commandVersion("bun", ["--version"]) ?? miseExecVersion("bun", ["--version"]);
-  if (key === "mise") return commandVersion(resolveMiseCommand(), ["--version"]);
-  return commandVersion(key, ["--version"]) ?? commandVersion(key, ["version"]) ?? miseExecVersion(key, ["--version"]) ?? miseExecVersion(key, ["version"]);
-}
-
-function probeEnvironmentTool(tool: string): EnvironmentToolProbe {
-  const detectedVersion = detectToolVersion(tool);
-  return {
-    tool,
-    detectedVersion,
-    installed: Boolean(detectedVersion),
-  };
-}
-
-function detectMiseStatus() {
-  try {
-    const result = spawnSync(resolveMiseCommand(), ["--version"], { encoding: "utf8" });
-    const output = [result.stdout, result.stderr].join("\n");
-    const versionLine = output.split(/\r?\n/).map((line) => line.trim()).find((line) => line && !line.startsWith("[WARN]") && !line.startsWith("mise WARN")) ?? null;
-    const warningLine = output.split(/\r?\n/).map((line) => line.trim()).find((line) => line.startsWith("[WARN]") || line.startsWith("mise WARN")) ?? null;
-    return {
-      installed: result.status === 0,
-      version: versionLine,
-      warning: warningLine,
-    };
-  } catch {
-    return {
-      installed: false,
-      version: null,
-      warning: "mise_not_installed",
-    };
-  }
-}
-
-function parseRegistryLines(output: string) {
-  return output
-    .split(/\r?\n/)
-    .map((line) => line.trimEnd())
-    .filter((line) => line && !line.startsWith("[WARN]") && !line.startsWith("mise WARN"))
-    .map((line) => {
-      const match = line.match(/^(\S+)\s+(.*)$/);
-      if (!match) return null;
-      const name = match[1]?.trim();
-      const rest = match[2]?.trim() ?? "";
-      if (!name) return null;
-      const backend = rest.split(/\s+/)[0]?.trim() || null;
-      return {
-        name,
-        description: rest || null,
-        backend,
-      };
-    })
-    .filter((item): item is EnvironmentToolRegistryItem => Boolean(item));
-}
-
-function listEnvironmentToolRegistry(query?: string) {
-  const trimmed = query?.trim();
-  const args = trimmed ? ["search", trimmed] : ["registry"];
-  try {
-    const result = spawnSync(resolveMiseCommand(), args, { encoding: "utf8" });
-    if (result.status !== 0) return [];
-    const items = parseRegistryLines([result.stdout, result.stderr].join("\n"));
-    return items.slice(0, trimmed ? 100 : 400);
-  } catch {
-    return [];
-  }
-}
-
-function listEnvironmentToolVersions(tool: string) {
-  const trimmed = tool.trim();
-  if (!trimmed) return { items: [] as EnvironmentToolVersionItem[], error: "tool_required" as string | null };
-  try {
-    const result = spawnSync(resolveMiseCommand(), ["ls-remote", trimmed], { encoding: "utf8" });
-    if (result.status !== 0) {
-      return {
-        items: [] as EnvironmentToolVersionItem[],
-        error: [result.stderr, result.stdout].join("\n").trim() || "environment_versions_failed",
-      };
-    }
-    const items = [result.stdout, result.stderr]
-      .join("\n")
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith("[WARN]") && !line.startsWith("mise WARN"))
-      .map((line) => {
-        const version = line.split(/\s+/)[0]?.trim();
-        return version ? ({ version } satisfies EnvironmentToolVersionItem) : null;
-      })
-      .filter((item): item is EnvironmentToolVersionItem => Boolean(item))
-      .sort((a, b) => compareSemverDesc(a.version, b.version));
-    const recommended = recommendEnvironmentToolVersions(trimmed, items);
-    const historical = items.filter((item) => !recommended.some((entry) => entry.version === item.version)).slice(0, 80);
-    return { items: recommended, history: historical, error: null };
-  } catch (error) {
-    return {
-      items: [] as EnvironmentToolVersionItem[],
-      history: [] as EnvironmentToolVersionItem[],
-      error: error instanceof Error ? error.message : "environment_versions_failed",
-    };
-  }
-}
-
-function compareSemverDesc(a: string, b: string) {
-  const parse = (value: string) => value.split(".").map((part) => Number.parseInt(part.replace(/\D.*$/g, ""), 10) || 0);
-  const left = parse(a);
-  const right = parse(b);
-  const length = Math.max(left.length, right.length);
-  for (let index = 0; index < length; index += 1) {
-    const diff = (right[index] ?? 0) - (left[index] ?? 0);
-    if (diff !== 0) return diff;
-  }
-  return b.localeCompare(a, undefined, { numeric: true, sensitivity: "base" });
-}
-
-function recommendEnvironmentToolVersions(tool: string, items: EnvironmentToolVersionItem[]) {
-  const normalized = tool.trim().toLowerCase();
-  if (!items.length) return [];
-  if (normalized === "node" || normalized === "python" || normalized === "bun") {
-    const latestByMajor = new Map<number, EnvironmentToolVersionItem>();
-    for (const item of items) {
-      const major = Number.parseInt(item.version.split(".")[0] ?? "", 10);
-      if (!Number.isFinite(major)) continue;
-      if (!latestByMajor.has(major)) latestByMajor.set(major, item);
-    }
-    return Array.from(latestByMajor.entries())
-      .sort((a, b) => b[0] - a[0])
-      .slice(0, 6)
-      .map(([, item], index) => ({ ...item, recommended: index < 3 }));
-  }
-  return items.slice(0, 12).map((item, index) => ({ ...item, recommended: index < 6 }));
-}
-
-function buildEnvironmentOverview(): EnvironmentOverview {
-  const raw = loadJsonSetting<EnvironmentOverview>("environment_overview", {
-    tools: [],
-    packageRecords: [],
-    restoreRuns: [],
-    reconcile: [],
-    projectUsage: [],
-    mise: {
-      installed: false,
-      version: null,
-      warning: null,
-    },
-    updatedAt: new Date().toISOString(),
-  });
-  const tools = Array.isArray(raw.tools) ? raw.tools : [];
-  const packageRecords = Array.isArray(raw.packageRecords) ? raw.packageRecords : [];
-  const restoreRuns = Array.isArray(raw.restoreRuns) ? raw.restoreRuns : [];
-  const mise = detectMiseStatus();
-  const currentOutput = (() => {
-    try {
-      const result = spawnSync(resolveMiseCommand(), ["current"], { encoding: "utf8" });
-      return result.status === 0 ? [result.stdout, result.stderr].join("\n") : "";
-    } catch {
-      return "";
-    }
-  })();
-  const normalizedTools = tools.map((tool) => {
-    const detectedVersion = detectToolVersion(tool.tool);
-    const status: EnvironmentToolRecord["status"] = detectedVersion
-      ? (tool.requestedVersion && !detectedVersion.includes(tool.requestedVersion) ? "version_mismatch" : "installed")
-      : "missing";
-    const isGlobalDefault = currentOutput.split(/\r?\n/).some((line) => {
-      const normalized = line.trim().toLowerCase();
-      return normalized.startsWith(`${tool.tool.toLowerCase()} `) && normalized.includes(tool.requestedVersion.toLowerCase());
-    });
-    return {
-      ...tool,
-      detectedVersion,
-      isGlobalDefault,
-      status,
-      updatedAt: new Date().toISOString(),
-    };
-  });
-  const normalizedPackageRecords = packageRecords.map((pkg) => {
-    const toolRecord = normalizedTools.find((tool) => tool.id === pkg.toolRecordId) ?? null;
-    const runtimeMissing = toolRecord?.status === "missing";
-    const runtimeMismatch = toolRecord?.status === "version_mismatch";
-    const pkgStatus = runtimeMissing
-      ? "missing"
-      : runtimeMismatch
-        ? "failed"
-        : pkg.status ?? "installed";
-    return {
-      ...pkg,
-      status: pkgStatus,
-      updatedAt: new Date().toISOString(),
-    };
-  });
-  const reconcile: EnvironmentReconcileItem[] = [];
-  for (const tool of normalizedTools) {
-    if (tool.status === "missing") {
-      reconcile.push({
-        id: `reconcile-tool-missing-${tool.id}`,
-        kind: "tool",
-        status: "missing_runtime",
-        title: `${tool.tool}@${tool.requestedVersion}`,
-        detail: "Recorded runtime is missing locally.",
-        toolRecordId: tool.id,
-      });
-    } else if (tool.status === "version_mismatch") {
-      reconcile.push({
-        id: `reconcile-tool-version-${tool.id}`,
-        kind: "tool",
-        status: "runtime_version_mismatch",
-        title: `${tool.tool}@${tool.requestedVersion}`,
-        detail: `Detected ${tool.detectedVersion ?? "unknown"} locally.`,
-        toolRecordId: tool.id,
-      });
-    }
-  }
-  for (const pkg of normalizedPackageRecords) {
-    if (pkg.status === "missing") {
-      reconcile.push({
-        id: `reconcile-pkg-missing-${pkg.id}`,
-        kind: "package",
-        status: "missing_package",
-        title: `${pkg.packageName} · ${pkg.manager}`,
-        detail: `Missing from ${pkg.targetLabel}.`,
-        toolRecordId: pkg.toolRecordId ?? null,
-        packageRecordId: pkg.id,
-      });
-    } else if (pkg.versionSpec && pkg.installedVersion && pkg.versionSpec !== pkg.installedVersion) {
-      reconcile.push({
-        id: `reconcile-pkg-version-${pkg.id}`,
-        kind: "package",
-        status: "package_version_mismatch",
-        title: `${pkg.packageName} · ${pkg.manager}`,
-        detail: `Recorded ${pkg.versionSpec}, detected ${pkg.installedVersion}.`,
-        toolRecordId: pkg.toolRecordId ?? null,
-        packageRecordId: pkg.id,
-      });
-    }
-  }
-  const projectUsage: EnvironmentProjectUsage[] = appData.projects.map((project) => {
-    const detectedFiles: string[] = [];
-    const matchedTools = new Set<string>();
-    try {
-      const root = resolveTerminalCwd(project.workspacePath);
-      const probes: Array<{ file: string; tool: string }> = [
-        { file: "package.json", tool: "node" },
-        { file: "pnpm-lock.yaml", tool: "node" },
-        { file: "requirements.txt", tool: "python" },
-        { file: "pyproject.toml", tool: "python" },
-        { file: "go.mod", tool: "go" },
-        { file: "Cargo.toml", tool: "rust" },
-        { file: "Gemfile", tool: "ruby" },
-        { file: "composer.json", tool: "php" },
-        { file: "deno.json", tool: "deno" },
-        { file: "pubspec.yaml", tool: "dart" },
-      ];
-      for (const probe of probes) {
-        if (existsSync(join(root, probe.file))) {
-          detectedFiles.push(probe.file);
-          matchedTools.add(probe.tool);
-        }
-      }
-    } catch {}
-    return {
-      projectId: project.id,
-      projectName: project.name,
-      workspacePath: project.workspacePath,
-      matchedTools: [...matchedTools],
-      detectedFiles,
-    };
-  }).filter((item) => item.matchedTools.length || item.detectedFiles.length);
-  return {
-    tools: normalizedTools,
-    packageRecords: normalizedPackageRecords,
-    restoreRuns,
-    reconcile,
-    projectUsage,
-    mise: {
-      installed: Boolean(mise.installed),
-      version: mise.version ?? null,
-      warning: mise.warning ?? null,
-    },
-    updatedAt: new Date().toISOString(),
-  };
-}
-
-function saveEnvironmentOverview(overview: EnvironmentOverview) {
-  saveJsonSetting("environment_overview", overview);
-}
-
-function listPackagesForToolRecord(toolRecord: EnvironmentToolRecord) {
-  return environmentOverview.packageRecords
-    .filter((item) => item.toolRecordId === toolRecord.id)
-    .sort((a, b) => (b.updatedAt ?? b.createdAt).localeCompare(a.updatedAt ?? a.createdAt));
-}
-
-const environmentPackageRegistry = createEnvironmentPackageRegistry(commandVersion);
-
-function environmentPackageManualCleanup(manager: string) {
-  return manager === "go-install" || manager === "shards";
-}
-
-function buildEnvironmentRestorePreview(toolRecord: EnvironmentToolRecord, packages: EnvironmentPackageRecord[]): EnvironmentRestorePreviewItem[] {
-  const items: EnvironmentRestorePreviewItem[] = [];
-  items.push({
-    id: `preview-tool-${toolRecord.id}`,
-    kind: "tool",
-    action: toolRecord.status === "missing" ? "install" : toolRecord.status === "version_mismatch" ? "manual" : "record",
-    title: `${toolRecord.tool}@${toolRecord.requestedVersion}`,
-    detail: toolRecord.status === "missing"
-      ? "Runtime needs installation."
-      : toolRecord.status === "version_mismatch"
-        ? `Detected ${toolRecord.detectedVersion ?? "unknown"} locally.`
-        : "Runtime already available locally.",
-    command: toolRecord.source === "mise" ? `mise use -g ${toolRecord.tool}@${toolRecord.requestedVersion}` : null,
-    toolRecordId: toolRecord.id,
-  });
-  for (const pkg of packages) {
-    items.push({
-      id: `preview-package-${pkg.id}`,
-      kind: "package",
-      action: environmentPackageManualCleanup(pkg.manager)
-        ? "manual"
-        : pkg.persisted
-          ? "record"
-          : pkg.status === "missing"
-            ? "install"
-            : "record",
-      title: `${pkg.packageName} · ${pkg.manager}`,
-      detail: environmentPackageManualCleanup(pkg.manager)
-        ? "Requires manual cleanup or manual install review."
-        : pkg.status === "missing"
-          ? `Will install into ${pkg.targetLabel}.`
-          : `Will record or keep existing install for ${pkg.targetLabel}.`,
-      command: pkg.status === "missing" ? pkg.installCommand : null,
-      toolRecordId: pkg.toolRecordId ?? null,
-      packageRecordId: pkg.id,
-    });
-  }
-  return items;
-}
-
-function summarizeEnvironmentRestoreRun(status: EnvironmentRestoreRun["status"], lines: string[]) {
-  const content = lines.filter(Boolean).join("; ").trim();
-  return content || (status === "success" ? "Environment restore completed" : status === "partial" ? "Environment restore partially completed" : "Environment restore failed");
-}
-
-function environmentRestoreSelectionMatches(mode: "all" | "auto", autoRestore: boolean) {
-  return mode === "all" || autoRestore;
-}
-
-function buildEnvironmentRestoreExecutionPlan(body?: EnvironmentRestoreMissingRequest): EnvironmentRestorePreviewResponse {
-  const mode = body?.mode === "all" ? "all" : "auto";
-  const includeTools = body?.includeTools !== false;
-  const includePackages = body?.includePackages !== false;
-  const overview = buildEnvironmentOverview();
-  const items: EnvironmentRestorePreviewItem[] = [];
-  let tools = 0;
-  let packages = 0;
-  if (includeTools) {
-    for (const tool of overview.tools.filter((item) => item.status === "missing" && environmentRestoreSelectionMatches(mode, item.autoRestore))) {
-      tools += 1;
-      items.push({
-        id: `restore-tool-${tool.id}`,
-        kind: "tool",
-        action: tool.source === "mise" ? "install" : "manual",
-        title: `${tool.tool}@${tool.requestedVersion}`,
-        detail: tool.source === "mise"
-          ? "Missing runtime will be installed."
-          : `Missing runtime is tracked as ${tool.source} and requires manual restore.`,
-        command: tool.source === "mise" ? `mise use -g ${tool.tool}@${tool.requestedVersion}` : null,
-        toolRecordId: tool.id,
-      });
-    }
-  }
-  if (includePackages) {
-    for (const pkg of overview.packageRecords.filter((item) => item.status === "missing" && environmentRestoreSelectionMatches(mode, item.autoRestore))) {
-      packages += 1;
-      const tool = pkg.toolRecordId ? overview.tools.find((entry) => entry.id === pkg.toolRecordId) ?? null : null;
-      const runtimeMissing = tool?.status === "missing";
-      const commandSpec = packageInstallCommandSpec(pkg.manager, pkg.packageName, pkg.versionSpec ?? null);
-      const action: EnvironmentRestorePreviewItem["action"] = runtimeMissing || !commandSpec || environmentPackageManualCleanup(pkg.manager) ? "manual" : "install";
-      items.push({
-        id: `restore-package-${pkg.id}`,
-        kind: "package",
-        action,
-        title: `${pkg.packageName} · ${pkg.manager}`,
-        detail: runtimeMissing
-          ? `Runtime ${tool?.tool ?? pkg.tool} is missing and must be restored first.`
-          : !commandSpec || environmentPackageManualCleanup(pkg.manager)
-            ? `Package manager ${pkg.manager} requires manual restore handling.`
-            : `Missing package will be installed into ${pkg.targetLabel}.`,
-        command: action === "install" && commandSpec ? commandSpec.text : null,
-        toolRecordId: pkg.toolRecordId ?? null,
-        packageRecordId: pkg.id,
-      });
-    }
-  }
-  return { items, tools, packages };
-}
-
-function runEnvironmentRestoreMissing(body?: EnvironmentRestoreMissingRequest) {
-  const mode = body?.mode === "all" ? "all" : "auto";
-  const includeTools = body?.includeTools !== false;
-  const includePackages = body?.includePackages !== false;
-  const now = new Date().toISOString();
-  const startedOverview = buildEnvironmentOverview();
-  const summaryLines: string[] = [];
-  let successCount = 0;
-  let failureCount = 0;
-
-  if (includeTools) {
-    const tools = startedOverview.tools.filter((item) => item.status === "missing" && environmentRestoreSelectionMatches(mode, item.autoRestore));
-    let installedTools = 0;
-    let skippedTools = 0;
-    let failedTools = 0;
-    for (const tool of tools) {
-      if (tool.source !== "mise") {
-        skippedTools += 1;
-        continue;
-      }
-      const result = runMiseUseGlobal(tool.tool, `${tool.tool}@${tool.requestedVersion}`);
-      if (result.status === 0) {
-        installedTools += 1;
-        successCount += 1;
-      } else {
-        failedTools += 1;
-        failureCount += 1;
-      }
-    }
-    if (tools.length) {
-      summaryLines.push(`runtimes ${installedTools}/${tools.length} restored${skippedTools ? `, ${skippedTools} manual` : ""}${failedTools ? `, ${failedTools} failed` : ""}`);
-    }
-  }
-
-  let refreshedOverview = buildEnvironmentOverview();
-  if (includePackages) {
-    const packages = refreshedOverview.packageRecords.filter((item) => item.status === "missing" && environmentRestoreSelectionMatches(mode, item.autoRestore));
-    let installedPackages = 0;
-    let skippedPackages = 0;
-    let failedPackages = 0;
-    const updatedRecords = [...refreshedOverview.packageRecords];
-    for (const pkg of packages) {
-      const tool = pkg.toolRecordId ? refreshedOverview.tools.find((entry) => entry.id === pkg.toolRecordId) ?? null : null;
-      if (tool?.status === "missing") {
-        skippedPackages += 1;
-        continue;
-      }
-      const commandSpec = packageInstallCommandSpec(pkg.manager, pkg.packageName, pkg.versionSpec ?? null);
-      if (!commandSpec || environmentPackageManualCleanup(pkg.manager)) {
-        skippedPackages += 1;
-        continue;
-      }
-      const probe = environmentPackageRegistry.inspectEnvironmentPackage(pkg.manager, pkg.packageName);
-      const result = probe.installed ? { status: 0, stdout: "already installed", stderr: "" } : spawnSync(commandSpec.command, commandSpec.args, { encoding: "utf8" });
-      const index = updatedRecords.findIndex((item) => item.id === pkg.id);
-      if (result.status === 0) {
-        installedPackages += 1;
-        successCount += 1;
-        if (index >= 0) {
-          updatedRecords[index] = {
-            ...updatedRecords[index],
-            persisted: true,
-            status: "installed",
-            installedVersion: probe.version ?? pkg.versionSpec ?? updatedRecords[index].installedVersion ?? null,
-            updatedAt: now,
-          };
-        }
-      } else {
-        failedPackages += 1;
-        failureCount += 1;
-        if (index >= 0) updatedRecords[index] = { ...updatedRecords[index], status: "failed", updatedAt: now };
-      }
-    }
-    refreshedOverview = {
-      ...refreshedOverview,
-      packageRecords: updatedRecords,
-      updatedAt: now,
-    };
-    saveEnvironmentOverview(refreshedOverview);
-    if (packages.length) {
-      summaryLines.push(`packages ${installedPackages}/${packages.length} restored${skippedPackages ? `, ${skippedPackages} manual` : ""}${failedPackages ? `, ${failedPackages} failed` : ""}`);
-    }
-  }
-
-  const finalOverview = buildEnvironmentOverview();
-  const status: EnvironmentRestoreRun["status"] = failureCount === 0
-    ? "success"
-    : successCount > 0
-      ? "partial"
-      : "failed";
-  const nextOverview: EnvironmentOverview = {
-    ...finalOverview,
-    restoreRuns: [
-      {
-        id: `env-restore-${randomUUID()}`,
-        status,
-        summary: summarizeEnvironmentRestoreRun(status, summaryLines),
-        createdAt: now,
-      },
-      ...finalOverview.restoreRuns,
-    ].slice(0, 20),
-    updatedAt: now,
-  };
-  saveEnvironmentOverview(nextOverview);
-  environmentOverview = nextOverview;
-  return nextOverview;
-}
-
-function dataBackupEntries(rootName: string) {
-  const entries: Array<{ name: string; data: Buffer; modifiedAt?: Date }> = [];
-  const rootPath = resolve(dataDir);
-  const shouldExclude = archiveExcluder(systemBackupSettings.ignorePatterns);
-
-  function walk(absolutePath: string, relativePath: string) {
-    const stat = lstatSync(absolutePath);
-    if (stat.isSymbolicLink()) return;
-    if (relativePath && shouldExclude(relativePath, stat.isDirectory())) return;
-    if (stat.isDirectory()) {
-      for (const name of readdirSync(absolutePath)) walk(join(absolutePath, name), relativePath ? `${relativePath}/${name}` : name);
-      return;
-    }
-    if (!stat.isFile()) return;
-    const archivePath = safeBackupEntryName(`${rootName}/app-data/${relativePath}`);
-    entries.push({ name: archivePath, data: readFileSync(absolutePath), modifiedAt: stat.mtime });
-  }
-
-  if (existsSync(rootPath)) walk(rootPath, "");
-  return entries;
-}
-
-function gitValue(cwd: string, args: string[]) {
-  const result = runGitSync(cwd, args);
-  return result.exitCode === 0 ? result.stdout.trim() || null : null;
-}
-
-function projectBackupReferences(): SystemBackupProjectReference[] {
-  return appData.projects.map((project) => {
-    let workspacePath = project.workspacePath;
-    let exists = false;
-    try {
-      workspacePath = resolveTerminalCwd(project.workspacePath);
-      exists = existsSync(workspacePath);
-    } catch {
-      workspacePath = project.workspacePath;
-    }
-    const gitRemote = exists ? gitValue(workspacePath, ["config", "--get", "remote.origin.url"]) : null;
-    const gitBranch = exists ? gitValue(workspacePath, ["branch", "--show-current"]) : null;
-    const gitCommit = exists ? gitValue(workspacePath, ["rev-parse", "HEAD"]) : null;
-    const dirtyOutput = exists ? gitValue(workspacePath, ["status", "--short"]) : null;
-    const gitDirty = exists ? Boolean(dirtyOutput) : null;
-    return {
-      id: project.id,
-      name: project.name,
-      workspacePath,
-      exists,
-      gitRemote,
-      gitBranch,
-      gitCommit,
-      gitDirty,
-      included: false,
-      note: "真实项目源码目录不会随系统备份打包；这里只记录路径和 Git 参考信息。",
-    };
-  });
-}
-
-function buildSystemBackupManifest(warnings: string[] = []): SystemBackupManifest {
-  return {
-    schemaVersion: 1,
-    createdAt: new Date().toISOString(),
-    app: "codex-web",
-    dataDir,
-    ignorePatterns: systemBackupSettings.ignorePatterns,
-    included: [
-      "apps/api/data/**",
-      "备份清单 manifest.json",
-      "已绑定项目的路径与 Git 参考信息",
-    ],
-    excluded: [
-      "apps/api/data 之外的真实项目源码目录",
-      "构建产物和外部挂载目录",
-      "用户配置的备份忽略规则匹配到的 apps/api/data 内文件",
-    ],
-    projects: projectBackupReferences(),
-    warnings: [
-      "真实项目目录不会随系统备份打包；还原后如果路径不存在，需要重新绑定项目目录。",
-      "Provider API Key 等应用状态会随 apps/api/data 一起备份。请妥善保管备份文件。",
-      ...warnings,
-    ],
-  };
-}
-
-function createSystemBackupArchive() {
-  const warnings: string[] = [];
-  try {
-    db.pragma("wal_checkpoint(FULL)");
-  } catch {
-    warnings.push("SQLite WAL checkpoint 失败，备份仍会继续，但正在写入的数据可能需要重启后再备份一次。");
-  }
-  const rootName = `codex-web-system-backup-${backupTimestamp()}`;
-  const manifest = buildSystemBackupManifest(warnings);
-  const entries = [
-    { name: `${rootName}/manifest.json`, data: `${JSON.stringify(manifest, null, 2)}\n`, modifiedAt: new Date(manifest.createdAt) },
-    ...dataBackupEntries(rootName),
-  ];
-  const buffer = createZipArchiveWithEntries(entries);
-  return { manifest, buffer, entries: entries.length, bytes: buffer.length };
-}
-
-function readSystemBackupArchive(buffer: Buffer) {
-  const entries = parseStoredZipArchive(buffer);
-  const manifestEntry = entries.find((entry) => entry.name.endsWith("/manifest.json") || entry.name === "manifest.json");
-  if (!manifestEntry) throw new Error("backup_manifest_missing");
-  const rootName = manifestEntry.name.includes("/") ? manifestEntry.name.slice(0, manifestEntry.name.lastIndexOf("/")) : "";
-  const manifest = JSON.parse(manifestEntry.data.toString("utf8")) as SystemBackupManifest;
-  if (manifest.app !== "codex-web" || manifest.schemaVersion !== 1) throw new Error("backup_manifest_unsupported");
-  const prefix = rootName ? `${rootName}/app-data/` : "app-data/";
-  const appDataEntries = entries
-    .filter((entry) => entry.name.startsWith(prefix))
-    .map((entry) => {
-      const relativePath = safeBackupEntryName(entry.name.slice(prefix.length));
-      if (!relativePath) throw new Error("invalid_backup_entry");
-      return { relativePath, data: entry.data };
-    });
-  return { manifest, entries: appDataEntries, bytes: buffer.length };
-}
-
-function systemBackupPreviewFromArchive(buffer: Buffer): SystemBackupPreviewResponse {
-  const parsed = readSystemBackupArchive(buffer);
-  return {
-    ok: true,
-    manifest: parsed.manifest,
-    entries: parsed.entries.length,
-    bytes: parsed.bytes,
-    restartRequired: true,
-  };
-}
-
-async function readBackupUpload(c: { req: { formData: () => Promise<FormData> } }) {
-  const form = await c.req.formData();
-  const file = form.get("backup");
-  if (!file || typeof file === "string" || typeof (file as { arrayBuffer?: unknown }).arrayBuffer !== "function") {
-    throw new Error("backup_file_required");
-  }
-  return Buffer.from(await (file as { arrayBuffer: () => Promise<ArrayBuffer> }).arrayBuffer());
-}
-
-function deleteSessionData(session: SessionSummary, deleteWorkspace: boolean, deleteLogs: boolean) {
-  const managedWorkspaceRoots = [sessionWorkspaceRoot, join(dataDir, "rooms")];
-  const resolvedWorkspace = session.workspacePath ? resolve(session.workspacePath) : "";
-  if (resolvedWorkspace && managedWorkspaceRoots.some((root) => pathWithinRoot(resolvedWorkspace, root))) {
-    deleteFileMountsForRoot(resolvedWorkspace);
-  }
-  rmSync(sessionContextPath(session.id), { recursive: true, force: true });
-  if (deleteLogs) {
-    rmSync(taskLogPath(session.id), { force: true });
-    rmSync(taskMetaPath(session.id), { force: true });
-    rmSync(legacyTaskLogPath(session.id), { force: true });
-    rmSync(legacyTaskMetaPath(session.id), { force: true });
-  }
-  if (!deleteWorkspace) return;
-  const allowedRoots = managedWorkspaceRoots;
-  const candidates = new Set<string>([sessionDataPath(session.id)]);
-  if (session.workspacePath) candidates.add(resolve(session.workspacePath));
-  if (session.roomId) candidates.add(roomWorkspaceDataPath(session.roomId));
-  for (const candidate of candidates) {
-    if (!allowedRoots.some((root) => pathWithinRoot(candidate, root))) continue;
-    rmSync(candidate, { recursive: true, force: true });
-  }
-}
-
-function validPreviewHost(value: string) {
-  return /^[a-zA-Z0-9._-]+$/.test(value);
-}
-
-function rewritePreviewHtml(value: string, basePath: string) {
-  return value
-    .replace(/\b(src|href|action)=(["'])\/(?!\/|preview\/|api\/)/g, `$1=$2${basePath}`)
-    .replace(/\bsrcset=(["'])([^"']*)\1/g, (_match, quote: string, srcset: string) => {
-      const rewritten = srcset.split(",").map((item) => {
-        const trimmed = item.trim();
-        const [url = "", ...rest] = trimmed.split(/\s+/);
-        if (!url.startsWith("/") || url.startsWith("//") || url.startsWith("/preview/") || url.startsWith("/api/")) return trimmed;
-        return [`${basePath}${url.slice(1)}`, ...rest].join(" ");
-      }).join(", ");
-      return `srcset=${quote}${rewritten}${quote}`;
-    });
-}
-
-function rewritePreviewCss(value: string, basePath: string) {
-  return value.replace(/url\((["']?)\/(?!\/|preview\/|api\/)/g, `url($1${basePath}`);
-}
-
-function rewritePreviewText(value: string, basePath: string, contentType: string) {
-  if (contentType.includes("text/html")) return rewritePreviewCss(rewritePreviewHtml(value, basePath), basePath);
-  if (contentType.includes("text/css")) return rewritePreviewCss(value, basePath);
-  return value;
-}
-
-function rewritePreviewLocation(value: string | null, upstreamUrl: URL, basePath: string) {
-  if (!value) return value;
-  try {
-    const target = new URL(value, upstreamUrl);
-    if (target.origin !== upstreamUrl.origin) return value;
-    return `${basePath}${target.pathname.replace(/^\/+/, "")}${target.search}${target.hash}`;
-  } catch {
-    return value;
-  }
-}
-
-function previewFromReferer(value?: string | null) {
-  if (!value) return null;
-  try {
-    const refererUrl = new URL(value, `http://${host}:${apiPort}`);
-    const parts = refererUrl.pathname.split("/").filter(Boolean);
-    if (parts[0] !== "preview") return null;
-    const previewId = parts[1] ? decodeURIComponent(parts[1]) : "";
-    const token = parts[2] ? decodeURIComponent(parts[2]) : "";
-    const preview = previews.get(previewId);
-    return preview && preview.token === token ? preview : null;
-  } catch {
-    return null;
-  }
-}
-
-function previewUpstreamPathFromUrl(sourceUrl: URL, preview: PreviewRecord) {
-  const previewId = encodeURIComponent(preview.id);
-  const token = encodeURIComponent(preview.token);
-  let parts = sourceUrl.pathname.split("/").filter(Boolean).slice(3);
-  while (parts[0] === "preview" && parts[1] === previewId && parts[2] === token) {
-    parts = parts.slice(3);
-  }
-  return parts.join("/");
-}
-
-function previewScopeWorkspace(scopeType: PreviewRecord["scopeType"], scopeId: string) {
-  if (scopeType === "project") return appData.projects.find((project) => project.id === scopeId)?.workspacePath ?? null;
-  if (scopeType === "folder") {
-    const folderPath = resolve(scopeId);
-    return existsSync(folderPath) && statSync(folderPath).isDirectory() ? folderPath : null;
-  }
-  return appData.sessions.find((session) => session.id === scopeId)?.workspacePath ?? null;
-}
-
-function resolvePreviewCwd(preview: PreviewRecord, requestedCwd?: string) {
-  const workspace = previewScopeWorkspace(preview.scopeType, preview.scopeId);
-  if (!workspace) return null;
-  const absoluteWorkspace = resolve(workspace);
-  const absoluteCwd = resolve(absoluteWorkspace, requestedCwd?.trim() || ".");
-  const relativePath = relative(absoluteWorkspace, absoluteCwd);
-  if (relativePath.startsWith("..") || relativePath === ".." || relativePath.startsWith("/") || relativePath.startsWith("\\")) return null;
-  return absoluteCwd;
-}
-
-function stopPreviewProcess(previewId: string) {
-  const child = previewProcesses.get(previewId);
-  const processGroupId = child?.pid ?? previewProcessGroups.get(previewId);
-  if (processGroupId && process.platform !== "win32") {
-    try {
-      process.kill(-processGroupId, "SIGTERM");
-      setTimeout(() => {
-        try {
-          process.kill(-processGroupId, "SIGKILL");
-        } catch {
-          // Process group already exited.
-        }
-      }, 2500).unref();
-    } catch {
-      child?.kill("SIGTERM");
-    }
-  } else {
-    child?.kill("SIGTERM");
-  }
-  previewProcesses.delete(previewId);
-  previewProcessGroups.delete(previewId);
-}
-
-function previewUsingPort(preview: Pick<PreviewRecord, "id" | "targetHost" | "port">) {
-  return Array.from(previews.values()).find((item) =>
-    item.id !== preview.id
-    && item.targetHost === preview.targetHost
-    && item.port === preview.port
-    && (item.status === "running" || item.status === "starting")
-  ) ?? null;
-}
-
-function appendPreviewLog(previewId: string, value: string) {
-  const current = previewLogs.get(previewId) ?? "";
-  const logs = (current + value).slice(-128 * 1024);
-  const label = previews.get(previewId)?.label ?? null;
-  previewLogs.set(previewId, logs);
-  db.prepare(`
-    insert into preview_logs (preview_id, label, logs, updated_at)
-    values (?, ?, ?, ?)
-    on conflict(preview_id) do update set
-      label = coalesce(excluded.label, preview_logs.label),
-      logs = excluded.logs,
-      updated_at = excluded.updated_at
-  `).run(previewId, label, logs, new Date().toISOString());
-  publishPreviewLogEvent(previewId, { type: "log", previewId, chunk: value, at: new Date().toISOString() });
-}
-
-async function isPreviewReachable(preview: PreviewRecord) {
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 800);
-    const response = await fetch(`http://${preview.targetHost}:${preview.port}/`, { signal: controller.signal }).catch(() => null);
-    clearTimeout(timer);
-    return response;
-  } catch {
-    return null;
-  }
-}
-
-async function waitForPreviewReady(preview: PreviewRecord) {
-  for (let attempt = 0; attempt < 24; attempt += 1) {
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
-    const current = previews.get(preview.id);
-    if (!current || current.status !== "starting") return;
-    const response = await isPreviewReachable(preview);
-    if (response) {
-      current.status = "running";
-      updatePreview(current);
-      appendPreviewLog(preview.id, `[ready] upstream responded with ${response.status}\n`);
-      return;
-    }
-  }
-  const current = previews.get(preview.id);
-  if (!current || current.status !== "starting") return;
-  current.status = "error";
-  updatePreview(current);
-  appendPreviewLog(preview.id, "[error] upstream did not become ready within 12s\n");
-}
-
-async function settlePreviewProcessExit(previewId: string, exitCode: number | null) {
-  previewProcesses.delete(previewId);
-  const current = previews.get(previewId);
-  if (!current || (current.status !== "running" && current.status !== "starting")) return;
-  await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
-  const response = await isPreviewReachable(current);
-  if (response && exitCode === 0) {
-    current.status = "running";
-    updatePreview(current);
-    appendPreviewLog(previewId, `\n[exit] shell exited with ${exitCode}, upstream still responds with ${response.status}\n`);
-    return;
-  }
-  previewProcessGroups.delete(previewId);
-  current.status = exitCode === 0 ? "stopped" : "error";
-  updatePreview(current);
-  appendPreviewLog(previewId, `\n[exit] ${exitCode}\n`);
-}
-
-function startPreviewProcess(preview: PreviewRecord) {
-  if (!preview.command?.trim()) throw new Error("preview_command_required");
-  const cwd = resolvePreviewCwd(preview, preview.cwd);
-  if (!cwd) throw new Error("invalid_preview_cwd");
-  const conflict = previewUsingPort(preview);
-  if (conflict) {
-    appendPreviewLog(preview.id, `[error] port ${preview.targetHost}:${preview.port} is already used by ${conflict.label}\n`);
-    throw new Error("preview_port_in_use");
-  }
-  stopPreviewProcess(preview.id);
-  preview.cwd = cwd;
-  preview.status = "starting";
-  updatePreview(preview);
-  appendPreviewLog(preview.id, `\n[start] ${new Date().toISOString()}\n$ ${preview.command}\ncwd: ${toTerminalPath(cwd)}\n`);
-  const child = spawnProcess(preview.command, {
-    cwd,
-    shell: true,
-    detached: process.platform !== "win32",
-    env: managedChildEnv({
-      HOST: "0.0.0.0",
-      PORT: String(preview.port),
-    }),
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  previewProcesses.set(preview.id, child);
-  if (child.pid) previewProcessGroups.set(preview.id, child.pid);
-  child.stdout?.on("data", (data) => appendPreviewLog(preview.id, data.toString()));
-  child.stderr?.on("data", (data) => appendPreviewLog(preview.id, data.toString()));
-  child.once("exit", (exitCode) => {
-    void settlePreviewProcessExit(preview.id, exitCode);
-  });
-  void waitForPreviewReady(preview);
-}
-
 function pauseStaleRunningSessions() {
   let changed = false;
   for (const session of appData.sessions) {
@@ -8475,794 +3782,12 @@ function recoverInterruptedRoomAgentRunsFromLogs() {
   if (changed) saveAppData();
 }
 
-function jsonArray(value: unknown): string[] {
-  if (Array.isArray(value)) return value.map((item) => String(item)).filter(Boolean);
-  if (typeof value !== "string" || !value.trim()) return [];
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    return Array.isArray(parsed) ? parsed.map((item) => String(item)).filter(Boolean) : [];
-  } catch {
-    return [];
-  }
-}
-
-function jsonPayload(value: unknown): unknown {
-  if (typeof value !== "string" || !value.trim()) return {};
-  try {
-    return JSON.parse(value) as unknown;
-  } catch {
-    return { raw: value };
-  }
-}
-
-function goalMode(value: unknown, fallback: GoalMode = "reference"): GoalMode {
-  return value === "tracked" || value === "managed" || value === "orchestrated" || value === "reference" ? value : fallback;
-}
-
-function goalStatus(value: unknown, fallback: GoalStatus = "active"): GoalStatus {
-  return value === "paused" || value === "completed" || value === "cancelled" || value === "archived" || value === "active" ? value : fallback;
-}
-
-function goalFocusStatus(value: unknown, fallback: GoalFocusStatus = "active"): GoalFocusStatus {
-  return value === "completed" || value === "cancelled" || value === "paused" || value === "active" ? value : fallback;
-}
-
-function goalItemStatus(value: unknown, fallback: GoalItemStatus = "planned"): GoalItemStatus {
-  return value === "active" || value === "blocked" || value === "completed" || value === "failed" || value === "cancelled" || value === "planned" ? value : fallback;
-}
-
-function goalOwnerType(value: unknown): GoalOwnerType | null {
-  return value === "session" || value === "agent_session" || value === "room" ? value : null;
-}
-
-function goalFocusFromRow(row: Record<string, unknown>): GoalFocusSummary {
-  return {
-    id: String(row.id),
-    goalId: String(row.goal_id),
-    text: String(row.text),
-    status: goalFocusStatus(row.status),
-    ownerAgentId: row.owner_agent_id ? String(row.owner_agent_id) : null,
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-    completedAt: row.completed_at ? String(row.completed_at) : null,
-    cancelledAt: row.cancelled_at ? String(row.cancelled_at) : null,
-  };
-}
-
-function goalItemFromRow(row: Record<string, unknown>): GoalItemSummary {
-  return {
-    id: String(row.id),
-    goalId: String(row.goal_id),
-    roomTaskId: row.room_task_id ? String(row.room_task_id) : null,
-    title: String(row.title),
-    description: row.description ? String(row.description) : null,
-    status: goalItemStatus(row.status),
-    assignedAgentId: row.assigned_agent_id ? String(row.assigned_agent_id) : null,
-    priority: Number(row.priority) || 0,
-    dependsOnItemId: row.depends_on_item_id ? String(row.depends_on_item_id) : null,
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-    completedAt: row.completed_at ? String(row.completed_at) : null,
-    cancelledAt: row.cancelled_at ? String(row.cancelled_at) : null,
-  };
-}
-
-function goalEventFromRow(row: Record<string, unknown>): GoalEventSummary {
-  return {
-    id: String(row.id),
-    goalId: String(row.goal_id),
-    type: String(row.type),
-    actorType: row.actor_type ? String(row.actor_type) : null,
-    actorId: row.actor_id ? String(row.actor_id) : null,
-    payload: jsonPayload(row.payload),
-    createdAt: String(row.created_at),
-  };
-}
-
-function goalProposalKind(value: unknown): GoalProposalKind {
-  return value === "focus" || value === "item" || value === "plan" || value === "goal_update" ? value : "goal_update";
-}
-
-function goalProposalStatus(value: unknown): GoalProposalStatus {
-  return value === "approved" || value === "rejected" || value === "pending" ? value : "pending";
-}
-
-function goalProposalFromRow(row: Record<string, unknown>): GoalProposalSummary {
-  return {
-    id: String(row.id),
-    goalId: String(row.goal_id),
-    kind: goalProposalKind(row.kind),
-    status: goalProposalStatus(row.status),
-    title: String(row.title),
-    payload: jsonPayload(row.payload),
-    proposedByAgentId: row.proposed_by_agent_id ? String(row.proposed_by_agent_id) : null,
-    createdAt: String(row.created_at),
-    resolvedAt: row.resolved_at ? String(row.resolved_at) : null,
-  };
-}
-
-function goalProgress(goalId: string, progressSummary?: string | null): GoalSummary["progress"] {
-  const rows = db.prepare("select status, updated_at from goal_items where goal_id = ?").all(goalId) as Array<{ status?: string; updated_at?: string }>;
-  const activeStatuses = new Set(["planned", "active"]);
-  return {
-    totalItems: rows.length,
-    activeItems: rows.filter((item) => activeStatuses.has(String(item.status))).length,
-    completedItems: rows.filter((item) => item.status === "completed").length,
-    failedItems: rows.filter((item) => item.status === "failed").length,
-    blockedItems: rows.filter((item) => item.status === "blocked").length,
-    latestSummary: progressSummary ?? null,
-    updatedAt: rows.map((item) => item.updated_at ? String(item.updated_at) : "").filter(Boolean).sort().pop() ?? null,
-  };
-}
-
-function currentGoalFocus(goalId: string) {
-  const row = db.prepare(`
-    select * from goal_focuses
-    where goal_id = ? and status in ('active', 'paused')
-    order by updated_at desc, id desc
-    limit 1
-  `).get(goalId) as Record<string, unknown> | undefined;
-  return row ? goalFocusFromRow(row) : null;
-}
-
-function goalFromRow(row: Record<string, unknown>): GoalSummary {
-  return {
-    id: String(row.id),
-    ownerType: goalOwnerType(row.owner_type) ?? "session",
-    ownerId: String(row.owner_id),
-    text: String(row.text),
-    mode: goalMode(row.mode),
-    status: goalStatus(row.status),
-    managerAgentId: row.manager_agent_id ? String(row.manager_agent_id) : null,
-    coordinatorAgentId: row.coordinator_agent_id ? String(row.coordinator_agent_id) : null,
-    currentFocus: currentGoalFocus(String(row.id)),
-    progress: goalProgress(String(row.id), row.progress_summary ? String(row.progress_summary) : null),
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-    completedAt: row.completed_at ? String(row.completed_at) : null,
-    cancelledAt: row.cancelled_at ? String(row.cancelled_at) : null,
-  };
-}
-
-function activeGoalForOwner(ownerType: GoalOwnerType, ownerId?: string | null) {
-  if (!ownerId) return null;
-  const row = db.prepare(`
-    select * from goals
-    where owner_type = ? and owner_id = ? and status in ('active', 'paused')
-    order by updated_at desc, id desc
-    limit 1
-  `).get(ownerType, ownerId) as Record<string, unknown> | undefined;
-  return row ? goalFromRow(row) : null;
-}
-
-function activeGoalForSession(session: Pick<SessionSummary, "id" | "conversationType" | "roomId" | "directAgentId">) {
-  if (session.roomId) return activeGoalForOwner("room", session.roomId);
-  if (session.conversationType === "agent" || session.directAgentId) return activeGoalForOwner("agent_session", session.id);
-  return activeGoalForOwner("session", session.id);
-}
-
-function assertGoalOwner(ownerType: GoalOwnerType, ownerId: string) {
-  if (ownerType === "room") {
-    if (!db.prepare("select id from rooms where id = ?").get(ownerId)) throw new Error("room_not_found");
-    return;
-  }
-  if (!appData.sessions.some((session) => session.id === ownerId)) throw new Error("session_not_found");
-}
-
-type GoalActor = { type: "user"; agentId: null } | { type: "agent"; agentId: string };
-
-function goalActorFromRequest(c: { req: { header: (name: string) => string | undefined } }, body?: Record<string, unknown> | null): GoalActor {
-  const agentId = c.req.header("x-codex-agent-id")?.trim()
-    || c.req.header("x-agent-id")?.trim()
-    || (typeof body?.actorAgentId === "string" ? body.actorAgentId.trim() : "")
-    || (typeof body?.proposedByAgentId === "string" ? body.proposedByAgentId.trim() : "");
-  if (!agentId) return { type: "user", agentId: null };
-  if (!db.prepare("select id from agents where id = ?").get(agentId)) throw new Error("agent_actor_not_found");
-  return { type: "agent", agentId };
-}
-
-function canAgentManageGoal(goal: GoalSummary, agentId: string) {
-  if (goal.managerAgentId === agentId || goal.coordinatorAgentId === agentId) return true;
-  if (goal.ownerType !== "room") return false;
-  const membership = db.prepare("select listen_mode from room_agents where room_id = ? and agent_id = ?").get(goal.ownerId, agentId) as { listen_mode?: string } | undefined;
-  if (!membership) return false;
-  if (membership.listen_mode === "orchestrator") return true;
-  const agent = db.prepare("select name, role_id from agents where id = ?").get(agentId) as { name?: string; role_id?: string } | undefined;
-  const roleId = agent?.role_id?.toLowerCase() ?? "";
-  const name = agent?.name?.toLowerCase() ?? "";
-  return roleId.includes("product") || roleId.includes("manager") || name.includes("pm") || name.includes("product");
-}
-
-function assertCanManageGoal(goal: GoalSummary, actor: GoalActor) {
-  if (actor.type === "user") return;
-  if (canAgentManageGoal(goal, actor.agentId)) return;
-  throw new Error("goal_agent_must_propose");
-}
-
-function assertCanUpdateGoalItem(goalId: string, itemId: string, actor: GoalActor) {
-  if (actor.type === "user") return;
-  const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(goalId) as Record<string, unknown>);
-  if (canAgentManageGoal(goal, actor.agentId)) return;
-  const item = db.prepare("select assigned_agent_id from goal_items where id = ? and goal_id = ?").get(itemId, goalId) as { assigned_agent_id?: string | null } | undefined;
-  if (item?.assigned_agent_id === actor.agentId) return;
-  throw new Error("goal_item_agent_not_assigned");
-}
-
-function recordGoalEvent(goalId: string, type: string, payload: unknown = {}, actorType?: string | null, actorId?: string | null) {
-  const now = new Date().toISOString();
-  db.prepare(`
-    insert into goal_events (id, goal_id, type, actor_type, actor_id, payload, created_at)
-    values (?, ?, ?, ?, ?, ?, ?)
-  `).run(`goal-event-${randomUUID()}`, goalId, type, actorType ?? null, actorId ?? null, JSON.stringify(payload ?? {}), now);
-}
-
-function ownerDefaultGoalMode(ownerType: GoalOwnerType, requested?: GoalMode): GoalMode {
-  if (requested) return requested;
-  return ownerType === "room" ? "orchestrated" : "reference";
-}
-
-function createGoal(input: CreateGoalRequest, actorType = "user", actorId?: string | null): GoalSummary {
-  const ownerType = goalOwnerType(input.ownerType);
-  const ownerId = String(input.ownerId ?? "");
-  const text = String(input.text ?? "").trim();
-  if (!ownerType || !ownerId || !text) throw new Error("invalid_goal");
-  assertGoalOwner(ownerType, ownerId);
-  const now = new Date().toISOString();
-  const existing = activeGoalForOwner(ownerType, ownerId);
-  if (existing) {
-    db.prepare("update goals set status = 'archived', updated_at = ? where id = ?").run(now, existing.id);
-    recordGoalEvent(existing.id, "goal.archived", { reason: "replaced", replacementOwnerType: ownerType, replacementOwnerId: ownerId }, actorType, actorId);
-  }
-  const id = `goal-${randomUUID()}`;
-  db.prepare(`
-    insert into goals (id, owner_type, owner_id, text, mode, status, manager_agent_id, coordinator_agent_id, progress_summary, created_at, updated_at, completed_at, cancelled_at)
-    values (?, ?, ?, ?, ?, 'active', ?, ?, null, ?, ?, null, null)
-  `).run(id, ownerType, ownerId, text, ownerDefaultGoalMode(ownerType, input.mode), input.managerAgentId ?? null, input.coordinatorAgentId ?? null, now, now);
-  recordGoalEvent(id, "goal.created", { ownerType, ownerId, text }, actorType, actorId);
-  if (input.focusText?.trim()) createGoalFocus(id, { text: input.focusText, ownerAgentId: input.focusOwnerAgentId ?? null }, actorType, actorId);
-  return goalFromRow(db.prepare("select * from goals where id = ?").get(id) as Record<string, unknown>);
-}
-
-function updateGoal(id: string, input: UpdateGoalRequest, actorType = "user", actorId?: string | null): GoalSummary {
-  const current = db.prepare("select * from goals where id = ?").get(id) as Record<string, unknown> | undefined;
-  if (!current) throw new Error("goal_not_found");
-  const now = new Date().toISOString();
-  const nextStatus = input.status ? goalStatus(input.status, goalStatus(current.status)) : goalStatus(current.status);
-  const completedAt = nextStatus === "completed" ? String(current.completed_at ?? now) : (nextStatus === "active" || nextStatus === "paused" ? null : current.completed_at ?? null);
-  const cancelledAt = nextStatus === "cancelled" ? String(current.cancelled_at ?? now) : (nextStatus === "active" || nextStatus === "paused" ? null : current.cancelled_at ?? null);
-  db.prepare(`
-    update goals
-    set text = ?, mode = ?, status = ?, manager_agent_id = ?, coordinator_agent_id = ?, progress_summary = ?, completed_at = ?, cancelled_at = ?, updated_at = ?
-    where id = ?
-  `).run(
-    input.text !== undefined ? String(input.text).trim() || String(current.text) : String(current.text),
-    input.mode ? goalMode(input.mode, goalMode(current.mode)) : goalMode(current.mode),
-    nextStatus,
-    input.managerAgentId !== undefined ? input.managerAgentId : current.manager_agent_id ?? null,
-    input.coordinatorAgentId !== undefined ? input.coordinatorAgentId : current.coordinator_agent_id ?? null,
-    input.progressSummary !== undefined ? input.progressSummary?.trim() || null : current.progress_summary ?? null,
-    completedAt,
-    cancelledAt,
-    now,
-    id,
-  );
-  recordGoalEvent(id, "goal.updated", input, actorType, actorId);
-  return goalFromRow(db.prepare("select * from goals where id = ?").get(id) as Record<string, unknown>);
-}
-
-function createGoalFocus(goalId: string, input: CreateGoalFocusRequest, actorType = "user", actorId?: string | null): GoalFocusSummary {
-  const goal = db.prepare("select * from goals where id = ?").get(goalId) as Record<string, unknown> | undefined;
-  if (!goal) throw new Error("goal_not_found");
-  const text = String(input.text ?? "").trim();
-  if (!text) throw new Error("invalid_goal_focus");
-  const now = new Date().toISOString();
-  db.prepare("update goal_focuses set status = 'completed', completed_at = coalesce(completed_at, ?), updated_at = ? where goal_id = ? and status in ('active', 'paused')").run(now, now, goalId);
-  const id = `goal-focus-${randomUUID()}`;
-  db.prepare(`
-    insert into goal_focuses (id, goal_id, text, status, owner_agent_id, created_at, updated_at, completed_at, cancelled_at)
-    values (?, ?, ?, 'active', ?, ?, ?, null, null)
-  `).run(id, goalId, text, input.ownerAgentId ?? null, now, now);
-  db.prepare("update goals set updated_at = ? where id = ?").run(now, goalId);
-  recordGoalEvent(goalId, "focus.created", { focusId: id, text, ownerAgentId: input.ownerAgentId ?? null }, actorType, actorId);
-  return goalFocusFromRow(db.prepare("select * from goal_focuses where id = ?").get(id) as Record<string, unknown>);
-}
-
-function updateGoalFocus(goalId: string, focusId: string, input: UpdateGoalFocusRequest, actorType = "user", actorId?: string | null): GoalFocusSummary {
-  const current = db.prepare("select * from goal_focuses where id = ? and goal_id = ?").get(focusId, goalId) as Record<string, unknown> | undefined;
-  if (!current) throw new Error("goal_focus_not_found");
-  const now = new Date().toISOString();
-  const nextStatus = input.status ? goalFocusStatus(input.status, goalFocusStatus(current.status)) : goalFocusStatus(current.status);
-  db.prepare(`
-    update goal_focuses
-    set text = ?, status = ?, owner_agent_id = ?, completed_at = ?, cancelled_at = ?, updated_at = ?
-    where id = ? and goal_id = ?
-  `).run(
-    input.text !== undefined ? String(input.text).trim() || String(current.text) : String(current.text),
-    nextStatus,
-    input.ownerAgentId !== undefined ? input.ownerAgentId : current.owner_agent_id ?? null,
-    nextStatus === "completed" ? String(current.completed_at ?? now) : (nextStatus === "active" || nextStatus === "paused" ? null : current.completed_at ?? null),
-    nextStatus === "cancelled" ? String(current.cancelled_at ?? now) : (nextStatus === "active" || nextStatus === "paused" ? null : current.cancelled_at ?? null),
-    now,
-    focusId,
-    goalId,
-  );
-  db.prepare("update goals set updated_at = ? where id = ?").run(now, goalId);
-  recordGoalEvent(goalId, "focus.updated", { focusId, ...input }, actorType, actorId);
-  return goalFocusFromRow(db.prepare("select * from goal_focuses where id = ?").get(focusId) as Record<string, unknown>);
-}
-
-function createGoalItem(goalId: string, input: CreateGoalItemRequest, actorType = "user", actorId?: string | null): GoalItemSummary {
-  if (!db.prepare("select id from goals where id = ?").get(goalId)) throw new Error("goal_not_found");
-  const title = String(input.title ?? "").trim();
-  if (!title) throw new Error("invalid_goal_item");
-  const now = new Date().toISOString();
-  const id = `goal-item-${randomUUID()}`;
-  db.prepare(`
-    insert into goal_items (id, goal_id, room_task_id, title, description, status, assigned_agent_id, priority, depends_on_item_id, created_at, updated_at, completed_at, cancelled_at)
-    values (?, ?, null, ?, ?, ?, ?, ?, ?, ?, ?, null, null)
-  `).run(id, goalId, title, input.description?.trim() || null, goalItemStatus(input.status), input.assignedAgentId ?? null, Number(input.priority ?? 0) || 0, input.dependsOnItemId ?? null, now, now);
-  db.prepare("update goals set updated_at = ? where id = ?").run(now, goalId);
-  recordGoalEvent(goalId, "item.created", { itemId: id, title }, actorType, actorId);
-  return goalItemFromRow(db.prepare("select * from goal_items where id = ?").get(id) as Record<string, unknown>);
-}
-
-function updateGoalItem(goalId: string, itemId: string, input: UpdateGoalItemRequest, actorType = "user", actorId?: string | null): GoalItemSummary {
-  const current = db.prepare("select * from goal_items where id = ? and goal_id = ?").get(itemId, goalId) as Record<string, unknown> | undefined;
-  if (!current) throw new Error("goal_item_not_found");
-  const now = new Date().toISOString();
-  const nextStatus = input.status ? goalItemStatus(input.status, goalItemStatus(current.status)) : goalItemStatus(current.status);
-  db.prepare(`
-    update goal_items
-    set room_task_id = ?, title = ?, description = ?, status = ?, assigned_agent_id = ?, priority = ?, depends_on_item_id = ?, completed_at = ?, cancelled_at = ?, updated_at = ?
-    where id = ? and goal_id = ?
-  `).run(
-    input.roomTaskId !== undefined ? input.roomTaskId : current.room_task_id ?? null,
-    input.title !== undefined ? String(input.title).trim() || String(current.title) : String(current.title),
-    input.description !== undefined ? input.description?.trim() || null : current.description ?? null,
-    nextStatus,
-    input.assignedAgentId !== undefined ? input.assignedAgentId : current.assigned_agent_id ?? null,
-    input.priority !== undefined ? Number(input.priority) || 0 : Number(current.priority ?? 0) || 0,
-    input.dependsOnItemId !== undefined ? input.dependsOnItemId : current.depends_on_item_id ?? null,
-    nextStatus === "completed" ? String(current.completed_at ?? now) : (nextStatus === "planned" || nextStatus === "active" || nextStatus === "blocked" ? null : current.completed_at ?? null),
-    nextStatus === "cancelled" ? String(current.cancelled_at ?? now) : (nextStatus === "planned" || nextStatus === "active" || nextStatus === "blocked" ? null : current.cancelled_at ?? null),
-    now,
-    itemId,
-    goalId,
-  );
-  db.prepare("update goals set updated_at = ? where id = ?").run(now, goalId);
-  if (input.roomTaskId !== undefined) db.prepare("update room_tasks set goal_item_id = ? where id = ?").run(itemId, input.roomTaskId);
-  recordGoalEvent(goalId, "item.updated", { itemId, ...input }, actorType, actorId);
-  if ((nextStatus === "blocked" || nextStatus === "failed") && String(current.status) !== nextStatus) {
-    createReplanProposal(goalId, itemId, nextStatus, actorType, actorId);
-  }
-  return goalItemFromRow(db.prepare("select * from goal_items where id = ?").get(itemId) as Record<string, unknown>);
-}
-
-function listGoalProposals(goalId: string) {
-  return (db.prepare("select * from goal_proposals where goal_id = ? order by status asc, created_at desc, id desc").all(goalId) as Array<Record<string, unknown>>).map(goalProposalFromRow);
-}
-
-function createGoalProposal(goalId: string, input: { kind?: unknown; title?: unknown; payload?: unknown; proposedByAgentId?: unknown }, actorType = "agent", actorId?: string | null) {
-  if (!db.prepare("select id from goals where id = ?").get(goalId)) throw new Error("goal_not_found");
-  const kind = goalProposalKind(input.kind);
-  const title = String(input.title ?? "").trim() || kind;
-  const id = `goal-proposal-${randomUUID()}`;
-  const now = new Date().toISOString();
-  db.prepare(`
-    insert into goal_proposals (id, goal_id, kind, status, title, payload, proposed_by_agent_id, created_at, resolved_at)
-    values (?, ?, ?, 'pending', ?, ?, ?, ?, null)
-  `).run(id, goalId, kind, title, JSON.stringify(input.payload ?? {}), input.proposedByAgentId ? String(input.proposedByAgentId) : actorId ?? null, now);
-  recordGoalEvent(goalId, "proposal.created", { proposalId: id, kind, title }, actorType, actorId);
-  return goalProposalFromRow(db.prepare("select * from goal_proposals where id = ?").get(id) as Record<string, unknown>);
-}
-
-function applyGoalProposal(goalId: string, proposalId: string, actorType = "user", actorId?: string | null) {
-  const row = db.prepare("select * from goal_proposals where id = ? and goal_id = ?").get(proposalId, goalId) as Record<string, unknown> | undefined;
-  if (!row) throw new Error("goal_proposal_not_found");
-  const proposal = goalProposalFromRow(row);
-  if (proposal.status !== "pending") return proposal;
-  const payload = proposal.payload && typeof proposal.payload === "object" ? proposal.payload as Record<string, unknown> : {};
-  if (proposal.kind === "goal_update") {
-    updateGoal(goalId, {
-      text: typeof payload.text === "string" ? payload.text : undefined,
-      mode: payload.mode === "reference" || payload.mode === "tracked" || payload.mode === "managed" || payload.mode === "orchestrated" ? payload.mode : undefined,
-      progressSummary: typeof payload.progressSummary === "string" ? payload.progressSummary : undefined,
-    }, actorType, actorId);
-  } else if (proposal.kind === "focus") {
-    createGoalFocus(goalId, { text: String(payload.text ?? proposal.title), ownerAgentId: typeof payload.ownerAgentId === "string" ? payload.ownerAgentId : null }, actorType, actorId);
-  } else if (proposal.kind === "item") {
-    createGoalItem(goalId, {
-      title: String(payload.title ?? proposal.title),
-      description: typeof payload.description === "string" ? payload.description : null,
-      assignedAgentId: typeof payload.assignedAgentId === "string" ? payload.assignedAgentId : null,
-      priority: Number(payload.priority ?? 0) || 0,
-    }, actorType, actorId);
-  } else if (proposal.kind === "plan") {
-    const rawItems = Array.isArray(payload.items) ? payload.items : [];
-    for (const rawItem of rawItems.slice(0, 20)) {
-      if (!rawItem || typeof rawItem !== "object") continue;
-      const item = rawItem as Record<string, unknown>;
-      const title = String(item.title ?? "").trim();
-      if (!title) continue;
-      createGoalItem(goalId, {
-        title,
-        description: typeof item.description === "string" ? item.description : null,
-        assignedAgentId: typeof item.assignedAgentId === "string" ? item.assignedAgentId : null,
-        priority: Number(item.priority ?? 0) || 0,
-      }, actorType, actorId);
-    }
-  }
-  const now = new Date().toISOString();
-  db.prepare("update goal_proposals set status = 'approved', resolved_at = ? where id = ? and goal_id = ?").run(now, proposalId, goalId);
-  recordGoalEvent(goalId, "proposal.approved", { proposalId, kind: proposal.kind }, actorType, actorId);
-  return goalProposalFromRow(db.prepare("select * from goal_proposals where id = ?").get(proposalId) as Record<string, unknown>);
-}
-
-function rejectGoalProposal(goalId: string, proposalId: string, actorType = "user", actorId?: string | null) {
-  const row = db.prepare("select * from goal_proposals where id = ? and goal_id = ?").get(proposalId, goalId) as Record<string, unknown> | undefined;
-  if (!row) throw new Error("goal_proposal_not_found");
-  const now = new Date().toISOString();
-  db.prepare("update goal_proposals set status = 'rejected', resolved_at = ? where id = ? and goal_id = ? and status = 'pending'").run(now, proposalId, goalId);
-  recordGoalEvent(goalId, "proposal.rejected", { proposalId }, actorType, actorId);
-  return goalProposalFromRow(db.prepare("select * from goal_proposals where id = ?").get(proposalId) as Record<string, unknown>);
-}
-
-function createDefaultGoalPlan(goalId: string, actorType = "user", actorId?: string | null) {
-  const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(goalId) as Record<string, unknown>);
-  const existing = (db.prepare("select * from goal_items where goal_id = ? and status not in ('cancelled')").all(goalId) as Array<Record<string, unknown>>).map(goalItemFromRow);
-  if (existing.length) return existing;
-  const roomAgents = goal.ownerType === "room"
-    ? (db.prepare("select agent_id from room_agents where room_id = ? order by joined_at asc").all(goal.ownerId) as Array<{ agent_id: string }>).map((row) => row.agent_id)
-    : [];
-  const templates = [
-    { title: "需求澄清与范围确认", description: goal.text, priority: 50, assignedAgentId: roomAgents[0] ?? null },
-    { title: "方案设计与任务拆解", description: goal.currentFocus?.text ?? goal.text, priority: 40, assignedAgentId: roomAgents[1] ?? roomAgents[0] ?? null },
-    { title: "实现与验证", description: goal.text, priority: 30, assignedAgentId: roomAgents[2] ?? roomAgents[0] ?? null },
-    { title: "审查、修正与交付总结", description: goal.text, priority: 20, assignedAgentId: roomAgents[3] ?? roomAgents[0] ?? null },
-  ];
-  const items = templates.map((item) => createGoalItem(goalId, { ...item, status: "planned" }, actorType, actorId));
-  recordGoalEvent(goalId, "goal.planned", { itemIds: items.map((item) => item.id) }, actorType, actorId);
-  return items;
-}
-
-function createReplanProposal(goalId: string, itemId: string, status: "blocked" | "failed", actorType = "system", actorId?: string | null) {
-  const item = goalItemFromRow(db.prepare("select * from goal_items where id = ? and goal_id = ?").get(itemId, goalId) as Record<string, unknown>);
-  const duplicate = (db.prepare(`
-    select id from goal_proposals
-    where goal_id = ? and status = 'pending' and kind = 'plan' and json_extract(payload, '$.sourceItemId') = ?
-    limit 1
-  `).get(goalId, itemId) as { id?: string } | undefined);
-  if (duplicate) return null;
-  const title = status === "blocked" ? `重新规划阻塞项：${item.title}` : `重新规划失败项：${item.title}`;
-  const payload = {
-    sourceItemId: item.id,
-    sourceStatus: status,
-    reason: status === "blocked" ? "Goal item was marked blocked" : "Goal item or linked Room task failed",
-    items: [
-      {
-        title: `诊断并解除阻塞：${item.title}`,
-        description: item.description || item.title,
-        assignedAgentId: item.assignedAgentId ?? null,
-        priority: item.priority + 10,
-      },
-      {
-        title: `验证替代方案：${item.title}`,
-        description: "确认重新规划后的方案可以继续推进，并更新 Goal item 状态。",
-        assignedAgentId: item.assignedAgentId ?? null,
-        priority: item.priority + 5,
-      },
-    ],
-  };
-  return createGoalProposal(goalId, { kind: "plan", title, payload, proposedByAgentId: actorType === "agent" ? actorId : null }, actorType, actorId);
-}
-
-function goalDetail(goalId: string): GoalDetailResponse {
-  const row = db.prepare("select * from goals where id = ?").get(goalId) as Record<string, unknown> | undefined;
-  if (!row) throw new Error("goal_not_found");
-  const focuses = (db.prepare("select * from goal_focuses where goal_id = ? order by updated_at desc, id desc").all(goalId) as Array<Record<string, unknown>>).map(goalFocusFromRow);
-  const items = (db.prepare("select * from goal_items where goal_id = ? order by priority desc, updated_at desc, id desc").all(goalId) as Array<Record<string, unknown>>).map(goalItemFromRow);
-  const events = (db.prepare("select * from goal_events where goal_id = ? order by created_at desc, id desc limit 80").all(goalId) as Array<Record<string, unknown>>).map(goalEventFromRow);
-  const proposals = listGoalProposals(goalId);
-  return { goal: goalFromRow(row), focuses, items, events, proposals };
-}
-
-const defaultAgentPermissions: AgentPermissionSettings = {
-  canWriteFiles: true,
-  canRunCommands: true,
-  canUseTerminal: true,
-  canCreatePreview: true,
-  canWriteSharedWorkspace: true,
-  canRequestApproval: true,
-  canTriggerAgents: false,
-  canMergeChanges: false,
-};
-
-const permissionProfiles: Record<string, Partial<AgentPermissionSettings>> = {
-  "read-only": {
-    canWriteFiles: false,
-    canRunCommands: false,
-    canUseTerminal: false,
-    canCreatePreview: false,
-    canWriteSharedWorkspace: false,
-    canRequestApproval: true,
-    canTriggerAgents: false,
-    canMergeChanges: false,
-  },
-  "workspace-write": {
-    canWriteFiles: true,
-    canRunCommands: false,
-    canUseTerminal: false,
-    canCreatePreview: false,
-    canWriteSharedWorkspace: true,
-    canRequestApproval: true,
-    canTriggerAgents: false,
-    canMergeChanges: false,
-  },
-  developer: {
-    canWriteFiles: true,
-    canRunCommands: true,
-    canUseTerminal: true,
-    canCreatePreview: true,
-    canWriteSharedWorkspace: true,
-    canRequestApproval: true,
-    canTriggerAgents: false,
-    canMergeChanges: false,
-  },
-  maintainer: {
-    canWriteFiles: true,
-    canRunCommands: true,
-    canUseTerminal: true,
-    canCreatePreview: true,
-    canWriteSharedWorkspace: true,
-    canRequestApproval: true,
-    canTriggerAgents: true,
-    canMergeChanges: true,
-  },
-  "danger-full-access": defaultAgentPermissions,
-};
-
-function permissionProfileId(value: unknown): PermissionProfileId | null {
-  return typeof value === "string" && value in permissionProfiles ? value as PermissionProfileId : null;
-}
-
-function agentPermissions(value: unknown, override?: Partial<AgentPermissionSettings>): AgentPermissionSettings {
-  let parsed: Partial<AgentPermissionSettings> = {};
-  if (typeof value === "string" && value.trim()) {
-    try {
-      parsed = JSON.parse(value) as Partial<AgentPermissionSettings>;
-    } catch {
-      parsed = {};
-    }
-  } else if (value && typeof value === "object") {
-    parsed = value as Partial<AgentPermissionSettings>;
-  }
-  return { ...defaultAgentPermissions, ...parsed, ...override };
-}
-
-function resolvedAgentPermissions(agent: Pick<AgentSummary, "permissions" | "permissionProfileId">) {
-  return agentPermissions(agent.permissions, agent.permissionProfileId ? permissionProfiles[agent.permissionProfileId] : undefined);
-}
-
-function projectAccessMode(value: unknown): AgentProjectAccessMode {
-  return value === "none" || value === "selected" || value === "all" ? value : "all";
-}
-
-function roleSourceType(value: unknown): AgentRoleSourceType {
-  return value === "file-import" || value === "builtin-template" ? value : "custom-markdown";
-}
-
-function listenMode(value: unknown, fallback: AgentListenMode = "passive"): AgentListenMode {
-  return value === "none" || value === "active" || value === "orchestrator" || value === "passive" ? value : fallback;
-}
-
-function workspaceMode(value: unknown, fallback: AgentWorkspaceMode = "isolated-worktree-with-shared-room"): AgentWorkspaceMode {
-  return value === "shared-readonly"
-    || value === "shared-write"
-    || value === "merge-workspace"
-    || value === "isolated-worktree"
-    || value === "isolated-worktree-with-shared-room"
-    ? value
-    : fallback;
-}
-
-function roomStatus(value: unknown, fallback: RoomStatus = "draft"): RoomStatus {
-  return value === "running" || value === "paused" || value === "done" || value === "failed" || value === "draft" ? value : fallback;
-}
-
-const defaultRoomOrchestration: RoomOrchestrationSettings = {
-  autoStartTasks: true,
-  autoCreateReviewTasks: true,
-  autoListenAfterAgentEvents: true,
-  notifyUserOnFailure: true,
-  maxAutoRetries: 0,
-  maxAutoListenChainDepth: 1,
-  maxAutoListenTasksPerEvent: 1,
-};
-
-function roomOrchestrationSettings(value: unknown, override?: Partial<RoomOrchestrationSettings>): RoomOrchestrationSettings {
-  const parsed = typeof value === "string" ? jsonPayload(value) : value;
-  const item = parsed && typeof parsed === "object" ? parsed as Partial<RoomOrchestrationSettings> : {};
-  return {
-    autoStartTasks: override?.autoStartTasks ?? item.autoStartTasks ?? defaultRoomOrchestration.autoStartTasks,
-    autoCreateReviewTasks: override?.autoCreateReviewTasks ?? item.autoCreateReviewTasks ?? defaultRoomOrchestration.autoCreateReviewTasks,
-    autoListenAfterAgentEvents: override?.autoListenAfterAgentEvents ?? item.autoListenAfterAgentEvents ?? defaultRoomOrchestration.autoListenAfterAgentEvents,
-    notifyUserOnFailure: override?.notifyUserOnFailure ?? item.notifyUserOnFailure ?? defaultRoomOrchestration.notifyUserOnFailure,
-    maxAutoRetries: Math.max(0, Math.min(10, Number(override?.maxAutoRetries ?? item.maxAutoRetries ?? defaultRoomOrchestration.maxAutoRetries) || 0)),
-    maxAutoListenChainDepth: Math.max(0, Math.min(10, Number(override?.maxAutoListenChainDepth ?? item.maxAutoListenChainDepth ?? defaultRoomOrchestration.maxAutoListenChainDepth) || 0)),
-    maxAutoListenTasksPerEvent: Math.max(1, Math.min(20, Number(override?.maxAutoListenTasksPerEvent ?? item.maxAutoListenTasksPerEvent ?? defaultRoomOrchestration.maxAutoListenTasksPerEvent) || 1)),
-  };
-}
-
-function conversationType(value: unknown, fallback: ConversationType = "codex"): ConversationType {
-  return value === "agent" || value === "room" || value === "codex" || value === "automation" ? value : fallback;
-}
-
-function previewAccess(value: unknown, fallback: PreviewAccess = "private"): PreviewAccess {
-  return value === "public" || value === "private" ? value : fallback;
-}
-
-function markdownTitle(value: string) {
-  return value.split(/\r?\n/).find((line) => line.trim().startsWith("# "))?.replace(/^#\s+/, "").trim() ?? "";
-}
-
-function markdownDescription(value: string) {
-  const lines = value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const firstBodyLine = lines.find((line) => !line.startsWith("#"));
-  return firstBodyLine ? firstBodyLine.slice(0, 240) : "";
-}
-
-function systemPromptWithRoleDescription(systemPrompt: string, description?: string | null, enabled = false) {
-  const cleanDescription = description?.trim();
-  if (!enabled || !cleanDescription) return systemPrompt;
-  const heading = "## Role Extension Description";
-  if (systemPrompt.includes(heading)) return systemPrompt;
-  return `${systemPrompt.trim()}\n\n${heading}\n${cleanDescription}`;
-}
-
-const previewAccessTtlMs = 12 * 60 * 60 * 1000;
-
-function previewAccessCookieName(previewId: string) {
-  return `codex_preview_${previewId.replace(/[^a-zA-Z0-9]/g, "_")}`;
-}
-
-function previewAccessCookie(preview: PreviewRecord, ttlMs = previewAccessTtlMs) {
-  return `${previewAccessCookieName(preview.id)}=${encodeURIComponent(signPreviewAccessToken(preview, ttlMs))}; Path=/; Max-Age=${Math.max(1, Math.floor(ttlMs / 1000))}; HttpOnly; SameSite=Lax`;
-}
-
 function sessionCookie(token: string) {
   return `${sessionCookieName}=${encodeURIComponent(token)}; Path=/; Max-Age=${Math.max(1, Math.floor(sessionTtlMs / 1000))}; HttpOnly; SameSite=Lax`;
 }
 
 function clearSessionCookie() {
   return `${sessionCookieName}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`;
-}
-
-function requestHasPreviewAccess(preview: PreviewRecord, request: Request | IncomingMessage) {
-  if (preview.access === "public") return true;
-  const cookieHeader = request instanceof Request ? request.headers.get("cookie") ?? undefined : request.headers.cookie;
-  const cookies = parseCookieHeader(cookieHeader);
-  if (verifyPreviewAccessToken(preview, cookies.get(previewAccessCookieName(preview.id)))) return true;
-  if (verifySessionToken(cookies.get(sessionCookieName) ?? null)) return true;
-  const authorization = request instanceof Request ? request.headers.get("authorization") ?? undefined : request.headers.authorization;
-  return verifySessionToken(getBearerToken(Array.isArray(authorization) ? authorization[0] : authorization));
-}
-
-function createPreviewAccessRequest(preview: PreviewRecord, sourceUrl: URL) {
-  expirePreviewAccessRequests();
-  const existing = Array.from(previewAccessRequests.values()).find((request) =>
-    request.previewId === preview.id
-    && request.status === "pending"
-    && Date.now() - new Date(request.createdAt).getTime() < 15 * 60 * 1000
-  );
-  if (existing) return { id: existing.id, secret: existing.secret, reused: true };
-  const id = `preview-access-${randomUUID()}`;
-  const secret = randomUUID();
-  const now = new Date().toISOString();
-  const request: PreviewAccessRequest = {
-    id,
-    previewId: preview.id,
-    secret,
-    status: "pending",
-    approvedUntil: null,
-    createdAt: now,
-    updatedAt: now,
-  };
-  upsertPreviewAccessRequest(request);
-  createApproval({
-    actionType: "preview-access",
-    risk: "low",
-    title: "Private preview access request",
-    description: `Allow temporary access to private preview ${preview.label}.`,
-    details: [
-      `preview=${preview.label}`,
-      `previewId=${preview.id}`,
-      `target=${preview.targetHost}:${preview.port}`,
-      `requestId=${id}`,
-      `url=${sourceUrl.pathname}`,
-    ].join("\n"),
-    payload: { requestId: id, previewId: preview.id, url: sourceUrl.pathname },
-  });
-  return { id, secret };
-}
-
-function getPreviewAccessRequest(preview: PreviewRecord, requestId: string, secret: string | null) {
-  const request = previewAccessRequests.get(requestId);
-  if (!request || request.previewId !== preview.id || request.secret !== (secret ?? "")) return null;
-  return request;
-}
-
-function privatePreviewAccessResponse(preview: PreviewRecord, sourceUrl: URL) {
-  const html = `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Private Preview</title>
-  <style>
-    body { margin: 0; min-height: 100vh; display: grid; place-items: center; font: 14px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f6f7f4; color: #172018; }
-    main { width: min(460px, calc(100vw - 32px)); border: 1px solid #d9ded6; border-radius: 10px; background: white; padding: 20px; box-shadow: 0 24px 80px rgba(14, 20, 16, .16); }
-    h1 { margin: 0 0 8px; font-size: 18px; }
-    p { margin: 0 0 14px; color: #586256; }
-    .actions { display: flex; flex-wrap: wrap; gap: 10px; }
-    a, button { display: inline-flex; align-items: center; min-height: 34px; border-radius: 8px; border: 1px solid #cdd5ca; background: #172018; color: white; padding: 0 12px; text-decoration: none; cursor: pointer; }
-    a.secondary { background: white; color: #172018; }
-    .muted { margin-top: 12px; font-size: 12px; color: #7a8378; }
-  </style>
-</head>
-<body>
-  <main>
-    <h1>私有预览需要授权</h1>
-    <p id="message">这是一个私有预览。你可以发起访问授权请求，等待 Codex Web 管理员批准。</p>
-    <div class="actions">
-      <button id="request" type="button">请求授权</button>
-      <a class="secondary" href="${sourceUrl.origin}/#approvals">打开审批页面</a>
-      <a class="secondary" href="${sourceUrl.origin}/#previews">打开预览列表</a>
-    </div>
-    <p class="muted">Private preview requires an authenticated Codex Web session.</p>
-  </main>
-  <script>
-    (() => {
-      const message = document.getElementById("message");
-      const button = document.getElementById("request");
-      let timer = null;
-      async function poll(id, secret) {
-        const response = await fetch(${JSON.stringify(`${previewUrl(preview).replace(/\/+$/, "")}/access-requests/`)} + encodeURIComponent(id) + "?secret=" + encodeURIComponent(secret), { cache: "no-store" });
-        const result = await response.json().catch(() => null);
-        if (response.ok && result?.status === "approved") {
-          message.textContent = "授权已批准，正在打开预览...";
-          window.location.replace(${JSON.stringify(`${sourceUrl.pathname}${sourceUrl.search}${sourceUrl.hash}`)});
-          return;
-        }
-        if (result?.status === "denied") {
-          message.textContent = "授权请求已被拒绝。";
-          if (timer) window.clearInterval(timer);
-        }
-      }
-      button.addEventListener("click", async () => {
-        button.disabled = true;
-        message.textContent = "正在创建授权请求...";
-        const response = await fetch(${JSON.stringify(`${previewUrl(preview).replace(/\/+$/, "")}/access-requests`)}, { method: "POST" });
-        const result = await response.json().catch(() => null);
-        if (!response.ok || !result?.id || !result?.secret) {
-          message.textContent = "授权请求创建失败，请回到 Codex Web 后重试。";
-          button.disabled = false;
-          return;
-        }
-        message.textContent = "授权请求已发送，请等待审批通过。";
-        timer = window.setInterval(() => void poll(result.id, result.secret), 2000);
-        void poll(result.id, result.secret);
-      });
-    })();
-  </script>
-</body>
-</html>`;
-  return new Response(html, {
-    status: 401,
-    headers: {
-      "content-type": "text/html; charset=utf-8",
-      "cache-control": "no-store",
-    },
-  });
 }
 
 app.use("*", createRateLimitMiddleware(
@@ -9272,1232 +3797,6 @@ app.use("*", createRateLimitMiddleware(
     return provider ? { enabled: provider.rpmLimitEnabled, rpmLimit: provider.rpmLimit } : null;
   },
 ));
-
-function slugify(value: string) {
-  return value.trim().toLowerCase().replaceAll(/[^a-z0-9]+/g, "-").replaceAll(/^-|-$/g, "") || randomUUID();
-}
-
-function uniqueProjectId(name: string) {
-  const base = slugify(name);
-  let candidate = base;
-  let index = 2;
-  while (appData.projects.some((project) => project.id === candidate)) {
-    candidate = `${base}-${index}`;
-    index += 1;
-  }
-  return candidate;
-}
-
-function defaultProjectWorkspacePath(projectId: string) {
-  return resolve(projectWorkspaceRoot, projectId);
-}
-
-function normalizeMountPath(value: string) {
-  return resolve(value.trim() || ".");
-}
-
-function resolveInsideRoot(root: string, inputPath?: string) {
-  const requestedPath = inputPath && inputPath !== "." ? inputPath : ".";
-  const expandedPath = requestedPath === "~" || requestedPath.startsWith("~/")
-    ? join(process.env.HOME ?? root, requestedPath.slice(2))
-    : requestedPath;
-  const absolutePath = resolve(root, expandedPath);
-  const relativePath = relative(root, absolutePath);
-  if (relativePath.startsWith("..") || resolve(relativePath) === relativePath) throw new Error("path_outside_root");
-  return absolutePath;
-}
-
-function getMount(mountId?: string | null) {
-  if (mountId && fileMounts.has(mountId)) return fileMounts.get(mountId) ?? null;
-  return fileMounts.get("default") ?? Array.from(fileMounts.values())[0] ?? null;
-}
-
-function upsertFileMount(mount: FileMountRecord) {
-  db.prepare(`
-    insert into file_mounts (id, name, root_path, created_at, updated_at)
-    values (?, ?, ?, ?, ?)
-    on conflict(id) do update set
-      name = excluded.name,
-      root_path = excluded.root_path,
-      updated_at = excluded.updated_at
-  `).run(mount.id, mount.name, mount.rootPath, mount.createdAt, mount.updatedAt);
-  fileMounts.set(mount.id, mount);
-}
-
-function deleteFileMount(id: string) {
-  db.prepare("delete from file_mounts where id = ?").run(id);
-  fileMounts.delete(id);
-}
-
-function deleteFileMountsForRoot(rootPath: string) {
-  const normalizedRoot = normalizeMountPath(rootPath);
-  for (const mount of Array.from(fileMounts.values())) {
-    if (normalizeMountPath(mount.rootPath) !== normalizedRoot) continue;
-    if (mount.id === "default" && fileMounts.size <= 1) continue;
-    db.prepare("delete from file_mounts where id = ?").run(mount.id);
-    fileMounts.delete(mount.id);
-  }
-}
-
-function resolveInsideMount(mount: FileMountRecord, inputPath?: string) {
-  const baseRoot = mount.rootPath;
-  const requestedPath = inputPath && inputPath !== "." ? inputPath : ".";
-  const expandedPath = requestedPath === "~" || requestedPath.startsWith("~/")
-    ? join(process.env.HOME ?? baseRoot, requestedPath.slice(2))
-    : requestedPath;
-  const absolutePath = resolve(baseRoot, expandedPath);
-  const relativePath = relative(baseRoot, absolutePath);
-  if (relativePath.startsWith("..") || resolve(relativePath) === relativePath) throw new Error("path_outside_root");
-  return absolutePath;
-}
-
-function resolveMountWorkspace(mountId?: string | null) {
-  const mount = getMount(mountId);
-  if (!mount) throw new Error("mount_not_found");
-  return mount;
-}
-
-function resolveFileRequestMount(mountId?: string | null, rootPath?: string | null): FileMountRecord {
-  if (rootPath?.trim()) {
-    const transientRoot = normalizeMountPath(rootPath);
-    if (!existsSync(transientRoot) || !statSync(transientRoot).isDirectory()) throw new Error("mount_root_invalid");
-    return {
-      id: "__workspace",
-      name: "Workspace",
-      rootPath: transientRoot,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-  }
-  return resolveMountWorkspace(mountId);
-}
-
-type AgentRoleTemplateRecord = AgentRoleTemplateSummary & { markdownContent: string };
-
-function readJsonFileWithFallback<T>(path: string, fallback: T): T {
-  try {
-    return JSON.parse(readFileSync(path, "utf8")) as T;
-  } catch {
-    return fallback;
-  }
-}
-
-function parseMarkdownFrontmatter(content: string) {
-  const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-  const fields: Record<string, string> = {};
-  if (!match) return fields;
-  for (const line of match[1].split(/\r?\n/)) {
-    const item = line.match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
-    if (item) fields[item[1]] = item[2].replace(/^["']|["']$/g, "").trim();
-  }
-  return fields;
-}
-
-function listAgentRoleTemplates(): AgentRoleTemplateRecord[] {
-  if (!existsSync(agentRoleTemplateDir)) return [];
-  const zhNamesPath = join(agentRoleTemplateDir, "agency-agents", "scripts", "i18n", "agent-names-zh.json");
-  const zhNames = existsSync(zhNamesPath) ? readJsonFileWithFallback<Record<string, { name?: string; description?: string }>>(zhNamesPath, {}) : {};
-  const useLocalizedAllowlist = Object.keys(zhNames).length > 0;
-  function walk(dir: string, groupParts: string[] = []): AgentRoleTemplateRecord[] {
-    return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
-      const filePath = join(dir, entry.name);
-      if (entry.isDirectory()) return walk(filePath, [...groupParts, entry.name]);
-      if (!entry.isFile() || !/\.md$/i.test(entry.name)) return [];
-      const markdownContent = readFileSync(filePath, "utf8");
-      const metadata = parseMarkdownFrontmatter(markdownContent);
-      if (!metadata.name) return [];
-      const isAgencyTemplate = groupParts[0] === "agency-agents";
-      if (useLocalizedAllowlist && isAgencyTemplate && !zhNames[metadata.name]) return [];
-      const filename = entry.name.replace(/\.md$/i, "");
-      const group = groupParts.join("/") || "Root";
-      const id = [...groupParts, filename].join("-").toLowerCase().replaceAll(/[^a-z0-9]+/g, "-");
-      const localized = zhNames[metadata.name]
-        ? {
-            "zh-CN": { name: zhNames[metadata.name].name || metadata.name, description: zhNames[metadata.name].description },
-            zh: { name: zhNames[metadata.name].name || metadata.name, description: zhNames[metadata.name].description },
-          }
-        : undefined;
-      return [{
-        id,
-        name: metadata.name || markdownTitle(markdownContent) || filename.split("-").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(" "),
-        group,
-        description: metadata.description || markdownDescription(markdownContent),
-        localizedNames: localized,
-        sourcePath: relative(agentRoleTemplateDir, filePath),
-        sourceUrl: isAgencyTemplate ? `https://github.com/msitarzewski/agency-agents/blob/main/${relative(join(agentRoleTemplateDir, "agency-agents"), filePath)}` : undefined,
-        markdownContent,
-      }];
-    });
-  }
-  return walk(agentRoleTemplateDir)
-    .sort((a, b) => a.group === b.group ? a.name.localeCompare(b.name) : a.group.localeCompare(b.group));
-}
-
-function publicAgentRoleTemplate(template: AgentRoleTemplateRecord): AgentRoleTemplateSummary {
-  const { markdownContent, ...summary } = template;
-  return summary;
-}
-
-function publicProvider(provider: ProviderRecord): ProviderSummary {
-  const cachedModels = readProviderModelCache(provider);
-  return {
-    id: provider.id,
-    name: provider.name,
-    kind: provider.kind,
-    defaultModel: provider.defaultModel,
-    baseUrl: provider.baseUrl,
-    apiKeyConfigured: Boolean(provider.apiKey),
-    capabilities: provider.capabilities ?? defaultProviderCapabilities(provider.kind),
-    models: cachedModels?.models,
-    modelsCachedAt: cachedModels?.cachedAt ?? null,
-    rpmLimit: provider.rpmLimit ?? null,
-    rpmLimitEnabled: provider.rpmLimitEnabled ?? false,
-    useProxy: provider.useProxy ?? false,
-  };
-}
-
-function joinUrl(baseUrl: string, path: string) {
-  return `${baseUrl.replace(/\/+$/, "")}/${path.replace(/^\/+/, "")}`;
-}
-
-type ChatMessage = {
-  role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
-  tool_call_id?: string;
-  tool_calls?: Array<{ id: string; type: "function"; function: { name: string; arguments: string } }>;
-};
-
-function textFromResponseContent(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (!Array.isArray(value)) return stringifyReadable(value);
-  return value.map((item) => {
-    if (typeof item === "string") return item;
-    if (!item || typeof item !== "object") return "";
-    const record = item as Record<string, unknown>;
-    return typeof record.text === "string"
-      ? record.text
-      : typeof record.input_text === "string"
-        ? record.input_text
-        : typeof record.output_text === "string"
-          ? record.output_text
-          : "";
-  }).filter(Boolean).join("\n");
-}
-
-function responseInputToChatMessages(input: unknown, instructions?: unknown): ChatMessage[] {
-  const messages: ChatMessage[] = [];
-  if (typeof instructions === "string" && instructions.trim()) messages.push({ role: "system", content: instructions });
-  if (typeof input === "string") {
-    messages.push({ role: "user", content: input });
-    return messages;
-  }
-  if (!Array.isArray(input)) {
-    messages.push({ role: "user", content: stringifyReadable(input) });
-    return messages;
-  }
-  for (const item of input) {
-    if (typeof item === "string") {
-      messages.push({ role: "user", content: item });
-      continue;
-    }
-    if (!item || typeof item !== "object") {
-      messages.push({ role: "user", content: stringifyReadable(item) });
-      continue;
-    }
-    const record = item as Record<string, unknown>;
-    if (record.type === "message") {
-      const role = record.role === "assistant" || record.role === "system" || record.role === "tool" ? record.role : "user";
-      messages.push({ role, content: textFromResponseContent(record.content) });
-      continue;
-    }
-    if (typeof record.role === "string" && (record.role === "assistant" || record.role === "system" || record.role === "tool" || record.role === "user")) {
-      messages.push({ role: record.role, content: textFromResponseContent(record.content) });
-      continue;
-    }
-    if (record.type === "function_call") {
-      const callId = typeof record.call_id === "string" ? record.call_id : typeof record.id === "string" ? record.id : `call-${randomUUID()}`;
-      messages.push({
-        role: "assistant",
-        content: null,
-        tool_calls: [{
-          id: callId,
-          type: "function",
-          function: {
-            name: typeof record.name === "string" ? record.name : "",
-            arguments: typeof record.arguments === "string" ? record.arguments : "{}",
-          },
-        }],
-      });
-      continue;
-    }
-    if (record.type === "function_call_output") {
-      messages.push({ role: "tool", tool_call_id: typeof record.call_id === "string" ? record.call_id : typeof record.id === "string" ? record.id : undefined, content: textFromResponseContent(record.output) });
-      continue;
-    }
-    messages.push({ role: "user", content: textFromResponseContent(record.content ?? record.text ?? record) });
-  }
-  return messages.length ? messages : [{ role: "user", content: "" }];
-}
-
-function responseToolsToChatTools(tools: unknown) {
-  if (!Array.isArray(tools)) return undefined;
-  const converted = tools.map((tool) => {
-    if (!tool || typeof tool !== "object") return null;
-    const record = tool as Record<string, unknown>;
-    if (record.type === "function" && record.name) {
-      return {
-        type: "function",
-        function: {
-          name: record.name,
-          description: record.description,
-          parameters: record.parameters ?? {},
-        },
-      };
-    }
-    if (record.type === "function" && record.function) return record;
-    return null;
-  }).filter(Boolean);
-  return converted.length ? converted : undefined;
-}
-
-function chatMessageToResponseOutput(message: Record<string, unknown>, responseId: string) {
-  const content = typeof message.content === "string" ? message.content : textFromResponseContent(message.content);
-  const output: Array<Record<string, unknown>> = [];
-  if (content) {
-    output.push({
-      id: `msg-${responseId}`,
-      type: "message",
-      status: "completed",
-      role: "assistant",
-      content: [{ type: "output_text", text: content, annotations: [] }],
-    });
-  }
-  const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
-  for (const call of toolCalls) {
-    if (!call || typeof call !== "object") continue;
-    const record = call as Record<string, unknown>;
-    const fn = record.function && typeof record.function === "object" ? record.function as Record<string, unknown> : {};
-    const callId = typeof record.id === "string" ? record.id : `call-${randomUUID()}`;
-    output.push({
-      id: callId,
-      type: "function_call",
-      call_id: callId,
-      name: typeof fn.name === "string" ? fn.name : "",
-      arguments: typeof fn.arguments === "string" ? fn.arguments : "{}",
-      status: "completed",
-    });
-  }
-  return output.length ? output : [{
-    id: `msg-${responseId}`,
-    type: "message",
-    status: "completed",
-    role: "assistant",
-    content: [{ type: "output_text", text: "", annotations: [] }],
-  }];
-}
-
-function chatCompletionToResponse(payload: Record<string, unknown>, fallbackModel: string) {
-  const responseId = typeof payload.id === "string" ? payload.id.replace(/^chatcmpl-/, "resp_") : `resp_${randomUUID()}`;
-  const choice = Array.isArray(payload.choices) ? payload.choices[0] as Record<string, unknown> | undefined : undefined;
-  const message = choice?.message && typeof choice.message === "object" ? choice.message as Record<string, unknown> : {};
-  const output = chatMessageToResponseOutput(message, responseId);
-  const text = output
-    .flatMap((item) => Array.isArray(item.content) ? item.content : [])
-    .map((item) => item && typeof item === "object" && typeof (item as Record<string, unknown>).text === "string" ? String((item as Record<string, unknown>).text) : "")
-    .join("");
-  return {
-    id: responseId,
-    object: "response",
-    created_at: typeof payload.created === "number" ? payload.created : Math.floor(Date.now() / 1000),
-    status: "completed",
-    model: typeof payload.model === "string" ? payload.model : fallbackModel,
-    output,
-    output_text: text,
-    usage: payload.usage ?? null,
-  };
-}
-
-function responsesRequestToChatCompletion(body: Record<string, unknown>, provider: ProviderRecord) {
-  const request: Record<string, unknown> = {
-    model: typeof body.model === "string" ? body.model : provider.defaultModel,
-    messages: responseInputToChatMessages(body.input, body.instructions),
-  };
-  if (body.max_output_tokens !== undefined) request.max_tokens = body.max_output_tokens;
-  if (body.temperature !== undefined) request.temperature = body.temperature;
-  if (body.top_p !== undefined) request.top_p = body.top_p;
-  if (body.stream !== undefined) request.stream = body.stream;
-  const tools = responseToolsToChatTools(body.tools);
-  if (tools) request.tools = tools;
-  if (body.tool_choice !== undefined) request.tool_choice = body.tool_choice;
-  return request;
-}
-
-function sseEvent(event: string, data: unknown) {
-  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-}
-
-async function streamChatCompletionAsResponses(upstream: Response, model: string) {
-  const responseId = `resp_${randomUUID()}`;
-  const itemId = `msg-${responseId}`;
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let textOutput = "";
-  let itemStarted = false;
-  let textOutputIndex = 0;
-  let nextOutputIndex = 0;
-  const functionCalls = new Map<number, { id: string; callId: string; name: string; arguments: string; outputIndex: number }>();
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      controller.enqueue(encoder.encode(sseEvent("response.created", { id: responseId, type: "response.created", response: { id: responseId, status: "in_progress", model } })));
-      const startTextItem = () => {
-        if (itemStarted) return;
-        itemStarted = true;
-        const outputIndex = nextOutputIndex++;
-        textOutputIndex = outputIndex;
-        controller.enqueue(encoder.encode(sseEvent("response.output_item.added", {
-          type: "response.output_item.added",
-          output_index: outputIndex,
-          item: { id: itemId, type: "message", status: "in_progress", role: "assistant", content: [] },
-        })));
-        controller.enqueue(encoder.encode(sseEvent("response.content_part.added", {
-          type: "response.content_part.added",
-          item_id: itemId,
-          output_index: outputIndex,
-          content_index: 0,
-          part: { type: "output_text", text: "", annotations: [] },
-        })));
-      };
-      const finishTextItem = () => {
-        if (!itemStarted) return null;
-        const part = { type: "output_text", text: textOutput, annotations: [] };
-        const outputIndex = textOutputIndex;
-        const item = { id: itemId, type: "message", status: "completed", role: "assistant", content: [part] };
-        controller.enqueue(encoder.encode(sseEvent("response.output_text.done", {
-          type: "response.output_text.done",
-          item_id: itemId,
-          output_index: outputIndex,
-          content_index: 0,
-          text: textOutput,
-        })));
-        controller.enqueue(encoder.encode(sseEvent("response.content_part.done", {
-          type: "response.content_part.done",
-          item_id: itemId,
-          output_index: outputIndex,
-          content_index: 0,
-          part,
-        })));
-        controller.enqueue(encoder.encode(sseEvent("response.output_item.done", {
-          type: "response.output_item.done",
-          output_index: outputIndex,
-          item,
-        })));
-        return item;
-      };
-      const startFunctionCall = (index: number, deltaCall: Record<string, unknown>) => {
-        const existing = functionCalls.get(index);
-        const fn = deltaCall.function && typeof deltaCall.function === "object" ? deltaCall.function as Record<string, unknown> : {};
-        if (existing) {
-          if (!existing.name && typeof fn.name === "string") existing.name = fn.name;
-          return existing;
-        }
-        const callId = typeof deltaCall.id === "string" ? deltaCall.id : `call-${randomUUID()}`;
-        const call = {
-          id: `fc_${callId.replace(/[^a-zA-Z0-9_-]/g, "_")}`,
-          callId,
-          name: typeof fn.name === "string" ? fn.name : "",
-          arguments: "",
-          outputIndex: nextOutputIndex++,
-        };
-        functionCalls.set(index, call);
-        controller.enqueue(encoder.encode(sseEvent("response.output_item.added", {
-          type: "response.output_item.added",
-          output_index: call.outputIndex,
-          item: { id: call.id, type: "function_call", status: "in_progress", call_id: call.callId, name: call.name, arguments: "" },
-        })));
-        return call;
-      };
-      const finishFunctionCalls = () => {
-        const items: Array<Record<string, unknown>> = [];
-        for (const call of [...functionCalls.values()].sort((a, b) => a.outputIndex - b.outputIndex)) {
-          const item = { id: call.id, type: "function_call", status: "completed", call_id: call.callId, name: call.name, arguments: call.arguments };
-          controller.enqueue(encoder.encode(sseEvent("response.function_call_arguments.done", {
-            type: "response.function_call_arguments.done",
-            item_id: call.id,
-            output_index: call.outputIndex,
-            arguments: call.arguments,
-          })));
-          controller.enqueue(encoder.encode(sseEvent("response.output_item.done", {
-            type: "response.output_item.done",
-            output_index: call.outputIndex,
-            item,
-          })));
-          items.push(item);
-        }
-        return items;
-      };
-      const splitSseEvents = (input: string) => {
-        const events: string[] = [];
-        let rest = input;
-        while (true) {
-          const match = rest.match(/\r?\n\r?\n/);
-          if (!match || match.index === undefined) break;
-          events.push(rest.slice(0, match.index));
-          rest = rest.slice(match.index + match[0].length);
-        }
-        return { events, rest };
-      };
-      const sseDataPayloads = (eventBlock: string) => {
-        const dataLines = eventBlock
-          .split(/\r?\n/)
-          .filter((line) => line.startsWith("data:"))
-          .map((line) => line.slice(5).replace(/^ /, ""));
-        if (!dataLines.length) return [];
-        const joined = dataLines.join("\n").trim();
-        if (dataLines.length === 1) return joined ? [joined] : [];
-        try {
-          JSON.parse(joined);
-          return [joined];
-        } catch {
-          return dataLines.map((line) => line.trim()).filter(Boolean);
-        }
-      };
-      const processChatCompletionData = (data: string) => {
-        if (!data || data === "[DONE]") return;
-        try {
-          const chunk = JSON.parse(data) as Record<string, unknown>;
-          const choice = Array.isArray(chunk.choices) ? chunk.choices[0] as Record<string, unknown> | undefined : undefined;
-          const delta = choice?.delta && typeof choice.delta === "object" ? choice.delta as Record<string, unknown> : {};
-          const content = delta.content;
-          const text = typeof content === "string"
-            ? content
-            : Array.isArray(content)
-              ? content.map((part) => {
-                if (typeof part === "string") return part;
-                if (!part || typeof part !== "object") return "";
-                const record = part as Record<string, unknown>;
-                return typeof record.text === "string" ? record.text : "";
-              }).join("")
-              : "";
-          if (text) {
-            startTextItem();
-            textOutput += text;
-            controller.enqueue(encoder.encode(sseEvent("response.output_text.delta", { type: "response.output_text.delta", item_id: itemId, output_index: textOutputIndex, content_index: 0, delta: text })));
-          }
-          const toolCalls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
-          for (const toolCall of toolCalls) {
-            if (!toolCall || typeof toolCall !== "object") continue;
-            const record = toolCall as Record<string, unknown>;
-            const index = typeof record.index === "number" ? record.index : functionCalls.size;
-            const call = startFunctionCall(index, record);
-            const fn = record.function && typeof record.function === "object" ? record.function as Record<string, unknown> : {};
-            const argumentsDelta = typeof fn.arguments === "string" ? fn.arguments : "";
-            if (argumentsDelta) {
-              call.arguments += argumentsDelta;
-              controller.enqueue(encoder.encode(sseEvent("response.function_call_arguments.delta", {
-                type: "response.function_call_arguments.delta",
-                item_id: call.id,
-                output_index: call.outputIndex,
-                delta: argumentsDelta,
-              })));
-            }
-          }
-        } catch {
-          // Ignore malformed upstream SSE chunks and continue streaming.
-        }
-      };
-      const processSseEventBlock = (eventBlock: string) => {
-        for (const data of sseDataPayloads(eventBlock)) processChatCompletionData(data);
-      };
-      const reader = upstream.body?.getReader();
-      if (!reader) {
-        const item = finishTextItem() ?? { id: itemId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: "", annotations: [] }] };
-        controller.enqueue(encoder.encode(sseEvent("response.completed", { type: "response.completed", response: { id: responseId, status: "completed", model, output: [item] } })));
-        controller.close();
-        return;
-      }
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const split = splitSseEvents(buffer);
-        buffer = split.rest;
-        for (const eventBlock of split.events) processSseEventBlock(eventBlock);
-      }
-      buffer += decoder.decode();
-      const split = splitSseEvents(buffer);
-      for (const eventBlock of split.events) processSseEventBlock(eventBlock);
-      if (split.rest.trim()) processSseEventBlock(split.rest);
-      buffer = "";
-      const output = [finishTextItem(), ...finishFunctionCalls()].filter(Boolean);
-      if (!output.length) output.push({ id: itemId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: "", annotations: [] }] });
-      controller.enqueue(encoder.encode(sseEvent("response.completed", { type: "response.completed", response: { id: responseId, status: "completed", model, output } })));
-      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-      controller.close();
-    },
-  });
-  return new Response(stream, {
-    headers: {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    },
-  });
-}
-
-async function proxyResponsesToChatCompletions(provider: ProviderRecord, body: Record<string, unknown>) {
-  if (!provider.baseUrl) return new Response(JSON.stringify({ error: "base_url_required" }), { status: 400, headers: { "content-type": "application/json" } });
-  const chatRequest = responsesRequestToChatCompletion(body, provider);
-  const upstream = await fetch(joinUrl(provider.baseUrl, "/chat/completions"), {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      ...(provider.apiKey ? { authorization: `Bearer ${provider.apiKey}` } : {}),
-    },
-    body: JSON.stringify(chatRequest),
-  });
-  if (!upstream.ok) {
-    return new Response(await upstream.text(), { status: upstream.status, headers: { "content-type": upstream.headers.get("content-type") ?? "text/plain" } });
-  }
-  if (body.stream === true) return streamChatCompletionAsResponses(upstream, String(chatRequest.model ?? provider.defaultModel));
-  const payload = await upstream.json() as Record<string, unknown>;
-  return new Response(JSON.stringify(chatCompletionToResponse(payload, String(chatRequest.model ?? provider.defaultModel))), { headers: { "content-type": "application/json" } });
-}
-
-async function proxyResponsesToResponses(provider: ProviderRecord, body: Record<string, unknown>) {
-  if (!provider.baseUrl) return new Response(JSON.stringify({ error: "base_url_required" }), { status: 400, headers: { "content-type": "application/json" } });
-  const upstream = await fetch(joinUrl(provider.baseUrl, "/responses"), {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      ...(provider.apiKey ? { authorization: `Bearer ${provider.apiKey}` } : {}),
-    },
-    body: JSON.stringify(body),
-  });
-  const headers = new Headers();
-  headers.set("content-type", upstream.headers.get("content-type") ?? (body.stream === true ? "text/event-stream; charset=utf-8" : "application/json"));
-  const cacheControl = upstream.headers.get("cache-control");
-  if (cacheControl) headers.set("cache-control", cacheControl);
-  return new Response(upstream.body, { status: upstream.status, headers });
-}
-
-async function probeProviderInterface(provider: ProviderRecord, kind: "responses" | "chatCompletions") {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), providerTimeoutMs);
-  const startedAt = Date.now();
-  try {
-    if (provider.kind !== "local" && !provider.apiKey) return { ok: false, status: null, durationMs: 0, error: "api_key_missing" };
-    if (kind === "responses") {
-      const baseUrl = provider.baseUrl || "https://api.openai.com/v1";
-      const response = await fetch(joinUrl(baseUrl, "/responses"), {
-        method: "POST",
-        signal: controller.signal,
-        headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" },
-        body: JSON.stringify({ model: provider.defaultModel, input: "ping", max_output_tokens: 1 }),
-      });
-      return { ok: response.ok, status: response.status, durationMs: Date.now() - startedAt, error: response.ok ? undefined : (await response.text()).slice(0, 240) };
-    }
-    if (!provider.baseUrl) return { ok: false, status: null, durationMs: 0, error: "base_url_required" };
-    const response = await fetch(joinUrl(provider.baseUrl, "/chat/completions"), {
-      method: "POST",
-      signal: controller.signal,
-      headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" },
-      body: JSON.stringify({ model: provider.defaultModel, messages: [{ role: "user", content: "ping" }], max_tokens: 1 }),
-    });
-    return { ok: response.ok, status: response.status, durationMs: Date.now() - startedAt, error: response.ok ? undefined : (await response.text()).slice(0, 240) };
-  } catch (error) {
-    return { ok: false, status: null, durationMs: Date.now() - startedAt, error: error instanceof Error ? error.message : "provider_probe_failed" };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function detectProviderInterface(provider: ProviderRecord): Promise<ProviderDetectionResponse> {
-  const startedAt = Date.now();
-  if (!provider.defaultModel?.trim()) {
-    return {
-      ok: false,
-      providerId: provider.id,
-      kind: provider.kind,
-      capabilities: provider.capabilities ?? defaultProviderCapabilities(provider.kind),
-      durationMs: 0,
-      checks: {
-        responses: { ok: false, status: null, error: "default_model_required" },
-        chatCompletions: { ok: false, status: null, error: "default_model_required" },
-      },
-      error: "default_model_required",
-    };
-  }
-  const [responses, chatCompletions] = await Promise.all([
-    probeProviderInterface(provider, "responses"),
-    probeProviderInterface(provider, "chatCompletions"),
-  ]);
-  const detectedKind: ProviderSummary["kind"] = responses.ok ? "openai-responses" : chatCompletions.ok ? "openai-compatible-chat" : provider.kind;
-  const capabilities = mergeProviderCapabilities(detectedKind, {
-    responsesApi: responses.ok,
-    chatCompletions: chatCompletions.ok,
-    tools: detectedKind !== "local",
-    jsonMode: detectedKind !== "local",
-    streaming: true,
-  });
-  return {
-    ok: responses.ok || chatCompletions.ok,
-    providerId: provider.id,
-    kind: detectedKind,
-    capabilities,
-    durationMs: Date.now() - startedAt,
-    checks: {
-      responses: { ok: responses.ok, status: responses.status, error: responses.error },
-      chatCompletions: { ok: chatCompletions.ok, status: chatCompletions.status, error: chatCompletions.error },
-    },
-    error: responses.ok || chatCompletions.ok ? undefined : responses.error ?? chatCompletions.error ?? "provider_detection_failed",
-  };
-}
-
-async function testProvider(provider: ProviderRecord): Promise<ProviderTestResponse> {
-  const startedAt = Date.now();
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), providerTimeoutMs);
-  try {
-    if (provider.kind !== "local" && !provider.apiKey) {
-      return { ok: false, providerId: provider.id, status: null, durationMs: Date.now() - startedAt, error: "api_key_missing" };
-    }
-    let response: Response;
-    if (provider.kind === "openai-responses") {
-      response = await fetch(joinUrl(provider.baseUrl || "https://api.openai.com/v1", "/responses"), {
-        method: "POST",
-        headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" },
-        body: JSON.stringify({ model: provider.defaultModel, input: "ping", max_output_tokens: 16 }),
-        signal: controller.signal,
-      });
-    } else if (provider.kind === "openai-compatible-chat") {
-      if (!provider.baseUrl) throw new Error("base_url_required");
-      response = await fetch(joinUrl(provider.baseUrl, "/chat/completions"), {
-        method: "POST",
-        headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" },
-        body: JSON.stringify({ model: provider.defaultModel, messages: [{ role: "user", content: "ping" }], max_tokens: 16 }),
-        signal: controller.signal,
-      });
-    } else {
-      if (!provider.baseUrl) throw new Error("base_url_required");
-      response = await fetch(joinUrl(provider.baseUrl, "/health"), { signal: controller.signal });
-    }
-    return {
-      ok: response.ok,
-      providerId: provider.id,
-      status: response.status,
-      durationMs: Date.now() - startedAt,
-      error: response.ok ? undefined : await response.text() || `http_${response.status}`,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      providerId: provider.id,
-      status: null,
-      durationMs: Date.now() - startedAt,
-      error: error instanceof Error ? error.message : "provider_test_failed",
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function discoverProviderModels(provider: ProviderRecord): Promise<ProviderModelsResponse> {
-  const startedAt = Date.now();
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), providerTimeoutMs);
-  try {
-    if (provider.kind !== "local" && !provider.apiKey) {
-      return { ok: false, providerId: provider.id, models: [], status: null, durationMs: Date.now() - startedAt, error: "api_key_missing" };
-    }
-    const baseUrl = provider.baseUrl || (provider.kind === "openai-responses" ? "https://api.openai.com/v1" : "");
-    if (!baseUrl) throw new Error("base_url_required");
-    const response = await fetch(joinUrl(baseUrl, "/models"), {
-      headers: provider.apiKey ? { authorization: `Bearer ${provider.apiKey}` } : {},
-      signal: controller.signal,
-    });
-    const payload = await response.json().catch(() => ({})) as { data?: Array<{ id?: string }>; models?: string[] };
-    const models = Array.isArray(payload.data)
-      ? payload.data.map((item) => item.id).filter((id): id is string => Boolean(id))
-      : Array.isArray(payload.models) ? payload.models : [];
-    return {
-      ok: response.ok,
-      providerId: provider.id,
-      models: models.sort(),
-      status: response.status,
-      durationMs: Date.now() - startedAt,
-      error: response.ok ? undefined : `http_${response.status}`,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      providerId: provider.id,
-      models: [],
-      status: null,
-      durationMs: Date.now() - startedAt,
-      error: error instanceof Error ? error.message : "provider_models_failed",
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function providerModelCacheKey(provider: ProviderRecord) {
-  return stableJson({
-    kind: provider.kind,
-    baseUrl: provider.baseUrl ?? "",
-    defaultModel: provider.defaultModel ?? "",
-    apiKeyHash: provider.apiKey ? createHash("sha256").update(provider.apiKey).digest("hex") : "",
-  });
-}
-
-function readProviderModelCache(provider: ProviderRecord): (ProviderModelsResponse & { cachedAt: string }) | null {
-  const row = db.prepare("select cache_key, models, cached_at from provider_model_cache where provider_id = ?").get(provider.id) as
-    | { cache_key: string; models: string; cached_at: string }
-    | undefined;
-  if (!row || row.cache_key !== providerModelCacheKey(provider)) return null;
-  const age = Date.now() - new Date(row.cached_at).getTime();
-  if (!Number.isFinite(age) || age < 0 || age > providerModelsCacheTtlMs) return null;
-  try {
-    const models = JSON.parse(row.models) as unknown;
-    if (!Array.isArray(models) || !models.every((item) => typeof item === "string")) return null;
-    return { ok: true, providerId: provider.id, models, status: null, durationMs: 0, cachedAt: row.cached_at };
-  } catch {
-    return null;
-  }
-}
-
-function saveProviderModelCache(provider: ProviderRecord, result: ProviderModelsResponse) {
-  if (!result.ok || !result.models.length) return;
-  db.prepare(`
-    insert into provider_model_cache (provider_id, cache_key, models, cached_at)
-    values (?, ?, ?, ?)
-    on conflict(provider_id) do update set
-      cache_key = excluded.cache_key,
-      models = excluded.models,
-      cached_at = excluded.cached_at
-  `).run(provider.id, providerModelCacheKey(provider), JSON.stringify(result.models), new Date().toISOString());
-}
-
-function clearProviderModelCache(providerId: string) {
-  db.prepare("delete from provider_model_cache where provider_id = ?").run(providerId);
-}
-
-function toRelativePath(absolutePath: string, root = workspaceRoot) {
-  if (root === resolve("/")) return absolutePath;
-  const nextPath = relative(root, absolutePath).replaceAll("\\", "/");
-  return nextPath === "" ? "." : nextPath;
-}
-
-function resolveWorkspacePath(inputPath?: string, mountId?: string | null) {
-  return resolveInsideMount(resolveMountWorkspace(mountId), inputPath);
-}
-
-function resolveTerminalCwd(inputPath?: string) {
-  const requestedPath = inputPath?.trim() || terminalDefaultCwd;
-  try {
-    return resolveInsideRoot(terminalRoot, requestedPath);
-  } catch {
-    if (inputPath?.trim() && inputPath.trim() !== terminalDefaultCwd) throw new Error("terminal_cwd_outside_workspace");
-    return terminalRoot;
-  }
-}
-
-function toTerminalPath(absolutePath: string) {
-  return toRelativePath(absolutePath, terminalRoot);
-}
-
-function topLevelSessionDataPath(sessionId: string) {
-  return resolve(sessionWorkspaceRoot, sessionId);
-}
-
-function roomParentSessionId(roomId: string) {
-  const row = db.prepare("select session_id from rooms where id = ?").get(roomId) as { session_id?: string | null } | undefined;
-  return row?.session_id ?? null;
-}
-
-function sessionDataPath(sessionId: string) {
-  const row = db.prepare("select conversation_type, room_id from sessions where id = ?").get(sessionId) as { conversation_type?: string | null; room_id?: string | null } | undefined;
-  if (row?.conversation_type === "agent" && row.room_id) {
-    const parentSessionId = roomParentSessionId(row.room_id);
-    if (parentSessionId && parentSessionId !== sessionId) return resolve(topLevelSessionDataPath(parentSessionId), "room", "agent-sessions", sessionId);
-  }
-  return topLevelSessionDataPath(sessionId);
-}
-
-function sessionLogsPath(sessionId: string) {
-  return resolve(sessionDataPath(sessionId), "logs");
-}
-
-function sessionMetadataPath(sessionId: string) {
-  return resolve(sessionDataPath(sessionId), "metadata.json");
-}
-
-function sessionContextPath(sessionId: string) {
-  return resolve(sessionDataPath(sessionId), "context");
-}
-
-function sessionMemoryPath(sessionId: string) {
-  return resolve(sessionDataPath(sessionId), "memory");
-}
-
-function sessionAttachmentsPath(sessionId: string) {
-  return resolve(sessionDataPath(sessionId), "attachments");
-}
-
-type SavedSessionAttachment = {
-  id: string;
-  name: string;
-  type: string;
-  size: number;
-  path: string;
-  relativePath: string;
-  textPreview?: string;
-};
-
-const maxAttachmentFiles = 8;
-const maxAttachmentBytes = 5 * 1024 * 1024;
-const maxAttachmentTextPreviewChars = 16_000;
-
-function safeAttachmentName(name: string) {
-  const base = basename(name || "attachment").replace(/[^\w.\- ()[\]\u4e00-\u9fff]/g, "_").slice(0, 120);
-  return base && base !== "." && base !== ".." ? base : "attachment";
-}
-
-function readableAttachmentBytes(size: number) {
-  if (size < 1024) return `${size} B`;
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
-  return `${(size / 1024 / 1024).toFixed(1)} MB`;
-}
-
-function attachmentTextPreview(buffer: Buffer, type: string, name: string) {
-  const lowerName = name.toLowerCase();
-  const looksText = type.startsWith("text/")
-    || /(?:\.txt|\.md|\.json|\.csv|\.tsv|\.log|\.xml|\.html|\.css|\.js|\.jsx|\.ts|\.tsx|\.py|\.go|\.rs|\.java|\.c|\.cpp|\.h|\.hpp|\.sh|\.yml|\.yaml|\.toml|\.ini|\.env)$/i.test(lowerName);
-  if (!looksText) return "";
-  const text = buffer.toString("utf8").replace(/\u0000/g, "");
-  return text.length > maxAttachmentTextPreviewChars ? `${text.slice(0, maxAttachmentTextPreviewChars)}\n... [truncated]` : text;
-}
-
-function saveSessionAttachments(sessionId: string, inputs?: UploadAttachmentInput[] | null) {
-  const items = (inputs ?? []).filter((item) => item?.dataBase64 && item.name).slice(0, maxAttachmentFiles);
-  if (!items.length) return [] as SavedSessionAttachment[];
-  const root = sessionAttachmentsPath(sessionId);
-  mkdirSync(root, { recursive: true });
-  return items.map((item) => {
-    const name = safeAttachmentName(item.name);
-    const type = item.type?.trim() || "application/octet-stream";
-    const buffer = Buffer.from(item.dataBase64, "base64");
-    if (buffer.length > maxAttachmentBytes) throw new Error("attachment_too_large");
-    const id = `attachment-${randomUUID()}`;
-    const filename = `${id}-${name}`;
-    const target = resolve(root, filename);
-    if (!target.startsWith(`${root}/`)) throw new Error("invalid_attachment_path");
-    writeFileSync(target, buffer);
-    const relativePath = `attachments/${filename}`;
-    const textPreview = attachmentTextPreview(buffer, type, name);
-    return {
-      id,
-      name,
-      type,
-      size: buffer.length,
-      path: target,
-      relativePath,
-      textPreview: textPreview || undefined,
-    };
-  });
-}
-
-function attachmentMarkdown(attachments: SavedSessionAttachment[], options: { includePreview: boolean }) {
-  if (!attachments.length) return "";
-  return [
-    "## Attachments",
-    ...attachments.flatMap((attachment, index) => [
-      `${index + 1}. ${attachment.name}`,
-      `   - path: ${attachment.path}`,
-      `   - session path: ${attachment.relativePath}`,
-      `   - type: ${attachment.type}`,
-      `   - size: ${readableAttachmentBytes(attachment.size)}`,
-      options.includePreview && attachment.textPreview ? "   - text preview:" : "",
-      options.includePreview && attachment.textPreview ? attachment.textPreview.split("\n").map((line) => `     ${line}`).join("\n") : "",
-    ]),
-  ].filter((line) => line !== "").join("\n");
-}
-
-function promptWithAttachments(prompt: string, attachments: SavedSessionAttachment[]) {
-  const attachmentBlock = attachmentMarkdown(attachments, { includePreview: true });
-  return attachmentBlock ? `${prompt.trim()}\n\n${attachmentBlock}` : prompt.trim();
-}
-
-function messageWithAttachments(prompt: string, attachments: SavedSessionAttachment[]) {
-  const attachmentBlock = attachmentMarkdown(attachments, { includePreview: false });
-  return attachmentBlock ? `${prompt.trim()}\n\n${attachmentBlock}` : prompt.trim();
-}
-
-function writeSessionContextFile(sessionId: string, name: string, content: string) {
-  const root = sessionContextPath(sessionId);
-  mkdirSync(root, { recursive: true });
-  const target = resolve(root, name);
-  writeFileSync(target, content, "utf8");
-  return target;
-}
-
-function resetSessionContextFiles(sessionId: string) {
-  const root = sessionContextPath(sessionId);
-  rmSync(root, { recursive: true, force: true });
-  mkdirSync(root, { recursive: true });
-}
-
-function writeSessionMetadata(session: SessionSummary) {
-  try {
-    mkdirSync(sessionDataPath(session.id), { recursive: true });
-    writeFileSync(sessionMetadataPath(session.id), JSON.stringify({ session, updatedAt: new Date().toISOString() }, null, 2), "utf8");
-  } catch {
-    return;
-  }
-}
-
-function migrateLegacyScratchSessionWorkspace(sessionId: string) {
-  const root = sessionDataPath(sessionId);
-  const workspace = resolve(root, "workspace");
-  if (!existsSync(root) || existsSync(workspace)) return;
-  const entries = readdirSync(root).filter((name) => !["logs", "artifacts", "metadata.json", "workspace"].includes(name));
-  if (!entries.length) return;
-  mkdirSync(workspace, { recursive: true });
-  for (const name of entries) {
-    try {
-      renameSync(resolve(root, name), resolve(workspace, name));
-    } catch {
-      return;
-    }
-  }
-}
-
-function scratchSessionWorkspacePath(sessionId: string) {
-  return resolve(sessionDataPath(sessionId), "workspace");
-}
-
-function ensureScratchSessionWorkspace(sessionId: string) {
-  migrateLegacyScratchSessionWorkspace(sessionId);
-  const workspacePath = scratchSessionWorkspacePath(sessionId);
-  mkdirSync(workspacePath, { recursive: true });
-  ensureGitRepositorySync(workspacePath);
-  return workspacePath;
-}
-
-function migrateRoomAgentSessionDataRoots() {
-  const rows = db.prepare(`
-    select id
-    from sessions
-    where conversation_type = 'agent'
-      and room_id is not null
-  `).all() as Array<{ id: string }>;
-  for (const row of rows) {
-    const source = topLevelSessionDataPath(row.id);
-    const target = sessionDataPath(row.id);
-    if (resolve(source) === resolve(target) || !existsSync(source)) continue;
-    mkdirSync(dirname(target), { recursive: true });
-    if (!existsSync(target)) {
-      try {
-        renameSync(source, target);
-        continue;
-      } catch {
-        // Fall through to best-effort merge below.
-      }
-    }
-    try {
-      mkdirSync(target, { recursive: true });
-      for (const name of readdirSync(source)) {
-        const from = resolve(source, name);
-        const to = resolve(target, name);
-        if (existsSync(to)) continue;
-        renameSync(from, to);
-      }
-      rmSync(source, { recursive: true, force: true });
-    } catch {
-      // Leave the original directory in place if migration cannot safely finish.
-    }
-  }
-}
-
-function roomWorkspaceDataPath(roomId: string) {
-  const parentSessionId = roomParentSessionId(roomId);
-  return parentSessionId ? resolve(topLevelSessionDataPath(parentSessionId), "room") : resolve(dataDir, "rooms", roomId);
-}
-
-function migrateRoomWorkspaceRoots() {
-  const rows = db.prepare("select id, session_id from rooms").all() as Array<{ id: string; session_id?: string | null }>;
-  for (const room of rows) {
-    if (!room.session_id) continue;
-    const source = resolve(dataDir, "rooms", room.id);
-    const target = roomWorkspaceDataPath(room.id);
-    if (resolve(source) === resolve(target) || !existsSync(source)) continue;
-    mkdirSync(target, { recursive: true });
-    let fullyMoved = true;
-    for (const name of readdirSync(source)) {
-      const from = resolve(source, name);
-      const to = resolve(target, name);
-      if (existsSync(to)) {
-        fullyMoved = false;
-        continue;
-      }
-      try {
-        renameSync(from, to);
-      } catch {
-        fullyMoved = false;
-      }
-    }
-    if (fullyMoved) rmSync(source, { recursive: true, force: true });
-    const oldPrefix = `${source}/`;
-    const newPrefix = `${target}/`;
-    for (const run of db.prepare("select id, workspace_path from agent_runs where room_id = ? and workspace_path is not null and workspace_path != ''").all(room.id) as Array<{ id: string; workspace_path: string }>) {
-      if (resolve(run.workspace_path) === source || run.workspace_path.startsWith(oldPrefix)) {
-        const nextPath = resolve(run.workspace_path) === source ? target : `${newPrefix}${run.workspace_path.slice(oldPrefix.length)}`;
-        db.prepare("update agent_runs set workspace_path = ? where id = ?").run(nextPath, run.id);
-      }
-    }
-    for (const thread of db.prepare("select room_id, agent_id, workspace_path from room_agent_threads where room_id = ? and workspace_path is not null and workspace_path != ''").all(room.id) as Array<{ room_id: string; agent_id: string; workspace_path: string }>) {
-      if (resolve(thread.workspace_path) === source || thread.workspace_path.startsWith(oldPrefix)) {
-        const nextPath = resolve(thread.workspace_path) === source ? target : `${newPrefix}${thread.workspace_path.slice(oldPrefix.length)}`;
-        db.prepare("update room_agent_threads set workspace_path = ?, updated_at = ? where room_id = ? and agent_id = ?").run(nextPath, new Date().toISOString(), thread.room_id, thread.agent_id);
-      }
-    }
-    for (const session of appData.sessions) {
-      if (!session.workspacePath || !(resolve(session.workspacePath) === source || session.workspacePath.startsWith(oldPrefix))) continue;
-      session.workspacePath = resolve(session.workspacePath) === source ? target : `${newPrefix}${session.workspacePath.slice(oldPrefix.length)}`;
-      upsertSession(session);
-    }
-  }
-}
-
-type RoomRunWorkspace = {
-  root: string;
-  shared: string;
-  agentWorkspace: string;
-  projectPath?: string;
-};
-
-function ensureRoomWorkspace(roomId: string, agentId: string): RoomRunWorkspace {
-  const root = roomWorkspaceDataPath(roomId);
-  const shared = resolve(root, "shared");
-  const agentWorkspace = resolve(root, "agents", agentId);
-  mkdirSync(shared, { recursive: true });
-  mkdirSync(agentWorkspace, { recursive: true });
-  ensureGitRepositorySync(agentWorkspace);
-  return { root, shared, agentWorkspace };
-}
-
-function ensureRoomRunWorkspace(roomRow: Record<string, unknown>, agent: AgentSummary, taskId: string): RoomRunWorkspace {
-  const base = ensureRoomWorkspace(String(roomRow.id), agent.id);
-  const project = roomRow.project_id ? appData.projects.find((item) => item.id === String(roomRow.project_id)) : null;
-  if (!project) return base;
-  const projectPath = resolveTerminalCwd(project.workspacePath);
-  const projectRoot = runGitSync(projectPath, ["rev-parse", "--show-toplevel"]);
-  if (projectRoot.exitCode !== 0 || resolve(projectRoot.stdout.trim()) !== projectPath) return base;
-  const useProjectWorktree = agent.workspaceMode !== "shared-write" && agent.workspaceMode !== "merge-workspace";
-  if (!useProjectWorktree) return { ...base, projectPath };
-  const worktree = resolve(base.root, "worktrees", `${agent.id}-${taskId}`);
-  if (!existsSync(worktree)) {
-    mkdirSync(dirname(worktree), { recursive: true });
-    const branch = `codex-room/${String(roomRow.id).slice(0, 12)}/${agent.id.slice(0, 18)}/${taskId.slice(-8)}`;
-    const result = runGitSync(projectPath, ["worktree", "add", "-B", branch, worktree, "HEAD"]);
-    if (result.exitCode !== 0) return { ...base, projectPath };
-  }
-  return { ...base, agentWorkspace: worktree, projectPath };
-}
-
-function resolveSessionWorkspace(session: SessionSummary) {
-  const project = session.projectId ? appData.projects.find((item) => item.id === session.projectId) : null;
-  const roomAgentRun = session.conversationType === "agent" && session.roomId
-    ? db.prepare("select workspace_path from agent_runs where session_id = ? and workspace_path is not null and workspace_path != '' order by started_at desc limit 1").get(session.id) as { workspace_path?: string | null } | undefined
-    : null;
-  const workspacePath = project?.workspacePath
-    ? resolveTerminalCwd(project.workspacePath)
-    : roomAgentRun?.workspace_path
-      ? resolveTerminalCwd(String(roomAgentRun.workspace_path))
-      : session.workspacePath
-        ? resolveTerminalCwd(session.workspacePath)
-        : ensureScratchSessionWorkspace(session.id);
-  if (!project && !roomAgentRun?.workspace_path && workspacePath === scratchSessionWorkspacePath(session.id)) ensureGitRepositorySync(workspacePath);
-  if (session.workspacePath !== workspacePath || (project && session.kind !== "project") || (!project && !roomAgentRun?.workspace_path && session.kind !== "scratch")) {
-    session.workspacePath = workspacePath;
-    if (project) {
-      session.kind = "project";
-    } else if (!roomAgentRun?.workspace_path) {
-      session.projectId = null;
-      session.kind = "scratch";
-    }
-    session.updatedAt = new Date().toISOString();
-    upsertSession(session);
-  }
-  return workspacePath;
-}
-
-function resolveChildPath(parentPath: string, name: string, mountId?: string | null) {
-  const cleanName = name.trim();
-  if (!cleanName || cleanName.includes("/") || cleanName.includes("\\")) throw new Error("invalid_name");
-  return resolveWorkspacePath(join(parentPath, cleanName), mountId);
-}
-
-function toFileEntry(absolutePath: string, root = workspaceRoot): FileEntry {
-  const stat = statSync(absolutePath);
-  return {
-    name: absolutePath.split(/[\\/]/).at(-1) ?? absolutePath,
-    path: toRelativePath(absolutePath, root),
-    kind: stat.isDirectory() ? "directory" : "file",
-    size: stat.size,
-    updatedAt: stat.mtime.toISOString(),
-  };
-}
-
-function automationCommandTimeoutSeconds(value: unknown) {
-  if (value === null || value === undefined || value === "") return null;
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) return null;
-  return Math.max(1, Math.min(Math.round(parsed), 24 * 60 * 60));
-}
-
-function runShellCommand(command: string, cwd: string, options: { timeoutMs?: number | null; onChild?: (child: ChildProcess) => void } = {}): Promise<TerminalCommandResponse> {
-  const startedAt = Date.now();
-  return new Promise((resolveCommand) => {
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    const child = spawnProcess("/bin/zsh", ["-lc", command], { cwd, env: managedChildEnv() });
-    options.onChild?.(child);
-    const trimOutput = (value: string) => value.slice(-64 * 1024);
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdout = trimOutput(stdout + chunk.toString("utf8"));
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      stderr = trimOutput(stderr + chunk.toString("utf8"));
-    });
-    const timeoutMs = options.timeoutMs === undefined ? 30_000 : options.timeoutMs;
-    const timeout = timeoutMs === null ? null : setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-    }, timeoutMs);
-    child.on("close", (exitCode) => {
-      if (timeout) clearTimeout(timeout);
-      resolveCommand({ command, cwd: toTerminalPath(cwd), exitCode, stdout, stderr, durationMs: Date.now() - startedAt, timedOut });
-    });
-  });
-}
-
-function formatShellCommandOutput(result: TerminalCommandResponse, timeoutSeconds?: number | null) {
-  return [
-    `Command: ${result.command}`,
-    `CWD: ${result.cwd}`,
-    `Exit code: ${result.exitCode ?? "null"}`,
-    `Duration: ${result.durationMs}ms${result.timedOut && timeoutSeconds ? ` (timed out after ${timeoutSeconds}s)` : ""}`,
-    "",
-    "stdout:",
-    result.stdout || "(empty)",
-    "",
-    "stderr:",
-    result.stderr || "(empty)",
-  ].join("\n");
-}
 
 async function runLoggedShellCommand(session: SessionSummary, command: string, cwd: string, options: { timeoutMs?: number | null; source?: string } = {}) {
   const promptHash = createHash("sha256").update(command).digest("hex").slice(0, 12);
@@ -10534,231 +3833,6 @@ async function runLoggedShellCommand(session: SessionSummary, command: string, c
     shellTaskProcesses.delete(session.id);
     shellTaskStopRequested.delete(session.id);
   }
-}
-
-function saveProjectCheckRun(projectId: string, result: TerminalCommandResponse, startedAt: string): ProjectCheckRunSummary {
-  const run: ProjectCheckRunSummary = {
-    id: `project-check-${randomUUID()}`,
-    projectId,
-    command: result.command,
-    cwd: result.cwd,
-    status: result.timedOut ? "timed_out" : result.exitCode === 0 ? "done" : "failed",
-    exitCode: result.exitCode,
-    durationMs: result.durationMs,
-    stdout: result.stdout,
-    stderr: result.stderr,
-    startedAt,
-    finishedAt: new Date().toISOString(),
-  };
-  db.prepare(`
-    insert into project_check_runs (id, project_id, command, cwd, status, exit_code, duration_ms, stdout, stderr, started_at, finished_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(run.id, run.projectId, run.command, run.cwd, run.status, run.exitCode, run.durationMs, run.stdout, run.stderr, run.startedAt, run.finishedAt ?? null);
-  return run;
-}
-
-function saveProjectGitOperation(projectId: string, operation: ProjectGitOperationType, args: string[], result: { exitCode: number | null; stdout: string; stderr: string }, status?: ProjectGitOperationSummary["status"]) {
-  const record: ProjectGitOperationSummary = {
-    id: `project-git-${randomUUID()}`,
-    projectId,
-    operation,
-    args,
-    status: status ?? (result.exitCode === 0 ? "done" : "failed"),
-    exitCode: result.exitCode,
-    stdout: result.stdout,
-    stderr: result.stderr,
-    createdAt: new Date().toISOString(),
-  };
-  db.prepare(`
-    insert into project_git_operations (id, project_id, operation, args, status, exit_code, stdout, stderr, created_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(record.id, record.projectId, record.operation, JSON.stringify(record.args), record.status, record.exitCode, record.stdout, record.stderr, record.createdAt);
-  return record;
-}
-
-function listProjectGitOperations(projectId: string, limit = 20, cursorValue?: string | null) {
-  const cursor = decodePageCursor(cursorValue);
-  const rows = db.prepare(`
-    select * from project_git_operations
-    where project_id = @projectId
-      ${cursor ? "and (created_at < @cursorSort or (created_at = @cursorSort and id < @cursorId))" : ""}
-    order by created_at desc, id desc
-    limit @limit
-  `).all({ projectId, cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
-  return pageFromRows(rows.map(projectGitOperationFromRow), limit, (item) => item.createdAt);
-}
-
-function projectGitArgs(input: ProjectGitOperationRequest) {
-  const branch = input.branch?.trim();
-  const message = input.message?.trim();
-  if (input.operation === "pull") return ["pull", "--ff-only"];
-  if (input.operation === "commit") {
-    if (!message) throw new Error("commit_message_required");
-    return ["commit", "-m", message];
-  }
-  if (input.operation === "branch-create") {
-    if (!branch) throw new Error("branch_required");
-    return ["checkout", "-b", branch];
-  }
-  if (input.operation === "branch-checkout") {
-    if (!branch) throw new Error("branch_required");
-    return ["checkout", branch];
-  }
-  if (input.operation === "push") return ["push"];
-  throw new Error("unsupported_git_operation");
-}
-
-function runProjectGitOperation(project: ProjectSummary, operation: ProjectGitOperationType, args: string[]) {
-  const result = runGitSync(resolveTerminalCwd(project.workspacePath), args);
-  return saveProjectGitOperation(project.id, operation, args, result);
-}
-
-function listProjectCheckRuns(projectId: string, limit = 20, cursorValue?: string | null) {
-  const cursor = decodePageCursor(cursorValue);
-  const rows = db.prepare(`
-    select * from project_check_runs
-    where project_id = @projectId
-      ${cursor ? "and (started_at < @cursorSort or (started_at = @cursorSort and id < @cursorId))" : ""}
-    order by started_at desc, id desc
-    limit @limit
-  `).all({ projectId, cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
-  return pageFromRows(rows.map(projectCheckRunFromRow), limit, (item) => item.startedAt);
-}
-
-function agentRoleFromRow(row: Record<string, unknown>): AgentRoleSummary {
-  return {
-    id: String(row.id),
-    name: String(row.name),
-    description: String(row.description ?? ""),
-    sourceType: roleSourceType(row.source_type),
-    sourcePath: row.source_path ? String(row.source_path) : null,
-    sourceUrl: row.source_url ? String(row.source_url) : null,
-    markdownContent: String(row.markdown_content ?? row.system_prompt ?? ""),
-    systemPrompt: String(row.system_prompt ?? ""),
-    capabilities: jsonArray(row.capabilities),
-    defaultListenMode: listenMode(row.default_listen_mode),
-    defaultListenEvents: jsonArray(row.default_listen_events),
-    defaultWorkspaceMode: workspaceMode(row.default_workspace_mode),
-    defaultSandboxMode: row.default_sandbox_mode ? String(row.default_sandbox_mode) as AgentRoleSummary["defaultSandboxMode"] : null,
-    defaultApprovalPolicy: row.default_approval_policy ? String(row.default_approval_policy) as AgentRoleSummary["defaultApprovalPolicy"] : null,
-    outputContract: row.output_contract ? String(row.output_contract) : null,
-    safetyNotes: row.safety_notes ? String(row.safety_notes) : null,
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function agentFromRow(row: Record<string, unknown>): AgentSummary {
-  return {
-    id: String(row.id),
-    name: String(row.name),
-    roleId: String(row.role_id),
-    description: row.description ? String(row.description) : null,
-    extraPrompt: row.extra_prompt ? String(row.extra_prompt) : null,
-    providerId: row.provider_id ? String(row.provider_id) : null,
-    model: row.model ? String(row.model) : null,
-    workspaceMode: workspaceMode(row.workspace_mode),
-    defaultProjectId: row.default_project_id ? String(row.default_project_id) : null,
-    favoriteProjectIds: jsonArray(row.favorite_project_ids),
-    projectAccessMode: projectAccessMode(row.project_access_mode),
-    allowedProjectIds: jsonArray(row.allowed_project_ids),
-    permissionProfileId: permissionProfileId(row.permission_profile_id),
-    permissions: agentPermissions(row.permissions),
-    maxConcurrentRuns: Number(row.max_concurrent_runs) || 1,
-    enabled: Number(row.enabled) === 1,
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function normalizeProjectIds(ids?: string[] | null) {
-  const valid = new Set(appData.projects.map((project) => project.id));
-  return Array.from(new Set((ids ?? []).map(String).filter((id) => valid.has(id))));
-}
-
-function agentCanAccessProject(agent: AgentSummary, projectId?: string | null) {
-  if (!projectId) return true;
-  if (agent.projectAccessMode === "none") return false;
-  if (agent.projectAccessMode === "all") return appData.projects.some((project) => project.id === projectId);
-  return agent.allowedProjectIds.includes(projectId);
-}
-
-function resolveAgentProject(agent: AgentSummary, requestedProjectId?: string | null) {
-  const projectId = requestedProjectId !== undefined ? requestedProjectId : agent.defaultProjectId;
-  if (!projectId) return null;
-  if (!agentCanAccessProject(agent, projectId)) throw new Error("agent_project_access_denied");
-  return appData.projects.find((project) => project.id === projectId) ?? null;
-}
-
-function executionContextFromRow(row: Record<string, unknown>): ExecutionContextSummary {
-  return {
-    id: String(row.id),
-    sourceType: row.source_type as ExecutionContextSummary["sourceType"],
-    sessionId: row.session_id ? String(row.session_id) : null,
-    agentId: row.agent_id ? String(row.agent_id) : null,
-    roomId: row.room_id ? String(row.room_id) : null,
-    projectId: row.project_id ? String(row.project_id) : null,
-    workspacePath: String(row.workspace_path),
-    providerId: row.provider_id ? String(row.provider_id) : null,
-    model: row.model ? String(row.model) : null,
-    permissionProfileId: permissionProfileId(row.permission_profile_id),
-    resolvedPermissions: agentPermissions(row.resolved_permissions),
-    sandboxMode: row.sandbox_mode as CodexSandboxMode,
-    approvalPolicy: row.approval_policy as CodexApprovalPolicy,
-    createdBy: row.created_by as ExecutionContextSummary["createdBy"],
-    createdAt: String(row.created_at),
-  };
-}
-
-function recordExecutionContext(input: Omit<ExecutionContextSummary, "id" | "createdAt">) {
-  const context: ExecutionContextSummary = {
-    ...input,
-    id: `ctx-${randomUUID()}`,
-    createdAt: new Date().toISOString(),
-  };
-  db.prepare(`
-    insert into execution_contexts (id, source_type, session_id, agent_id, room_id, project_id, workspace_path, provider_id, model, permission_profile_id, resolved_permissions, sandbox_mode, approval_policy, created_by, created_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    context.id,
-    context.sourceType,
-    context.sessionId ?? null,
-    context.agentId ?? null,
-    context.roomId ?? null,
-    context.projectId ?? null,
-    context.workspacePath,
-    context.providerId ?? null,
-    context.model ?? null,
-    context.permissionProfileId ?? null,
-    JSON.stringify(context.resolvedPermissions),
-    context.sandboxMode,
-    context.approvalPolicy,
-    context.createdBy,
-    context.createdAt,
-  );
-  return context;
-}
-
-function directAgentForSession(sessionId: string) {
-  const link = db.prepare("select agent_id from agent_sessions where session_id = ?").get(sessionId) as { agent_id?: string } | undefined;
-  if (!link?.agent_id) return null;
-  const agentRow = db.prepare("select * from agents where id = ?").get(link.agent_id) as Record<string, unknown> | undefined;
-  if (!agentRow) return null;
-  const agent = agentFromRow(agentRow);
-  const roleRow = db.prepare("select * from agent_roles where id = ?").get(agent.roleId) as Record<string, unknown> | undefined;
-  if (!roleRow) return null;
-  return { agent, role: agentRoleFromRow(roleRow) };
-}
-
-function promptForDirectAgentSession(session: SessionSummary, prompt: string) {
-  if (session.conversationType !== "agent" || session.roomId || session.codexSessionId) return prompt;
-  const directAgent = directAgentForSession(session.id);
-  if (!directAgent) return prompt;
-  return [
-    directAgent.role.systemPrompt,
-    directAgent.agent.extraPrompt ? `\n\nAgent extra instructions:\n${directAgent.agent.extraPrompt}` : "",
-    `\n\nUser message:\n${prompt}`,
-  ].join("");
 }
 
 function groupContextForRoom(roomRow: Record<string, unknown>) {
@@ -10800,163 +3874,6 @@ function recentRoomContext(roomId: string) {
   return lines.length ? ["Recent room events:", ...lines].join("\n") : "";
 }
 
-function agentGroupFromRow(row: Record<string, unknown>): AgentGroupSummary {
-  const members = db.prepare("select agent_id, listen_mode from agent_group_members where group_id = ? order by agent_id asc").all(String(row.id)) as Array<{ agent_id: string; listen_mode?: string }>;
-  return {
-    id: String(row.id),
-    name: String(row.name),
-    description: row.description ? String(row.description) : null,
-    agentIds: members.map((member) => member.agent_id),
-    memberListenModes: Object.fromEntries(members.map((member) => [member.agent_id, listenMode(member.listen_mode)])),
-    collaborationRules: String(row.collaboration_rules ?? ""),
-    eventRoutingRules: String(row.event_routing_rules ?? ""),
-    maxConcurrentAgents: Number(row.max_concurrent_agents) || 1,
-    approvalPolicy: String(row.approval_policy ?? "bounded"),
-    mergeStrategy: String(row.merge_strategy ?? "approval-required"),
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function agentCircleFromRow(row: Record<string, unknown>): AgentCircleSummary {
-  const roleRows = db.prepare("select role_id from agent_circle_roles where circle_id = ? order by position asc, role_id asc").all(String(row.id)) as Array<Record<string, unknown>>;
-  return {
-    id: String(row.id),
-    name: String(row.name),
-    description: row.description ? String(row.description) : null,
-    roleIds: roleRows.map((item) => String(item.role_id)),
-    collaborationRules: String(row.collaboration_rules ?? ""),
-    eventRoutingRules: String(row.event_routing_rules ?? ""),
-    maxConcurrentAgents: Number(row.max_concurrent_agents) || 3,
-    approvalPolicy: String(row.approval_policy ?? "bounded"),
-    mergeStrategy: String(row.merge_strategy ?? "approval-required"),
-    groupTemplateId: row.group_template_id ? String(row.group_template_id) : null,
-    builtin: Number(row.builtin) === 1,
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function roomFromRow(row: Record<string, unknown>): RoomSummary {
-  return {
-    id: String(row.id),
-    sessionId: row.session_id ? String(row.session_id) : null,
-    name: String(row.name),
-    groupId: row.group_id ? String(row.group_id) : null,
-    circleId: row.circle_id ? String(row.circle_id) : null,
-    projectId: row.project_id ? String(row.project_id) : null,
-    status: roomStatus(row.status),
-    sharedContext: row.shared_context ? String(row.shared_context) : null,
-    goal: activeGoalForOwner("room", String(row.id)),
-    orchestration: roomOrchestrationSettings(row.orchestration_settings),
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function roomEventFromRow(row: Record<string, unknown>): RoomEventSummary {
-  return {
-    id: String(row.id),
-    roomId: String(row.room_id),
-    type: String(row.type),
-    sourceAgentId: row.source_agent_id ? String(row.source_agent_id) : null,
-    targetAgentId: row.target_agent_id ? String(row.target_agent_id) : null,
-    payload: jsonPayload(row.payload),
-    createdAt: String(row.created_at),
-  };
-}
-
-function roomArtifactFromRow(row: Record<string, unknown>): RoomArtifactSummary {
-  return {
-    id: String(row.id),
-    roomId: String(row.room_id),
-    agentId: row.agent_id ? String(row.agent_id) : null,
-    kind: String(row.kind) as RoomArtifactSummary["kind"],
-    title: String(row.title),
-    payload: jsonPayload(row.payload),
-    createdAt: String(row.created_at),
-  };
-}
-
-function createRoomArtifact(roomId: string, input: Omit<RoomArtifactSummary, "id" | "roomId" | "createdAt">) {
-  const artifact: RoomArtifactSummary = {
-    ...input,
-    id: `artifact-${randomUUID()}`,
-    roomId,
-    createdAt: new Date().toISOString(),
-  };
-  db.prepare(`
-    insert into room_artifacts (id, room_id, agent_id, kind, title, payload, created_at)
-    values (?, ?, ?, ?, ?, ?, ?)
-  `).run(artifact.id, artifact.roomId, artifact.agentId ?? null, artifact.kind, artifact.title, JSON.stringify(artifact.payload ?? {}), artifact.createdAt);
-  roomEvent(roomId, "artifact.created", { artifactId: artifact.id, kind: artifact.kind, title: artifact.title }, artifact.agentId ?? null);
-  return artifact;
-}
-
-function roomDecisionFromRow(row: Record<string, unknown>): RoomDecisionSummary {
-  const status = ["open", "approved", "rejected", "resolved"].includes(String(row.status)) ? String(row.status) as RoomDecisionSummary["status"] : "open";
-  return {
-    id: String(row.id),
-    roomId: String(row.room_id),
-    title: String(row.title),
-    status,
-    payload: jsonPayload(row.payload),
-    createdAt: String(row.created_at),
-    resolvedAt: row.resolved_at ? String(row.resolved_at) : null,
-  };
-}
-
-function createRoomDecision(roomId: string, input: Omit<RoomDecisionSummary, "id" | "roomId" | "createdAt" | "resolvedAt"> & { resolvedAt?: string | null }) {
-  const decision: RoomDecisionSummary = {
-    ...input,
-    id: `decision-${randomUUID()}`,
-    roomId,
-    createdAt: new Date().toISOString(),
-    resolvedAt: input.resolvedAt ?? null,
-  };
-  db.prepare(`
-    insert into room_decisions (id, room_id, title, status, payload, created_at, resolved_at)
-    values (?, ?, ?, ?, ?, ?, ?)
-  `).run(decision.id, decision.roomId, decision.title, decision.status, JSON.stringify(decision.payload ?? {}), decision.createdAt, decision.resolvedAt ?? null);
-  roomEvent(roomId, "decision.created", { decisionId: decision.id, title: decision.title, status: decision.status });
-  return decision;
-}
-
-function roomHandoffStatus(value: unknown): RoomHandoffSummary["status"] {
-  return value === "accepted" || value === "returned" || value === "resolved" || value === "cancelled" ? value : "open";
-}
-
-function roomHandoffFromRow(row: Record<string, unknown>): RoomHandoffSummary {
-  return {
-    id: String(row.id),
-    roomId: String(row.room_id),
-    fromAgentId: row.from_agent_id ? String(row.from_agent_id) : null,
-    toAgentId: row.to_agent_id ? String(row.to_agent_id) : null,
-    summary: String(row.summary),
-    status: roomHandoffStatus(row.status),
-    payload: jsonPayload(row.payload),
-    createdAt: String(row.created_at),
-    resolvedAt: row.resolved_at ? String(row.resolved_at) : null,
-  };
-}
-
-function createRoomHandoff(roomId: string, input: Omit<RoomHandoffSummary, "id" | "roomId" | "createdAt" | "resolvedAt" | "status"> & { status?: RoomHandoffSummary["status"]; resolvedAt?: string | null }) {
-  const handoff: RoomHandoffSummary = {
-    ...input,
-    status: roomHandoffStatus(input.status),
-    id: `handoff-${randomUUID()}`,
-    roomId,
-    createdAt: new Date().toISOString(),
-    resolvedAt: input.resolvedAt ?? null,
-  };
-  db.prepare(`
-    insert into room_handoffs (id, room_id, from_agent_id, to_agent_id, summary, status, payload, created_at, resolved_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(handoff.id, handoff.roomId, handoff.fromAgentId ?? null, handoff.toAgentId ?? null, handoff.summary, handoff.status, JSON.stringify(handoff.payload ?? {}), handoff.createdAt, handoff.resolvedAt ?? null);
-  roomEvent(roomId, "handoff.created", { handoffId: handoff.id, summary: handoff.summary, status: handoff.status, toAgentId: handoff.toAgentId }, handoff.toAgentId ?? null, handoff.fromAgentId ?? null);
-  return handoff;
-}
-
 function createSuggestedRoomTask(roomId: string, input: { title: string; prompt: string; assignedAgentId?: string | null; priority?: number | null; sourceAgentId?: string | null }) {
   const title = input.title.trim().slice(0, 180);
   const prompt = input.prompt.trim();
@@ -10983,60 +3900,6 @@ function createSuggestedRoomTask(roomId: string, input: { title: string; prompt:
   );
   roomEvent(roomId, "task.created", { taskId: id, title, source: "agent-suggested" }, assignedAgentId, input.sourceAgentId ?? null);
   return roomTaskFromRow(db.prepare("select * from room_tasks where id = ?").get(id) as Record<string, unknown>);
-}
-
-function roomTaskFromRow(row: Record<string, unknown>): RoomTaskSummary {
-  return {
-    id: String(row.id),
-    roomId: String(row.room_id),
-    goalItemId: row.goal_item_id ? String(row.goal_item_id) : null,
-    title: String(row.title),
-    prompt: String(row.prompt ?? ""),
-    assignedAgentId: row.assigned_agent_id ? String(row.assigned_agent_id) : null,
-    status: String(row.status) as RoomTaskSummary["status"],
-    priority: Number(row.priority) || 0,
-    dependsOnTaskId: row.depends_on_task_id ? String(row.depends_on_task_id) : null,
-    scheduledAt: row.scheduled_at ? String(row.scheduled_at) : null,
-    startedAt: row.started_at ? String(row.started_at) : null,
-    finishedAt: row.finished_at ? String(row.finished_at) : null,
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function roomScheduleFromRow(row: Record<string, unknown>): RoomScheduleSummary {
-  return {
-    id: String(row.id),
-    roomId: String(row.room_id),
-    agentId: String(row.agent_id),
-    taskPrompt: String(row.task_prompt),
-    scheduleType: row.schedule_type === "hourly" || row.schedule_type === "daily" ? row.schedule_type : "once",
-    runAt: row.run_at ? String(row.run_at) : null,
-    status: row.status === "paused" || row.status === "done" ? row.status : "active",
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function agentRunFromRow(row: Record<string, unknown>): AgentRunSummary {
-  const merge = db.prepare("select status, summary from room_run_merges where run_id = ?").get(String(row.id)) as { status?: string; summary?: string } | undefined;
-  return {
-    id: String(row.id),
-    roomId: String(row.room_id),
-    agentId: String(row.agent_id),
-    taskId: row.task_id ? String(row.task_id) : null,
-    goalId: row.goal_id ? String(row.goal_id) : null,
-    sessionId: row.session_id ? String(row.session_id) : null,
-    status: String(row.status) as AgentRunSummary["status"],
-    providerId: row.provider_id ? String(row.provider_id) : null,
-    model: row.model ? String(row.model) : null,
-    workspacePath: row.workspace_path ? String(row.workspace_path) : null,
-    mergeStatus: merge?.status ? merge.status as AgentRunSummary["mergeStatus"] : "none",
-    mergeSummary: merge?.summary ?? null,
-    startedAt: String(row.started_at),
-    finishedAt: row.finished_at ? String(row.finished_at) : null,
-    exitCode: row.exit_code === null || row.exit_code === undefined ? null : Number(row.exit_code),
-  };
 }
 
 function mentionedRoomAgents(content: string, agents: AgentSummary[]) {
@@ -11339,284 +4202,6 @@ function createAgentGroupFromCircle(circle: AgentCircleSummary, now = new Date()
   return agentGroupFromRow(db.prepare("select * from agent_groups where id = ?").get(groupId) as Record<string, unknown>);
 }
 
-function listAgentRoles(limit = 50, cursorValue?: string | null) {
-  const cursor = decodePageCursor(cursorValue);
-  const rows = db.prepare(`
-    select * from agent_roles
-    ${cursor ? "where (updated_at < @cursorSort or (updated_at = @cursorSort and id < @cursorId))" : ""}
-    order by updated_at desc, id desc
-    limit @limit
-  `).all({ cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
-  return pageFromRows(rows.map(agentRoleFromRow), limit, (item) => item.updatedAt);
-}
-
-function listAgents(limit = 50, cursorValue?: string | null) {
-  const cursor = decodePageCursor(cursorValue);
-  const rows = db.prepare(`
-    select * from agents
-    ${cursor ? "where (updated_at < @cursorSort or (updated_at = @cursorSort and id < @cursorId))" : ""}
-    order by updated_at desc, id desc
-    limit @limit
-  `).all({ cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
-  return pageFromRows(rows.map(agentFromRow), limit, (item) => item.updatedAt);
-}
-
-function listAgentGroups(limit = 50, cursorValue?: string | null) {
-  const cursor = decodePageCursor(cursorValue);
-  const rows = db.prepare(`
-    select * from agent_groups
-    ${cursor ? "where (updated_at < @cursorSort or (updated_at = @cursorSort and id < @cursorId))" : ""}
-    order by updated_at desc, id desc
-    limit @limit
-  `).all({ cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
-  return pageFromRows(rows.map(agentGroupFromRow), limit, (item) => item.updatedAt);
-}
-
-function listAgentCircles(limit = 50, cursorValue?: string | null) {
-  const offset = decodeOffsetCursor(cursorValue);
-  const rows = db.prepare(`
-    select * from agent_circles
-    order by builtin desc, name asc, id desc
-    limit @limit offset @offset
-  `).all({ limit: limit + 1, offset }) as Array<Record<string, unknown>>;
-  return offsetPageFromRows(rows.map(agentCircleFromRow), limit, offset);
-}
-
-function listRooms(status?: string, limit = 50, cursorValue?: string | null) {
-  const cursor = decodePageCursor(cursorValue);
-  const where = [
-    ...(status ? ["status = @status"] : []),
-    ...(cursor ? ["(updated_at < @cursorSort or (updated_at = @cursorSort and id < @cursorId))"] : []),
-  ];
-  const rows = db.prepare(`
-    select * from rooms
-    ${where.length ? `where ${where.join(" and ")}` : ""}
-    order by updated_at desc, id desc
-    limit @limit
-  `).all({ status, cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
-  return pageFromRows(rows.map(roomFromRow), limit, (item) => item.updatedAt);
-}
-
-function createPipeTerminalAdapter(cwd: string, shellPath: string, warning: string | null) {
-  const child = spawnProcess(shellPath, ["-i"], { cwd, env: managedChildEnv() });
-  return {
-    mode: "pipe" as const,
-    warning,
-    adapter: {
-      write: (data: string) => child.stdin?.write(data.replaceAll("\r", "\n")),
-      resize: () => undefined,
-      kill: () => child.kill(),
-      onData: (callback: (value: string) => void) => {
-        child.stdout?.on("data", (chunk: Buffer) => callback(chunk.toString("utf8")));
-        child.stderr?.on("data", (chunk: Buffer) => callback(chunk.toString("utf8")));
-      },
-      onExit: (callback: (exitCode: number | null) => void) => {
-        child.on("error", () => callback(1));
-        child.on("close", (exitCode) => callback(exitCode));
-      },
-    },
-  };
-}
-
-function createScriptTerminalAdapter(cwd: string, shellPath: string) {
-  const child = spawnProcess("script", ["-q", "/dev/null", shellPath, "-l"], { cwd, env: managedChildEnv() });
-  return {
-    mode: "pty" as const,
-    warning: null,
-    adapter: {
-      write: (data: string) => child.stdin?.write(data),
-      resize: (cols: number, rows: number) => {
-        child.stdin?.write(`stty rows ${rows} cols ${cols}\n`);
-      },
-      kill: () => child.kill(),
-      onData: (callback: (value: string) => void) => {
-        child.stdout?.on("data", (chunk: Buffer) => callback(chunk.toString("utf8")));
-        child.stderr?.on("data", (chunk: Buffer) => callback(chunk.toString("utf8")));
-      },
-      onExit: (callback: (exitCode: number | null) => void) => {
-        child.on("error", () => callback(1));
-        child.on("close", (exitCode) => callback(exitCode));
-      },
-    },
-  };
-}
-
-function createTerminalAdapter(cwd: string): { adapter: TerminalAdapter; mode: "pty" | "pipe"; warning: string | null } {
-  const shellPath = resolveShellPath();
-  try {
-    const shell = spawnPty(shellPath, ["-l"], { name: "xterm-256color", cols: 100, rows: 30, cwd, env: managedChildEnv() });
-    return {
-      mode: "pty",
-      warning: null,
-      adapter: {
-        write: (data) => shell.write(data),
-        resize: (cols, rows) => shell.resize(cols, rows),
-        kill: () => shell.kill(),
-        onData: (callback) => shell.onData(callback),
-        onExit: (callback) => shell.onExit(({ exitCode }) => callback(exitCode)),
-      },
-    };
-  } catch (error) {
-    try {
-      return createScriptTerminalAdapter(cwd, shellPath);
-    } catch (scriptError) {
-      return createPipeTerminalAdapter(
-        cwd,
-        shellPath,
-        error instanceof Error
-          ? `PTY fallback: ${error.message}${scriptError instanceof Error ? `; script fallback failed: ${scriptError.message}` : ""}`
-          : "PTY fallback active",
-      );
-    }
-  }
-}
-
-function resolveShellPath() {
-  const candidates = [
-    process.env.SHELL,
-    "/bin/zsh",
-    "/usr/bin/zsh",
-    "/bin/bash",
-    "/usr/bin/bash",
-    "/bin/sh",
-    "/usr/bin/sh",
-  ].filter(Boolean) as string[];
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) return candidate;
-  }
-  throw new Error("shell_not_found");
-}
-
-function terminalSummary(session: TerminalRuntime): TerminalSessionSummary {
-  return {
-    id: session.id,
-    name: session.name,
-    cwd: session.cwd,
-    mode: session.mode,
-    status: session.status,
-    createdAt: session.createdAt,
-  };
-}
-
-function uniqueTerminalSessionName(preferredName?: string) {
-  const existingNames = new Set(listTerminalSessionSummaries().map((session) => session.name));
-  const preferred = preferredName?.trim();
-  if (preferred && !existingNames.has(preferred)) return preferred;
-  if (!preferred || /^shell(?: \d+)?$/.test(preferred)) {
-    let shellIndex = 1;
-    while (existingNames.has(`shell ${shellIndex}`)) shellIndex += 1;
-    return `shell ${shellIndex}`;
-  }
-  const baseName = preferred;
-  let index = 2;
-  while (existingNames.has(`${baseName} ${index}`)) index += 1;
-  return `${baseName} ${index}`;
-}
-
-function createTerminalSession(input: CreateTerminalSessionInput = {}) {
-  const absoluteCwd = resolveTerminalCwd(input.cwd);
-  if (!statSync(absoluteCwd).isDirectory()) throw new Error("cwd_not_directory");
-  const { adapter, mode, warning } = createTerminalAdapter(absoluteCwd);
-  const session: TerminalRuntime = {
-    id: randomUUID(),
-    name: uniqueTerminalSessionName(input.name),
-    cwd: toTerminalPath(absoluteCwd),
-    absoluteCwd,
-    mode,
-    status: "running",
-    createdAt: new Date().toISOString(),
-    adapter,
-    buffer: "",
-    clients: new Set(),
-    ephemeral: Boolean(input.ephemeral),
-  };
-  terminalSessions.set(session.id, session);
-  if (!session.ephemeral) upsertTerminalSession(terminalSummary(session));
-  const append = (data: string) => {
-    session.buffer = (session.buffer + data).slice(-120 * 1024);
-    for (const client of session.clients) {
-      if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: "output", data }));
-    }
-  };
-  if (warning) append(`[warning: ${warning}]\r\n`);
-  adapter.onData(append);
-  adapter.onExit((exitCode) => {
-    session.status = "closed";
-    if (!session.ephemeral && !deletedTerminalSessionIds.has(session.id)) upsertTerminalSession(terminalSummary(session));
-    for (const client of session.clients) {
-      if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: "exit", exitCode }));
-    }
-    terminalSessions.delete(session.id);
-  });
-  return session;
-}
-
-function taskLogPath(sessionId: string) {
-  return join(sessionLogsPath(sessionId), "codex.log");
-}
-
-function taskMetaPath(sessionId: string) {
-  return join(sessionLogsPath(sessionId), "codex.json");
-}
-
-function legacyTaskLogPath(sessionId: string) {
-  return join(taskLogDir, `${sessionId}.log`);
-}
-
-function legacyTaskMetaPath(sessionId: string) {
-  return join(taskLogDir, `${sessionId}.json`);
-}
-
-function readTaskLogContent(sessionId: string) {
-  const path = taskLogPath(sessionId);
-  if (existsSync(path)) return readFileSync(path, "utf8");
-  const legacyPath = legacyTaskLogPath(sessionId);
-  return existsSync(legacyPath) ? readFileSync(legacyPath, "utf8") : "";
-}
-
-function roomAgentRunLogSources(session: SessionSummary) {
-  if (session.conversationType !== "room" || !session.roomId) return [];
-  return db.prepare(`
-    select agent_runs.id, agent_runs.session_id, agents.name as agent_name, room_tasks.title as task_title, agent_runs.started_at
-    from agent_runs
-    left join agents on agents.id = agent_runs.agent_id
-    left join room_tasks on room_tasks.id = agent_runs.task_id
-    where agent_runs.room_id = ? and agent_runs.session_id is not null
-    order by agent_runs.started_at desc, agent_runs.id desc
-    limit 20
-  `).all(session.roomId) as Array<{ id: string; session_id?: string | null; agent_name?: string | null; task_title?: string | null; started_at?: string | null }>;
-}
-
-function readRoomTaskLogContent(session: SessionSummary, maxBytes: number) {
-  const sections: string[] = [];
-  const parent = readTaskLogContent(session.id).trim();
-  if (parent) sections.push(["===== Room Session =====", parent].join("\n"));
-  const sources = roomAgentRunLogSources(session);
-  for (const row of sources.reverse()) {
-    const childSessionId = row.session_id ? String(row.session_id) : "";
-    if (!childSessionId) continue;
-    const content = readTaskLogContent(childSessionId);
-    if (!content.trim()) continue;
-    const header = [
-      `===== ${row.agent_name || "Agent"} / ${row.task_title || row.id} =====`,
-      `run: ${row.id}`,
-      `session: ${childSessionId}`,
-      row.started_at ? `started: ${row.started_at}` : "",
-    ].filter(Boolean).join("\n");
-    const budget = Math.max(4000, Math.floor(maxBytes / Math.max(1, sources.length)));
-    sections.push(`${header}\n${content.length > budget ? content.slice(content.length - budget) : content}`);
-  }
-  const log = sections.join("\n\n");
-  return log.length > maxBytes ? log.slice(log.length - maxBytes) : log;
-}
-
-function appendCodexOutput(sessionId: string, value: string) {
-  const item = codexTaskOutputs.get(sessionId);
-  if (item) item.output = (item.output + value).slice(-256 * 1024);
-  mkdirSync(sessionLogsPath(sessionId), { recursive: true });
-  appendFileSync(taskLogPath(sessionId), value, "utf8");
-}
-
 function processCodexLogChunk(session: SessionSummary, value: string) {
   const item = codexTaskOutputs.get(session.id);
   if (item) item.output = (item.output + value).slice(-256 * 1024);
@@ -11646,66 +4231,6 @@ function processCodexLogChunk(session: SessionSummary, value: string) {
 function appendCodexErrorOutput(session: SessionSummary, value: string) {
   appendCodexOutput(session.id, value);
   processCodexLogChunk(session, value);
-}
-
-function readTaskExitCode(sessionId: string) {
-  const path = taskMetaPath(sessionId);
-  const metaPath = existsSync(path) ? path : legacyTaskMetaPath(sessionId);
-  if (!existsSync(metaPath)) return null;
-  try {
-    const parsed = JSON.parse(readFileSync(metaPath, "utf8")) as { exitCode?: number | null };
-    return typeof parsed.exitCode === "number" ? parsed.exitCode : null;
-  } catch {
-    return null;
-  }
-}
-
-function readTaskMeta(sessionId: string) {
-  const path = taskMetaPath(sessionId);
-  const metaPath = existsSync(path) ? path : legacyTaskMetaPath(sessionId);
-  if (!existsSync(metaPath)) return null;
-  try {
-    return JSON.parse(readFileSync(metaPath, "utf8")) as { exitCode?: number | null; running?: boolean; error?: string | null; runnerPid?: number | null; childPid?: number | null };
-  } catch {
-    return null;
-  }
-}
-
-function writeTaskExitCode(sessionId: string, exitCode: number | null) {
-  mkdirSync(sessionLogsPath(sessionId), { recursive: true });
-  const previous = readTaskMeta(sessionId) ?? {};
-  writeFileSync(taskMetaPath(sessionId), JSON.stringify({ ...previous, running: false, exitCode, updatedAt: new Date().toISOString() }, null, 2), "utf8");
-}
-
-function taskRunFromRow(row: Record<string, unknown>): TaskRunSummary {
-  return {
-    id: String(row.id),
-    sessionId: String(row.session_id),
-    status: String(row.status) as TaskRunSummary["status"],
-    pid: row.pid === null || row.pid === undefined ? null : Number(row.pid),
-    startedAt: String(row.started_at),
-    endedAt: row.ended_at ? String(row.ended_at) : null,
-    exitCode: row.exit_code === null || row.exit_code === undefined ? null : Number(row.exit_code),
-    stopRequested: Boolean(row.stop_requested),
-    interruptedReason: row.interrupted_reason ? String(row.interrupted_reason) : null,
-    promptChars: row.prompt_chars === null || row.prompt_chars === undefined ? null : Number(row.prompt_chars),
-    promptHash: row.prompt_hash ? String(row.prompt_hash) : null,
-    contextPath: row.context_path ? String(row.context_path) : null,
-  };
-}
-
-function taskActivityFromRow(row: Record<string, unknown>): TaskActivitySummary {
-  return {
-    id: String(row.id),
-    sessionId: String(row.session_id),
-    activityId: row.activity_id ? String(row.activity_id) : null,
-    kind: String(row.kind) as TaskActivitySummary["kind"],
-    label: String(row.label),
-    detail: row.detail ? String(row.detail) : null,
-    status: row.status ? String(row.status) : null,
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
 }
 
 function insertTaskActivity(sessionId: string, activity: Extract<TaskEvent, { type: "activity" }>, now: string, activityId = activity.id ?? null) {
@@ -11826,20 +4351,6 @@ function backfillRoomActivitiesFromAgentLogs(session: SessionSummary) {
   }
 }
 
-function createTaskRun(sessionId: string, pid?: number, metadata?: { promptChars?: number; promptHash?: string; contextPath?: string }) {
-  const id = `task-run-${randomUUID()}`;
-  db.prepare(`
-    insert into task_runs (id, session_id, status, pid, started_at, stop_requested, prompt_chars, prompt_hash, context_path)
-    values (?, ?, 'running', ?, ?, 0, ?, ?, ?)
-  `).run(id, sessionId, pid ?? null, new Date().toISOString(), metadata?.promptChars ?? null, metadata?.promptHash ?? null, metadata?.contextPath ?? null);
-  return id;
-}
-
-function updateTaskRunPid(runId: string, pid?: number | null) {
-  if (!pid || !Number.isFinite(pid) || pid <= 0) return;
-  db.prepare("update task_runs set pid = ? where id = ? and status = 'running'").run(pid, runId);
-}
-
 function isProcessAlive(pid?: number | null) {
   if (!pid || !Number.isFinite(pid) || pid <= 0) return false;
   try {
@@ -11848,122 +4359,6 @@ function isProcessAlive(pid?: number | null) {
   } catch {
     return false;
   }
-}
-
-function latestRunningTaskRun(sessionId: string) {
-  return db.prepare(`
-    select * from task_runs
-    where session_id = ? and status = 'running'
-    order by started_at desc, id desc
-    limit 1
-  `).get(sessionId) as Record<string, unknown> | undefined;
-}
-
-function finishTaskRun(sessionId: string, status: TaskRunSummary["status"], exitCode: number | null, reason?: string) {
-  db.prepare(`
-    update task_runs
-    set status = ?, ended_at = ?, exit_code = ?, interrupted_reason = coalesce(?, interrupted_reason)
-    where session_id = ? and status = 'running'
-  `).run(status, new Date().toISOString(), exitCode, reason ?? null, sessionId);
-}
-
-function finishTaskRunById(runId: string, status: TaskRunSummary["status"], exitCode: number | null, reason?: string) {
-  db.prepare(`
-    update task_runs
-    set status = ?, ended_at = ?, exit_code = ?, interrupted_reason = coalesce(?, interrupted_reason)
-    where id = ?
-  `).run(status, new Date().toISOString(), exitCode, reason ?? null, runId);
-}
-
-function markTaskRunStopRequested(sessionId: string) {
-  db.prepare("update task_runs set stop_requested = 1 where session_id = ? and status = 'running'").run(sessionId);
-}
-
-function listTaskRuns(status?: string, limit = 50, cursorValue?: string | null) {
-  const cursor = decodePageCursor(cursorValue);
-  const where = [
-    ...(status ? ["status = @status"] : []),
-    ...(cursor ? ["(started_at < @cursorSort or (started_at = @cursorSort and id < @cursorId))"] : []),
-  ];
-  const rows = db.prepare(`
-    select * from task_runs
-    ${where.length ? `where ${where.join(" and ")}` : ""}
-    order by started_at desc, id desc
-    limit @limit
-  `).all({ status, cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 });
-  return pageFromRows((rows as Array<Record<string, unknown>>).map(taskRunFromRow), limit, (item) => item.startedAt);
-}
-
-function listTaskRunsForSession(sessionId: string, limit = 30, cursorValue?: string | null) {
-  const session = appData.sessions.find((item) => item.id === sessionId);
-  const cursor = decodePageCursor(cursorValue);
-  if (session?.conversationType === "room" && session.roomId) {
-    const rows = db.prepare(`
-      select task_runs.*
-      from task_runs
-      inner join agent_runs on agent_runs.session_id = task_runs.session_id
-      where agent_runs.room_id = @roomId
-        ${cursor ? "and (task_runs.started_at < @cursorSort or (task_runs.started_at = @cursorSort and task_runs.id < @cursorId))" : ""}
-      order by task_runs.started_at desc, task_runs.id desc
-      limit @limit
-    `).all({ roomId: session.roomId, cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
-    return pageFromRows(rows.map(taskRunFromRow), limit, (item) => item.startedAt);
-  }
-  const rows = db.prepare(`
-    select * from task_runs
-    where session_id = @sessionId
-      ${cursor ? "and (started_at < @cursorSort or (started_at = @cursorSort and id < @cursorId))" : ""}
-    order by started_at desc, id desc
-    limit @limit
-  `).all({ sessionId, cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
-  return pageFromRows(rows.map(taskRunFromRow), limit, (item) => item.startedAt);
-}
-
-function taskLogBytes(sessionId: string) {
-  const path = taskLogPath(sessionId);
-  if (existsSync(path)) return statSync(path).size;
-  const legacyPath = legacyTaskLogPath(sessionId);
-  return existsSync(legacyPath) ? statSync(legacyPath).size : 0;
-}
-
-function listTaskHealth(): TaskHealthResponse {
-  const rows = db.prepare(`
-    select *
-    from task_runs
-    where status = 'running'
-    order by started_at desc, id desc
-    limit 100
-  `).all() as Array<Record<string, unknown>>;
-  const items = rows.map((row) => {
-    const run = taskRunFromRow(row);
-    const session = appData.sessions.find((item) => item.id === run.sessionId);
-    const meta = readTaskMeta(run.sessionId);
-    const pidAlive = isProcessAlive(run.pid);
-    const childPid = typeof meta?.childPid === "number" ? meta.childPid : null;
-    const childPidAlive = childPid ? isProcessAlive(childPid) : null;
-    let issue: string | null = null;
-    if (!session) issue = "session_missing";
-    else if (session.status !== "running") issue = "session_not_running";
-    else if (meta?.running === false) issue = "runner_finished";
-    else if (!pidAlive) issue = "runner_pid_missing";
-    return {
-      sessionId: run.sessionId,
-      title: session?.title ?? run.sessionId,
-      sessionStatus: session?.status ?? "interrupted",
-      runId: run.id,
-      runStatus: run.status,
-      pid: run.pid,
-      pidAlive,
-      runnerRunning: typeof meta?.running === "boolean" ? meta.running : null,
-      runnerExitCode: typeof meta?.exitCode === "number" ? meta.exitCode : null,
-      childPid,
-      childPidAlive,
-      logBytes: taskLogBytes(run.sessionId),
-      updatedAt: session?.updatedAt ?? run.startedAt,
-      issue,
-    };
-  });
-  return { ok: items.every((item) => !item.issue), checkedAt: new Date().toISOString(), items };
 }
 
 function repairTaskHealth(): TaskHealthRepairResponse {
@@ -12076,128 +4471,6 @@ function stringifyReadable(value: unknown): string {
     if (typeof record.message === "string") return record.message.trim();
   }
   return "";
-}
-
-function readAssistantText(line: string) {
-  try {
-    const event = JSON.parse(line) as Record<string, unknown>;
-    const item = event.item;
-    if (item && typeof item === "object") {
-      const record = item as Record<string, unknown>;
-      if (record.type === "agent_message") {
-        return stringifyReadable(record.text ?? record.content ?? record.message);
-      }
-    }
-    if (event.type === "agent_message") {
-      return stringifyReadable(event.text ?? event.content ?? event.message);
-    }
-  } catch {
-    return "";
-  }
-  return "";
-}
-
-function readTextField(record: Record<string, unknown>, keys: string[]) {
-  for (const key of keys) {
-    const value = record[key];
-    if (typeof value === "string" && value.trim()) return value.trim();
-  }
-  return "";
-}
-
-function shortenActivityDetail(value: string) {
-  return value.length > 180 ? `${value.slice(0, 177)}...` : value;
-}
-
-function readActivityId(item: Record<string, unknown>, event: Record<string, unknown>) {
-  return readTextField(item, ["id", "call_id"]) || readTextField(event, ["id", "item_id"]);
-}
-
-function readActivityStatus(item: Record<string, unknown>, event: Record<string, unknown>) {
-  const explicitStatus = readTextField(item, ["status"]) || readTextField(event, ["status"]);
-  if (explicitStatus) return explicitStatus;
-  const eventType = String(event.type ?? "");
-  if (eventType.endsWith(".started")) return "in_progress";
-  if (eventType.endsWith(".completed")) return "completed";
-  return "";
-}
-
-function activityLabel(kind: "command" | "file" | "tool", status: string) {
-  const done = status === "completed";
-  const failed = status === "failed";
-  if (kind === "command") return failed ? "命令运行失败" : done ? "运行命令完成" : "正在运行命令";
-  if (kind === "file") return failed ? "文件操作失败" : done ? "文件操作完成" : "正在编辑文件";
-  return failed ? "工具调用失败" : done ? "工具调用完成" : "正在调用工具";
-}
-
-function readFileActivityPath(item: Record<string, unknown>) {
-  const direct = readTextField(item, ["path", "file", "file_path", "filename", "target_file"]);
-  if (direct) return direct;
-  const changes = item.changes;
-  if (!Array.isArray(changes)) return "";
-  const first = changes.find((change) => change && typeof change === "object") as Record<string, unknown> | undefined;
-  return first ? readTextField(first, ["path", "file", "file_path", "filename", "target_file"]) : "";
-}
-
-function readActivityEvent(line: string): TaskEvent | null {
-  let event: Record<string, unknown>;
-  try {
-    event = JSON.parse(line) as Record<string, unknown>;
-  } catch {
-    if (line.includes("patch rejected") || line.includes("writing is blocked")) {
-      return {
-        type: "activity",
-        kind: "file",
-        label: "文件写入被沙箱拦截",
-        detail: shortenActivityDetail(line),
-        status: "failed",
-        at: new Date().toISOString(),
-      };
-    }
-    return null;
-  }
-  const item = event.item && typeof event.item === "object" ? event.item as Record<string, unknown> : event;
-  const itemType = String(item.type ?? event.type ?? "");
-  const status = readActivityStatus(item, event);
-  const id = readActivityId(item, event);
-  if (itemType === "command_execution") {
-    const command = readTextField(item, ["command"]);
-    if (!command) return null;
-    return {
-      type: "activity",
-      id,
-      kind: "command",
-      label: activityLabel("command", status),
-      detail: shortenActivityDetail(command),
-      status,
-      at: new Date().toISOString(),
-    };
-  }
-  const filePath = readFileActivityPath(item);
-  if (filePath || ["file_change", "file_operation", "apply_patch", "patch"].includes(itemType)) {
-    return {
-      type: "activity",
-      id,
-      kind: "file",
-      label: activityLabel("file", status),
-      detail: shortenActivityDetail(filePath || itemType),
-      status,
-      at: new Date().toISOString(),
-    };
-  }
-  const toolName = readTextField(item, ["tool", "name", "tool_name"]);
-  if (toolName || itemType.includes("tool")) {
-    return {
-      type: "activity",
-      id,
-      kind: "tool",
-      label: activityLabel("tool", status),
-      detail: shortenActivityDetail(toolName || itemType),
-      status,
-      at: new Date().toISOString(),
-    };
-  }
-  return null;
 }
 
 function parseAssistantArtifactBlocks(text: string) {
@@ -13061,322 +5334,6 @@ function startCodexTask(
   });
 }
 
-function runGitCommand(cwd: string, args: string[]) {
-  return new Promise<{ stdout: string; stderr: string; exitCode: number | null }>((resolveResult) => {
-    const child = spawnProcess("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    child.stdout?.on("data", (chunk: Buffer) => {
-      stdout = (stdout + chunk.toString("utf8")).slice(-120 * 1024);
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      stderr = (stderr + chunk.toString("utf8")).slice(-32 * 1024);
-    });
-    child.on("error", (error) => resolveResult({ stdout, stderr: error.message, exitCode: null }));
-    child.on("close", (exitCode) => resolveResult({ stdout, stderr, exitCode }));
-  });
-}
-
-function hasGitCommand() {
-  const result = spawnSync("git", ["--version"], { encoding: "utf8" });
-  return !result.error && result.status === 0;
-}
-
-function ensureGitRepositorySync(workspacePath: string) {
-  if (!hasGitCommand()) return;
-  try {
-    const cwd = resolveTerminalCwd(workspacePath);
-    if (!existsSync(cwd) || !lstatSync(cwd).isDirectory()) return;
-    const probe = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8" });
-    if (probe.status === 0 && resolve(probe.stdout.trim()) === cwd) return;
-    spawnSync("git", ["init"], { cwd, encoding: "utf8" });
-  } catch {
-    return;
-  }
-}
-
-async function ensureGitRepositoryForProject(workspacePath: string) {
-  if (!hasGitCommand()) return;
-  let cwd = "";
-  try {
-    cwd = resolveTerminalCwd(workspacePath);
-    if (!existsSync(cwd) || !lstatSync(cwd).isDirectory()) return;
-  } catch {
-    return;
-  }
-  const probe = await runGitCommand(cwd, ["rev-parse", "--show-toplevel"]);
-  if (probe.exitCode === 0 && resolve(probe.stdout.trim()) === cwd) return;
-  await runGitCommand(cwd, ["init"]);
-}
-
-async function refreshProjectGitStatus(project: ProjectSummary) {
-  try {
-    const cwd = resolveTerminalCwd(project.workspacePath);
-      const status = await runGitCommand(cwd, ["status", "--short", "--", "."]);
-    if (status.exitCode !== 0) {
-      project.changedFiles = 0;
-      project.stagedFiles = 0;
-      project.modifiedFiles = 0;
-      project.untrackedFiles = 0;
-      project.gitStatus = "not-git";
-      project.gitBranch = undefined;
-      project.gitRemoteStatus = undefined;
-    } else {
-      const branch = await runGitCommand(cwd, ["branch", "--show-current"]);
-      const statusBranch = await runGitCommand(cwd, ["status", "-sb"]);
-      const lines = status.stdout.split(/\r?\n/).filter((line) => line.trim());
-      project.changedFiles = lines.length;
-      project.stagedFiles = lines.filter((line) => line[0] && line[0] !== " " && line[0] !== "?").length;
-      project.modifiedFiles = lines.filter((line) => line[1] && line[1] !== " ").length;
-      project.untrackedFiles = lines.filter((line) => line.startsWith("??")).length;
-      project.gitStatus = project.changedFiles > 0 ? "dirty" : "clean";
-      project.gitBranch = branch.stdout.trim() || "detached";
-      project.gitRemoteStatus = readGitRemoteStatus(statusBranch.stdout);
-    }
-    upsertProject(project);
-  } catch {
-    project.changedFiles = 0;
-    project.stagedFiles = 0;
-    project.modifiedFiles = 0;
-    project.untrackedFiles = 0;
-    project.gitStatus = "error";
-  }
-  return project;
-}
-
-function readGitRemoteStatus(statusBranch: string) {
-  const firstLine = statusBranch.split(/\r?\n/)[0] ?? "";
-  const remotePart = firstLine.replace(/^##\s*/, "").split("...")[1];
-  if (!remotePart) return "no upstream";
-  const match = remotePart.match(/^([^\s]+)(?:\s+\[(.+)\])?$/);
-  if (!match) return remotePart;
-  return match[2] ? `${match[1]} · ${match[2]}` : match[1];
-}
-
-function parseShortStatusLine(line: string) {
-  const status = line.slice(0, 2).trim() || line.slice(0, 2);
-  const rawPath = line.slice(3).trim();
-  const renamedPath = rawPath.includes(" -> ") ? rawPath.split(" -> ").at(-1) ?? rawPath : rawPath;
-  return { status, path: renamedPath.replace(/^"|"$/g, "") };
-}
-
-function parseNumstat(stat: string) {
-  const items = new Map<string, { additions: number; deletions: number; binary: boolean }>();
-  for (const line of stat.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    const [added, deleted, rawPath] = line.split(/\t/);
-    if (!rawPath) continue;
-    const binary = added === "-" || deleted === "-";
-    const previous = items.get(rawPath) ?? { additions: 0, deletions: 0, binary: false };
-    items.set(rawPath, {
-      additions: previous.additions + (binary ? 0 : Number(added) || 0),
-      deletions: previous.deletions + (binary ? 0 : Number(deleted) || 0),
-      binary: previous.binary || binary,
-    });
-  }
-  return items;
-}
-
-async function readTextFileIfSmall(cwd: string, filePath: string) {
-  const absolutePath = resolve(cwd, filePath);
-  const relativePath = relative(cwd, absolutePath);
-  if (relativePath.startsWith("..") || resolve(relativePath) === relativePath) return { binary: false, content: "" };
-  try {
-    const stat = statSync(absolutePath);
-    if (!stat.isFile() || stat.size > 512 * 1024) return { binary: stat.isFile(), content: "" };
-    const content = readFileSync(absolutePath, "utf8");
-    if (content.includes("\u0000")) return { binary: true, content: "" };
-    return { binary: false, content };
-  } catch {
-    return { binary: false, content: "" };
-  }
-}
-
-async function collectWorkspaceChangesForCwd(cwd: string): Promise<WorkspaceChanges> {
-  const repo = await runGitCommand(cwd, ["rev-parse", "--show-toplevel"]);
-  if (repo.exitCode !== 0) {
-    return {
-      ok: false,
-      cwd,
-      isGitRepo: false,
-      summary: { filesChanged: 0, additions: 0, deletions: 0 },
-      files: [],
-      raw: { status: "", stat: "", diff: "" },
-      error: repo.stderr || "not_a_git_repository",
-    };
-  }
-  const status = await runGitCommand(cwd, ["status", "--short", "--", "."]);
-  const numstat = await runGitCommand(cwd, ["diff", "--relative", "--numstat", "--", "."]);
-  const cachedNumstat = await runGitCommand(cwd, ["diff", "--relative", "--cached", "--numstat", "--", "."]);
-  const diff = await runGitCommand(cwd, ["diff", "--", "."]);
-  const cachedDiff = await runGitCommand(cwd, ["diff", "--cached", "--", "."]);
-  const untracked = await runGitCommand(cwd, ["ls-files", "--others", "--exclude-standard", "--", "."]);
-  const stats = parseNumstat(`${numstat.stdout}\n${cachedNumstat.stdout}`);
-  const statusItems = status.stdout.split(/\r?\n/).filter(Boolean).map(parseShortStatusLine);
-  for (const path of untracked.stdout.split(/\r?\n/).filter(Boolean)) {
-    if (!statusItems.some((item) => item.path === path)) statusItems.push({ status: "??", path });
-  }
-  const files: WorkspaceChangeFile[] = [];
-  for (const item of statusItems) {
-    let stat = stats.get(item.path) ?? { additions: 0, deletions: 0, binary: false };
-    let patch = "";
-    let newContent: string | undefined;
-    let binary = stat.binary;
-    if (item.status === "??") {
-      const file = await readTextFileIfSmall(cwd, item.path);
-      binary = file.binary;
-      newContent = file.content || undefined;
-      if (file.content) {
-        const lines = file.content.split(/\r?\n/);
-        stat = { additions: lines.length, deletions: 0, binary: false };
-        patch = [`--- /dev/null`, `+++ b/${item.path}`, `@@ -0,0 +1,${lines.length} @@`, ...lines.map((line) => `+${line}`)].join("\n");
-      }
-    } else {
-      const fileDiff = await runGitCommand(cwd, ["diff", "--", item.path]);
-      const cachedFileDiff = await runGitCommand(cwd, ["diff", "--cached", "--", item.path]);
-      patch = [cachedFileDiff.stdout, fileDiff.stdout].filter(Boolean).join("\n");
-    }
-    files.push({ path: item.path, status: item.status, additions: stat.additions, deletions: stat.deletions, patch, newContent, binary });
-  }
-  const summary = files.reduce(
-    (total, file) => ({
-      filesChanged: total.filesChanged + 1,
-      additions: total.additions + file.additions,
-      deletions: total.deletions + file.deletions,
-    }),
-    { filesChanged: 0, additions: 0, deletions: 0 },
-  );
-  return {
-    ok: status.exitCode === 0,
-    cwd,
-    isGitRepo: true,
-    summary,
-    files,
-    raw: { status: status.stdout, stat: `${numstat.stdout}\n${cachedNumstat.stdout}`.trim(), diff: [cachedDiff.stdout, diff.stdout].filter(Boolean).join("\n") },
-    error: status.exitCode === 0 ? undefined : status.stderr || "git_status_failed",
-  };
-}
-
-async function collectRoomWorkspaceChanges(session: SessionSummary): Promise<WorkspaceChanges> {
-  const parent = await collectWorkspaceChangesForCwd(resolveSessionCwd(session));
-  if (!session.roomId) return parent;
-  const parentCwd = resolve(parent.cwd);
-  const rows = db.prepare(`
-    select agent_runs.id, agent_runs.workspace_path, agents.name as agent_name
-    from agent_runs
-    left join agents on agents.id = agent_runs.agent_id
-    where agent_runs.room_id = ? and agent_runs.workspace_path is not null and agent_runs.workspace_path != ''
-    order by agent_runs.started_at desc, agent_runs.id desc
-    limit 20
-  `).all(session.roomId) as Array<{ id: string; workspace_path?: string | null; agent_name?: string | null }>;
-  const files: WorkspaceChangeFile[] = [...parent.files];
-  const rawStatus = [parent.raw.status].filter(Boolean);
-  const rawStat = [parent.raw.stat].filter(Boolean);
-  const rawDiff = [parent.raw.diff].filter(Boolean);
-  let sawGitRepo = parent.isGitRepo;
-  const seenWorkspaces = new Set([parentCwd]);
-  for (const row of rows) {
-    const cwd = row.workspace_path ? resolveTerminalCwd(String(row.workspace_path)) : "";
-    if (!cwd || seenWorkspaces.has(resolve(cwd)) || !existsSync(cwd)) continue;
-    seenWorkspaces.add(resolve(cwd));
-    const changes = await collectWorkspaceChangesForCwd(cwd);
-    sawGitRepo = sawGitRepo || changes.isGitRepo;
-    if (!changes.files.length) continue;
-    const label = row.agent_name ? String(row.agent_name) : String(row.id);
-    files.push(...changes.files.map((file) => ({
-      ...file,
-      path: `${label}/${file.path}`,
-      sourcePath: file.path,
-      sourceCwd: cwd,
-      sourceLabel: label,
-      sourceRunId: String(row.id),
-    })));
-    if (changes.raw.status) rawStatus.push(`# ${label} (${cwd})\n${changes.raw.status}`);
-    if (changes.raw.stat) rawStat.push(`# ${label} (${cwd})\n${changes.raw.stat}`);
-    if (changes.raw.diff) rawDiff.push(`# ${label} (${cwd})\n${changes.raw.diff}`);
-  }
-  const summary = files.reduce(
-    (total, file) => ({
-      filesChanged: total.filesChanged + 1,
-      additions: total.additions + file.additions,
-      deletions: total.deletions + file.deletions,
-    }),
-    { filesChanged: 0, additions: 0, deletions: 0 },
-  );
-  return {
-    ok: parent.ok || sawGitRepo,
-    cwd: parent.cwd,
-    isGitRepo: sawGitRepo,
-    summary,
-    files,
-    raw: { status: rawStatus.join("\n\n"), stat: rawStat.join("\n\n"), diff: rawDiff.join("\n\n") },
-    error: sawGitRepo ? undefined : parent.error,
-  };
-}
-
-async function collectWorkspaceChanges(session: SessionSummary): Promise<WorkspaceChanges> {
-  if (session.conversationType === "room") return collectRoomWorkspaceChanges(session);
-  return collectWorkspaceChangesForCwd(resolveSessionCwd(session));
-}
-
-function deleteProjectRecord(projectId: string, deleteFiles: boolean) {
-  const index = appData.projects.findIndex((item) => item.id === projectId);
-  if (index === -1) throw new Error("project_not_found");
-
-  const project = appData.projects[index];
-  if (deleteFiles) {
-    const absolutePath = resolveTerminalCwd(project.workspacePath);
-    const protectedPaths = new Set([resolve("/"), resolve(process.env.HOME ?? "/"), terminalRoot]);
-    if (protectedPaths.has(absolutePath)) throw new Error("refuse_delete_protected_path");
-    if (existsSync(absolutePath)) rmSync(absolutePath, { recursive: true, force: true });
-  } else {
-    writeProjectWorkspaceMetadata(project, new Date().toISOString());
-  }
-
-  const [removedProject] = appData.projects.splice(index, 1);
-  for (const session of appData.sessions) {
-    if (session.projectId !== removedProject.id) continue;
-    deletePreviewsForScope("session", session.id);
-    session.projectId = null;
-    session.kind = "scratch";
-    session.workspacePath = ensureScratchSessionWorkspace(session.id);
-    session.updatedAt = new Date().toISOString();
-    upsertSession(session);
-  }
-  deletePreviewsForScope("project", removedProject.id);
-  db.prepare("delete from project_check_runs where project_id = ?").run(removedProject.id);
-  db.prepare("delete from project_git_operations where project_id = ?").run(removedProject.id);
-  db.prepare("delete from projects where id = ?").run(removedProject.id);
-  return { ok: true, id: removedProject.id, deletedFiles: deleteFiles };
-}
-
-function assertWorkspaceChangePath(changes: WorkspaceChanges, filePath: string) {
-  const change = changes.files.find((item) => item.path === filePath);
-  if (!change) throw new Error("change_not_found");
-  const absolutePath = resolve(changes.cwd, filePath);
-  const relativePath = relative(changes.cwd, absolutePath);
-  if (relativePath.startsWith("..") || resolve(relativePath) === relativePath) throw new Error("path_outside_workspace");
-  return { change, absolutePath };
-}
-
-function resolveWorkspaceChangeActionCwd(session: SessionSummary, cwd?: string | null) {
-  if (!cwd) return resolveSessionCwd(session);
-  const resolved = resolveTerminalCwd(cwd);
-  if (session.conversationType !== "room" || !session.roomId) throw new Error("path_outside_workspace");
-  const row = db.prepare("select workspace_path from agent_runs where room_id = ? and workspace_path = ? limit 1").get(session.roomId, resolved) as { workspace_path?: string } | undefined;
-  if (!row) throw new Error("path_outside_workspace");
-  return resolved;
-}
-
-async function applyWorkspaceGitFileAction(cwd: string, filePath: string, action: "stage" | "unstage") {
-  const changes = await collectWorkspaceChangesForCwd(cwd);
-  assertWorkspaceChangePath(changes, filePath);
-  const args = action === "stage" ? ["add", "--", filePath] : ["restore", "--staged", "--", filePath];
-  const result = await runGitCommand(cwd, args);
-  if (result.exitCode !== 0) throw new Error(result.stderr || `git_${action}_failed`);
-  return collectWorkspaceChangesForCwd(cwd);
-}
-
 function handleTerminalWebSocketConnection(socket: WebSocket, request: IncomingMessage) {
   const url = new URL(request.url ?? "/", `ws://${host}:8788`);
   const token = url.searchParams.get("token");
@@ -13529,4955 +5486,36 @@ async function proxyPreviewHttpRequest(preview: PreviewRecord, upstreamPath: str
   });
 }
 
-app.post("/preview/:id/:token/access-requests", (c) => {
-  const preview = previews.get(c.req.param("id"));
-  if (!preview || c.req.param("token") !== preview.token) return c.json({ error: "preview_not_found" }, 404);
-  if (preview.access !== "private") return c.json({ error: "preview_is_public" }, 400);
-  const request = createPreviewAccessRequest(preview, new URL(c.req.url));
-  return c.json({ status: "pending", ...request }, 202);
-});
+registerServerRoutes(app, serverRouteDeps);
 
-app.get("/preview/:id/:token/access-requests/:requestId", (c) => {
-  expirePreviewAccessRequests();
-  const preview = previews.get(c.req.param("id"));
-  if (!preview || c.req.param("token") !== preview.token) return c.json({ error: "preview_not_found" }, 404);
-  const request = getPreviewAccessRequest(preview, c.req.param("requestId"), c.req.query("secret") ?? null);
-  if (!request) return c.json({ error: "access_request_not_found" }, 404);
-  if (request.status === "approved") {
-    const approvedUntil = request.approvedUntil ? new Date(request.approvedUntil).getTime() : Date.now() + 15 * 60 * 1000;
-    const ttlMs = Math.max(1, approvedUntil - Date.now());
-    c.header("set-cookie", previewAccessCookie(preview, ttlMs));
-  }
-  return c.json({ status: request.status, approvedUntil: request.approvedUntil ?? null, url: previewUrl(preview) });
-});
+registerApiAuthMiddleware(app, authRouteDeps);
 
-app.get("/preview/:id/:token/*", async (c) => {
-  const preview = previews.get(c.req.param("id"));
-  if (!preview || c.req.param("token") !== preview.token) return c.text("preview not found", 404);
-  const sourceUrl = new URL(c.req.url);
-  if (!requestHasPreviewAccess(preview, c.req.raw)) return privatePreviewAccessResponse(preview, sourceUrl);
-  const upstreamPath = previewUpstreamPathFromUrl(sourceUrl, preview);
-  return proxyPreviewHttpRequest(preview, upstreamPath, sourceUrl, c.req.raw);
-});
+registerProtectedAuthRoutes(app, authRouteDeps);
+registerSettingsRoutes(app, settingsRouteDeps);
 
-app.all("*", async (c, next) => {
-  const sourceUrl = new URL(c.req.url);
-  const path = sourceUrl.pathname;
-  if (path === "/health" || path.startsWith("/preview/")) return next();
-  const preview = previewFromReferer(c.req.header("referer"));
-  if (!preview) return next();
-  if (!requestHasPreviewAccess(preview, c.req.raw)) return c.req.method === "GET" || c.req.method === "HEAD"
-    ? privatePreviewAccessResponse(preview, sourceUrl)
-    : c.text("private preview requires Codex Web access", 401);
-  if (c.req.method !== "GET" && c.req.method !== "HEAD") {
-    return proxyPreviewHttpRequest(preview, path.replace(/^\/+/, ""), sourceUrl, c.req.raw);
-  }
-  return c.redirect(`${previewUrl(preview)}${path.replace(/^\/+/, "")}${sourceUrl.search}`, 307);
-});
+registerGoalRoutes(app, goalRouteDeps);
 
-app.get("/health", (c) => c.json({ ok: true }));
-app.get("/api/auth/state", (c) => {
-  const token = getBearerToken(c.req.header("authorization"));
-  if (token && verifySessionToken(token)) {
-    c.header("set-cookie", sessionCookie(token));
-    return c.json(authenticatedAuthState());
-  }
-  return c.json(anonymousState());
-});
-app.post("/provider-proxy/:providerId/:proxyToken/v1/responses", async (c) => {
-  const provider = appData.providers.find((item) => item.id === c.req.param("providerId"));
-  if (!provider) return c.json({ error: "provider_not_found" }, 404);
-  if (provider.kind !== "openai-compatible-chat" && !(provider.kind === "openai-responses" && provider.useProxy)) return c.json({ error: "provider_proxy_not_enabled" }, 400);
-  if (!verifyProviderProxyToken(provider, c.req.param("proxyToken"))) return c.json({ error: "unauthorized" }, 401);
-  const concurrent = getProviderProxyConcurrency(provider.id);
-  if (rateLimitSettings.enabled && concurrent >= rateLimitSettings.providerProxyMaxConcurrent) return c.json({ error: "provider_proxy_busy", retryAfter: 5 }, 429, { "retry-after": "5" });
-  const body = await c.req.json<Record<string, unknown>>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_responses_request" }, 400);
-  incrementProviderProxyConcurrency(provider.id);
-  try {
-    return await (provider.kind === "openai-compatible-chat"
-      ? proxyResponsesToChatCompletions(provider, body)
-      : proxyResponsesToResponses(provider, body));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "provider_proxy_failed" }, 502);
-  } finally {
-    decrementProviderProxyConcurrency(provider.id);
-  }
-});
-app.post("/api/auth/setup/start", (c) => {
-  if (authConfig) {
-    const response: SetupStartResponse = { setupRequired: false, otpSecret: null, otpauthUrl: null };
-    return c.json(response);
-  }
-  const response: SetupStartResponse = {
-    setupRequired: true,
-    otpSecret: pendingOtpSecret,
-    otpauthUrl: generateURI({ issuer: "Codex Web", label: "local-admin", secret: pendingOtpSecret, algorithm: "sha1", digits: 6, period: 30 }),
-  };
-  return c.json(response);
-});
-app.post("/api/auth/setup/complete", async (c) => {
-  if (authConfig) return c.json({ error: "already_configured" }, 409);
-  const body = await c.req.json<SetupCompleteRequest>().catch(() => null);
-  if (!body?.accessToken || !body.otp || !(await verifyOtp(pendingOtpSecret, body.otp))) {
-    return c.json({ error: "invalid_setup_token_or_otp" }, 401);
-  }
-  authConfig = { accessTokenHash: hashToken(body.accessToken), otpSecret: pendingOtpSecret };
-  saveAuthConfig(authConfig);
-  const sessionToken = signSessionToken();
-  c.header("set-cookie", sessionCookie(sessionToken));
-  const response: LoginResponse = { ok: true, sessionToken, auth: authenticatedAuthState() };
-  emitExternalNotification({
-    eventType: "auth_login",
-    severity: "success",
-    title: "Codex Web 登录成功",
-    message: "本地管理员完成首次设置并登录。",
-    sourceType: "auth",
-    sourceId: "local-admin",
-    metadata: { action: "setup_complete", userAgent: c.req.header("user-agent") ?? null, ip: c.req.header("x-forwarded-for") ?? null },
-  });
-  return c.json(response);
-});
-app.post("/api/auth/login", async (c) => {
-  if (!authConfig) {
-    const response: LoginResponse = { ok: false, sessionToken: null, auth: anonymousState(), error: "setup_required" };
-    return c.json(response, 409);
-  }
-  const body = await c.req.json<LoginRequest>().catch(() => null);
-  if (!body?.accessToken || !body.otp || hashToken(body.accessToken) !== authConfig.accessTokenHash || !(await verifyOtp(authConfig.otpSecret, body.otp))) {
-    const response: LoginResponse = { ok: false, sessionToken: null, auth: anonymousState(), error: "invalid_token_or_otp" };
-    return c.json(response, 401);
-  }
-  const sessionToken = signSessionToken();
-  c.header("set-cookie", sessionCookie(sessionToken));
-  const response: LoginResponse = { ok: true, sessionToken, auth: authenticatedAuthState() };
-  emitExternalNotification({
-    eventType: "auth_login",
-    severity: "success",
-    title: "Codex Web 登录成功",
-    message: "本地管理员已登录。",
-    sourceType: "auth",
-    sourceId: "local-admin",
-    metadata: { action: "login", userAgent: c.req.header("user-agent") ?? null, ip: c.req.header("x-forwarded-for") ?? null },
-  });
-  return c.json(response);
-});
+registerPreviewRoutes(app, previewRouteDeps);
 
-app.post("/api/auth/logout", (c) => {
-  c.header("set-cookie", clearSessionCookie());
-  return c.json({ ok: true });
-});
+registerTaskRoutes(app, taskRouteDeps);
 
-app.get("/api/codex/tasks/:id/events", (c) => {
-  const token = c.req.query("token") ?? getBearerToken(c.req.header("authorization"));
-  if (!verifySessionToken(token)) return c.text("unauthorized", 401);
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.text("task_not_found", 404);
-  const stream = new ReadableStream({
-    start(controller) {
-      const encoder = new TextEncoder();
-      const send = (event: TaskEvent | { type: "snapshot"; session: SessionSummary; messages: SessionMessage[]; queue: QueuedMessage[]; exitCode: number | null }) => {
-        controller.enqueue(encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
-      };
-      controller.enqueue(encoder.encode("retry: 5000\n\n"));
-      const output = readCodexOutput(session.id);
-      send({ type: "snapshot", session, messages: allSessionMessages(session.id), queue: listQueuedMessages(session.id), exitCode: output.exitCode });
-      const unsubscribe = subscribeTaskEvents(session.id, send);
-      const heartbeat = setInterval(() => {
-        try {
-          controller.enqueue(encoder.encode(`event: ping\ndata: {}\n\n`));
-        } catch {
-          clearInterval(heartbeat);
-          unsubscribe();
-        }
-      }, 15_000);
-      c.req.raw.signal.addEventListener("abort", () => {
-        clearInterval(heartbeat);
-        unsubscribe();
-        try {
-          controller.close();
-        } catch {
-          return;
-        }
-      });
-    },
-  });
-  return new Response(stream, {
-    headers: {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    },
-  });
-});
+registerProjectRoutes(app, projectRouteDeps);
 
-app.get("/api/previews/:id/logs/events", (c) => {
-  const token = c.req.query("token") ?? getBearerToken(c.req.header("authorization"));
-  if (!verifySessionToken(token)) return c.text("unauthorized", 401);
-  const preview = previews.get(c.req.param("id"));
-  if (!preview) return c.text("preview_not_found", 404);
-  const stream = new ReadableStream({
-    start(controller) {
-      const encoder = new TextEncoder();
-      const send = (event: PreviewLogEvent) => {
-        controller.enqueue(encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
-      };
-      controller.enqueue(encoder.encode("retry: 5000\n\n"));
-      send({ type: "snapshot", preview: publicPreview(preview), logs: previewLogs.get(preview.id) ?? "" });
-      const unsubscribe = subscribePreviewLogEvents(preview.id, send);
-      const heartbeat = setInterval(() => {
-        try {
-          controller.enqueue(encoder.encode("event: ping\ndata: {}\n\n"));
-        } catch {
-          clearInterval(heartbeat);
-          unsubscribe();
-        }
-      }, 15_000);
-      c.req.raw.signal.addEventListener("abort", () => {
-        clearInterval(heartbeat);
-        unsubscribe();
-        try {
-          controller.close();
-        } catch {
-          return;
-        }
-      });
-    },
-  });
-  return new Response(stream, {
-    headers: {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    },
-  });
-});
+registerAutomationRoutes(app, automationRouteDeps);
 
-app.get("/api/rooms/:id/events/stream", (c) => {
-  const token = c.req.query("token") ?? getBearerToken(c.req.header("authorization"));
-  if (!verifySessionToken(token)) return c.text("unauthorized", 401);
-  const roomId = c.req.param("id");
-  const snapshot = roomActivitySnapshot(roomId);
-  if (!snapshot) return c.text("room_not_found", 404);
-  const stream = new ReadableStream({
-    start(controller) {
-      const encoder = new TextEncoder();
-      const send = (event: RoomStreamEvent) => {
-        controller.enqueue(encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
-      };
-      controller.enqueue(encoder.encode("retry: 5000\n\n"));
-      send({ type: "snapshot", ...snapshot });
-      const unsubscribe = subscribeRoomEvents(roomId, send);
-      const heartbeat = setInterval(() => {
-        try {
-          send({ type: "ping" });
-        } catch {
-          clearInterval(heartbeat);
-          unsubscribe();
-        }
-      }, 15_000);
-      c.req.raw.signal.addEventListener("abort", () => {
-        clearInterval(heartbeat);
-        unsubscribe();
-        try {
-          controller.close();
-        } catch {
-          return;
-        }
-      });
-    },
-  });
-  return new Response(stream, {
-    headers: {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    },
-  });
-});
+registerAgentRoleRoutes(app, agentRouteDeps);
+registerAgentRoutes(app, agentRouteDeps);
+registerAgentGroupRoutes(app, agentRouteDeps);
+registerAgentCircleRoutes(app, agentRouteDeps);
+registerRoomRoutes(app, roomRouteDeps);
 
-app.get("/api/app-notifications/events", (c) => {
-  const token = c.req.query("token") ?? getBearerToken(c.req.header("authorization"));
-  if (!verifySessionToken(token)) return c.text("unauthorized", 401);
-  const stream = new ReadableStream({
-    start(controller) {
-      const encoder = new TextEncoder();
-      const send = (event: AppNotificationStreamEvent) => {
-        controller.enqueue(encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
-      };
-      controller.enqueue(encoder.encode("retry: 5000\n\n"));
-      send({ type: "snapshot", ...listAppNotifications(30) });
-      const unsubscribe = subscribeAppNotifications(send);
-      const heartbeat = setInterval(() => {
-        try {
-          controller.enqueue(encoder.encode("event: ping\ndata: {}\n\n"));
-        } catch {
-          clearInterval(heartbeat);
-          unsubscribe();
-        }
-      }, 15_000);
-      c.req.raw.signal.addEventListener("abort", () => {
-        clearInterval(heartbeat);
-        unsubscribe();
-        try {
-          controller.close();
-        } catch {
-          return;
-        }
-      });
-    },
-  });
-  return new Response(stream, {
-    headers: {
-      "content-type": "text/event-stream",
-      "cache-control": "no-cache",
-      connection: "keep-alive",
-    },
-  });
-});
+registerProviderRoutes(app, providerRouteDeps);
 
-app.use("/api/*", async (c, next) => {
-  const pathname = new URL(c.req.url).pathname;
-  if (pathname.startsWith("/api/webhook/")) return next();
-  const principal = resolveAuthPrincipalFromBearer(getBearerToken(c.req.header("authorization")));
-  if (!principal) return c.json({ error: "unauthorized" }, 401);
-  (c as unknown as { set: (name: string, value: AuthPrincipal) => void }).set("authPrincipal", principal);
-  if (principal.type === "api_key") {
-    const permission = routePermissionForRequest(c.req.method, pathname);
-    if (!permission || !hasApiKeyPermission(principal, permission)) return c.json({ error: "forbidden" }, 403);
-  }
-  return next();
-});
+registerExtensionRoutes(app, extensionRouteDeps);
 
-app.post("/api/auth/access-token", async (c) => {
-  requireSessionPrincipal(c);
-  if (!authConfig) return c.json({ error: "setup_required" }, 409);
-  const body = await c.req.json<UpdateAccessTokenRequest>().catch(() => null);
-  if (!body?.currentAccessToken?.trim() || !body.accessToken?.trim()) return c.json({ error: "access_token_required" }, 400);
-  if (hashToken(body.currentAccessToken) !== authConfig.accessTokenHash) return c.json({ error: "invalid_current_access_token" }, 401);
-  authConfig = { ...authConfig, accessTokenHash: hashToken(body.accessToken) };
-  saveAuthConfig(authConfig);
-  const sessionToken = signSessionToken();
-  c.header("set-cookie", sessionCookie(sessionToken));
-  const response: LoginResponse = { ok: true, sessionToken, auth: authenticatedAuthState() };
-  return c.json(response);
-});
+registerFileRoutes(app, fileRouteDeps);
 
-app.post("/api/auth/otp/reset", (c) => {
-  requireSessionPrincipal(c);
-  if (!authConfig) return c.json({ error: "setup_required" }, 409);
-  pendingResetOtpSecret = generateSecret();
-  const response: ResetOtpResponse = {
-    otpSecret: pendingResetOtpSecret,
-    otpauthUrl: generateURI({ issuer: "Codex Web", label: "local-admin", secret: pendingResetOtpSecret, algorithm: "sha1", digits: 6, period: 30 }),
-  };
-  return c.json(response);
-});
-
-app.post("/api/auth/otp/reset/confirm", async (c) => {
-  requireSessionPrincipal(c);
-  if (!authConfig) return c.json({ error: "setup_required" }, 409);
-  if (!pendingResetOtpSecret) return c.json({ error: "otp_reset_not_started" }, 400);
-  const body = await c.req.json<ConfirmOtpResetRequest>().catch(() => null);
-  if (!body?.currentAccessToken?.trim() || hashToken(body.currentAccessToken) !== authConfig.accessTokenHash) {
-    return c.json({ error: "invalid_current_access_token" }, 401);
-  }
-  if (!body?.otp || !(await verifyOtp(pendingResetOtpSecret, body.otp))) {
-    return c.json({ error: "invalid_otp" }, 401);
-  }
-  authConfig = { ...authConfig, otpSecret: pendingResetOtpSecret };
-  pendingResetOtpSecret = null;
-  saveAuthConfig(authConfig);
-  const sessionToken = signSessionToken();
-  c.header("set-cookie", sessionCookie(sessionToken));
-  const response: LoginResponse = { ok: true, sessionToken, auth: authenticatedAuthState() };
-  return c.json(response);
-});
-
-app.get("/api/auth/api-key-permissions", (c) => {
-  requireSessionPrincipal(c);
-  return c.json(apiKeyPermissionsResponse());
-});
-
-app.get("/api/auth/api-keys", (c) => {
-  requireSessionPrincipal(c);
-  return c.json(listApiKeys());
-});
-
-app.post("/api/auth/api-keys", async (c) => {
-  requireSessionPrincipal(c);
-  const body = await c.req.json<CreateApiKeyRequest>().catch(() => null);
-  if (!body?.name?.trim() || !Array.isArray(body.permissions) || !body.permissions.length) return c.json({ error: "invalid_api_key" }, 400);
-  try {
-    return c.json(createApiKey(body), 201);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "api_key_create_failed" }, 400);
-  }
-});
-
-app.patch("/api/auth/api-keys/:id", async (c) => {
-  requireSessionPrincipal(c);
-  const body = await c.req.json<UpdateApiKeyRequest>().catch(() => null);
-  if (!body?.name?.trim() || !Array.isArray(body.permissions) || !body.permissions.length) return c.json({ error: "invalid_api_key" }, 400);
-  try {
-    return c.json(updateApiKey(c.req.param("id"), body));
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : "api_key_update_failed";
-    return c.json({ error: reason }, reason === "api_key_not_found" ? 404 : 400);
-  }
-});
-
-app.delete("/api/auth/api-keys/:id", (c) => {
-  requireSessionPrincipal(c);
-  try {
-    return c.json(revokeApiKey(c.req.param("id")));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "api_key_not_found" }, 404);
-  }
-});
-
-app.delete("/api/auth/api-keys/:id/record", (c) => {
-  requireSessionPrincipal(c);
-  try {
-    return c.json(deleteRevokedApiKey(c.req.param("id")));
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : "api_key_delete_failed";
-    return c.json({ error: reason }, reason === "api_key_not_revoked" ? 409 : 404);
-  }
-});
-
-app.post("/api/settings/maintenance/cleanup", async (c) => {
-  const body = await c.req.json<{ deleteArchivedApprovals?: boolean; archivedApprovalRetentionDays?: number; deleteApprovalAuditLog?: boolean }>().catch(() => ({}));
-  return c.json(cleanupDatabaseRedundancy(body ?? {}));
-});
-
-app.get("/api/settings/task-health", (c) => {
-  const health = listTaskHealth();
-  if (!health.ok) {
-    emitExternalNotification({
-      eventType: "task_health_issue",
-      severity: "error",
-      title: "任务健康检查发现异常",
-      message: health.items.filter((item) => item.issue).map((item) => `${item.title}: ${item.issue}`).join("\n") || "运行任务状态异常。",
-      sourceType: "task-health",
-      sourceId: health.checkedAt,
-      metadata: { items: health.items.filter((item) => item.issue) },
-    });
-  }
-  return c.json(health);
-});
-
-app.post("/api/settings/task-health/repair", (c) => c.json(repairTaskHealth()));
-
-app.post("/api/settings/approvals/reset", (c) => {
-  const result = db.prepare("delete from approval_grants").run();
-  return c.json({ ok: true, deletedGrants: result.changes });
-});
-
-app.get("/api/settings/preview-access", (c) => c.json(previewAccessSettings));
-
-app.patch("/api/settings/preview-access", async (c) => {
-  const body = await c.req.json<Partial<PreviewAccessSettings>>().catch(() => null);
-  const next = runtimeSettingsStore.previewAccess.sanitize({
-    requestTtlMinutes: body?.requestTtlMinutes ?? previewAccessSettings.requestTtlMinutes,
-    updatedAt: new Date().toISOString(),
-  });
-  previewAccessSettings = next;
-  runtimeSettingsStore.previewAccess.save(next);
-  expirePreviewAccessRequests();
-  return c.json(next);
-});
-
-app.get("/api/settings/session-compaction", (c) => c.json(sessionCompactionSettings));
-
-app.patch("/api/settings/session-compaction", async (c) => {
-  const body = await c.req.json<UpdateSessionCompactionSettingsRequest>().catch(() => null);
-  const next = runtimeSettingsStore.sessionCompaction.sanitize({
-    ...sessionCompactionSettings,
-    ...(body ?? {}),
-    updatedAt: new Date().toISOString(),
-  });
-  sessionCompactionSettings = next;
-  runtimeSettingsStore.sessionCompaction.save(next);
-  return c.json(next);
-});
-
-app.get("/api/settings/rate-limit", (c) => c.json(rateLimitSettings));
-
-app.patch("/api/settings/rate-limit", async (c) => {
-  const body = await c.req.json<Partial<RateLimitSettings>>().catch(() => null);
-  const next = rateLimitStore.sanitize({
-    ...rateLimitSettings,
-    ...(body ?? {}),
-    updatedAt: new Date().toISOString(),
-  });
-  rateLimitSettings = next;
-  rateLimitStore.save(next);
-  return c.json(next);
-});
-
-app.get("/api/settings/notification-test", (c) => c.json(notificationTestSettings));
-
-app.patch("/api/settings/notification-test", async (c) => {
-  const body = await c.req.json<UpdateNotificationTestSettingsRequest>().catch(() => null);
-  const next = sanitizeNotificationTestSettings({
-    ...notificationTestSettings,
-    ...(body ?? {}),
-    updatedAt: new Date().toISOString(),
-  });
-  notificationTestSettings = next;
-  saveNotificationTestSettings(next);
-  return c.json(next);
-});
-
-app.get("/api/settings/environment", (c) => {
-  environmentOverview = buildEnvironmentOverview();
-  saveEnvironmentOverview(environmentOverview);
-  return c.json(environmentOverview);
-});
-
-app.post("/api/settings/environment/scan", (c) => {
-  environmentOverview = buildEnvironmentOverview();
-  saveEnvironmentOverview(environmentOverview);
-  return c.json(environmentOverview);
-});
-
-app.post("/api/settings/environment/restore-preview", async (c) => {
-  const body = await c.req.json<EnvironmentRestoreMissingRequest>().catch(() => ({}));
-  return c.json(buildEnvironmentRestoreExecutionPlan(body));
-});
-
-app.post("/api/settings/environment/restore-missing", async (c) => {
-  const body = await c.req.json<EnvironmentRestoreMissingRequest>().catch(() => ({}));
-  return c.json(runEnvironmentRestoreMissing(body));
-});
-
-app.post("/api/settings/environment/mise/install", (c) => {
-  const home = process.env.HOME;
-  if (!home) return c.json({ error: "home_not_available" }, 400);
-  const installPath = join(home, ".local/bin/mise");
-  const installScript = [
-    "set -euo pipefail",
-    "mkdir -p \"$HOME/.local/bin\"",
-    "tmp=\"$(mktemp)\"",
-    "trap 'rm -f \"$tmp\"' EXIT",
-    "curl -fsSL https://mise.run -o \"$tmp\"",
-    "MISE_INSTALL_PATH=\"$HOME/.local/bin/mise\" sh \"$tmp\"",
-    "\"$HOME/.local/bin/mise\" --version",
-  ].join(" && ");
-  const result = spawnSync("/bin/bash", ["-lc", installScript], {
-    encoding: "utf8",
-    env: managedChildEnv(),
-  });
-  const verification = spawnSync(installPath, ["--version"], { encoding: "utf8" });
-  const installed = result.status === 0 && verification.status === 0;
-  const now = new Date().toISOString();
-  environmentOverview = buildEnvironmentOverview();
-  environmentOverview.restoreRuns = [
-    {
-      id: `env-restore-${randomUUID()}`,
-      status: (installed ? "success" : "failed") as EnvironmentRestoreRun["status"],
-      summary: installed
-        ? `Installed mise to ${installPath}`
-        : [result.stderr, result.stdout, verification.stderr, verification.stdout].join("\n").trim() || "Failed to install mise",
-      createdAt: now,
-    },
-    ...environmentOverview.restoreRuns,
-  ].slice(0, 20);
-  environmentOverview.updatedAt = now;
-  saveEnvironmentOverview(environmentOverview);
-  if (!installed) return c.json({ error: "mise_install_failed", detail: [result.stderr, result.stdout, verification.stderr, verification.stdout].join("\n").trim(), overview: environmentOverview }, 400);
-  return c.json(environmentOverview);
-});
-
-app.get("/api/settings/environment/tool-registry", (c) => {
-  try {
-    const items = listEnvironmentToolRegistry(c.req.query("q")).map((item) => ({
-      name: String(item.name),
-      description: item.description ?? null,
-      backend: item.backend ?? null,
-    }));
-    return c.json({ items, mise: detectMiseStatus() });
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "environment_registry_failed", items: [], mise: detectMiseStatus() }, 500);
-  }
-});
-
-app.get("/api/settings/environment/tool-versions", (c) => {
-  try {
-    const tool = c.req.query("tool") ?? "";
-    const result = listEnvironmentToolVersions(tool);
-    return c.json({ ...result, mise: detectMiseStatus() }, result.error ? 200 : 200);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "environment_versions_failed", items: [], mise: detectMiseStatus() }, 500);
-  }
-});
-
-app.get("/api/settings/environment/tool-probe", (c) => {
-  try {
-    const tool = c.req.query("tool") ?? "";
-    if (!tool.trim()) return c.json({ error: "tool_required" }, 400);
-    return c.json({ probe: probeEnvironmentTool(tool), mise: detectMiseStatus() });
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "environment_probe_failed" }, 500);
-  }
-});
-
-app.post("/api/settings/environment/tools/install", async (c) => {
-  const body = await c.req.json<InstallEnvironmentToolRequest>().catch(() => null);
-  if (!body?.tool?.trim() || !body.version?.trim()) return c.json({ error: "invalid_environment_tool" }, 400);
-  const now = new Date().toISOString();
-  const requestedTool = body.tool.trim();
-  const version = body.version.trim();
-  const scope = body.scope ?? "global";
-  const note = body.notes?.trim() ?? null;
-  const installResult = runMiseUseGlobal(requestedTool, `${requestedTool}@${version}`);
-  const detectedVersion = detectToolVersion(requestedTool);
-  const status: EnvironmentToolRecord["status"] = installResult.status === 0
-    ? (detectedVersion && !detectedVersion.includes(version) ? "version_mismatch" : "installed")
-    : "missing";
-  const record: EnvironmentToolRecord = {
-    id: `env-tool-${randomUUID()}`,
-    tool: requestedTool,
-    requestedVersion: version,
-    detectedVersion,
-    status,
-    source: "mise",
-    scope,
-    autoRestore: body.autoRestore !== false,
-    notes: note,
-    createdAt: now,
-    updatedAt: now,
-  };
-  environmentOverview = {
-    ...buildEnvironmentOverview(),
-    tools: [
-      record,
-      ...environmentOverview.tools.filter((item) => !(item.tool === record.tool && item.scope === record.scope)),
-    ],
-    updatedAt: now,
-  };
-  environmentOverview.restoreRuns = [
-    {
-      id: `env-restore-${randomUUID()}`,
-      status: (installResult.status === 0 ? "success" : "failed") as EnvironmentRestoreRun["status"],
-      summary: installResult.status === 0
-        ? `Installed ${requestedTool}@${version} via mise`
-        : [installResult.stderr, installResult.stdout].join("\n").trim() || `Failed to install ${requestedTool}@${version}`,
-      createdAt: now,
-    },
-    ...environmentOverview.restoreRuns,
-  ].slice(0, 20);
-  saveEnvironmentOverview(environmentOverview);
-  if (installResult.status !== 0) return c.json({ error: "environment_tool_install_failed", detail: installResult.stderr || installResult.stdout, overview: environmentOverview }, 400);
-  return c.json(environmentOverview, 201);
-});
-
-app.post("/api/settings/environment/tools/register", async (c) => {
-  const body = await c.req.json<RegisterEnvironmentToolRequest>().catch(() => null);
-  if (!body?.tool?.trim() || !body.version?.trim()) return c.json({ error: "invalid_environment_tool" }, 400);
-  const now = new Date().toISOString();
-  const tool = body.tool.trim();
-  const detectedVersion = body.detectedVersion ?? detectToolVersion(tool);
-  const record: EnvironmentToolRecord = {
-    id: `env-tool-${randomUUID()}`,
-    tool,
-    requestedVersion: body.version.trim(),
-    detectedVersion,
-    status: detectedVersion
-      ? (body.version.trim() && !detectedVersion.includes(body.version.trim()) ? "version_mismatch" : "installed")
-      : "unknown",
-    source: body.source ?? "manual",
-    scope: body.scope ?? "global",
-    autoRestore: body.autoRestore !== false,
-    notes: body.notes?.trim() ?? null,
-    createdAt: now,
-    updatedAt: now,
-  };
-  environmentOverview = {
-    ...buildEnvironmentOverview(),
-    tools: [
-      record,
-      ...environmentOverview.tools.filter((item) => !(item.tool === record.tool && item.scope === record.scope)),
-    ],
-    updatedAt: now,
-  };
-  saveEnvironmentOverview(environmentOverview);
-  return c.json(environmentOverview, 201);
-});
-
-app.delete("/api/settings/environment/tools/:id", (c) => {
-  const id = c.req.param("id");
-  environmentOverview = {
-    ...buildEnvironmentOverview(),
-    tools: environmentOverview.tools.filter((item) => item.id !== id),
-    updatedAt: new Date().toISOString(),
-  };
-  saveEnvironmentOverview(environmentOverview);
-  return c.json(environmentOverview);
-});
-
-app.delete("/api/settings/environment/tools/:id/uninstall", (c) => {
-  const id = c.req.param("id");
-  const tool = environmentOverview.tools.find((item) => item.id === id) ?? null;
-  if (!tool) return c.json({ error: "environment_tool_not_found" }, 404);
-  if (tool.source !== "mise") return c.json({ error: "environment_tool_uninstall_not_allowed" }, 400);
-  const now = new Date().toISOString();
-  const target = `${tool.tool}@${tool.requestedVersion}`;
-  const uninstallResult = spawnSync(resolveMiseCommand(), ["uninstall", target], { encoding: "utf8" });
-  const summary = uninstallResult.status === 0
-    ? `Uninstalled ${target} via mise`
-    : [uninstallResult.stderr, uninstallResult.stdout].join("\n").trim() || `Failed to uninstall ${target}`;
-  environmentOverview = {
-    ...buildEnvironmentOverview(),
-    tools: uninstallResult.status === 0
-      ? environmentOverview.tools.filter((item) => item.id !== id)
-      : environmentOverview.tools,
-    restoreRuns: [
-      {
-        id: `env-restore-${randomUUID()}`,
-        status: (uninstallResult.status === 0 ? "success" : "failed") as EnvironmentRestoreRun["status"],
-        summary,
-        createdAt: now,
-      },
-      ...environmentOverview.restoreRuns,
-    ].slice(0, 20),
-    updatedAt: now,
-  };
-  saveEnvironmentOverview(environmentOverview);
-  if (uninstallResult.status !== 0) {
-    return c.json({ error: "environment_tool_uninstall_failed", detail: uninstallResult.stderr || uninstallResult.stdout, overview: environmentOverview }, 400);
-  }
-  return c.json(environmentOverview);
-});
-
-app.post("/api/settings/environment/tools/:id/set-default", (c) => {
-  const id = c.req.param("id");
-  const tool = environmentOverview.tools.find((item) => item.id === id) ?? null;
-  if (!tool) return c.json({ error: "environment_tool_not_found" }, 404);
-  const target = `${tool.tool}@${tool.requestedVersion}`;
-  const result = runMiseUseGlobal(tool.tool, target);
-  const now = new Date().toISOString();
-  environmentOverview = buildEnvironmentOverview();
-  environmentOverview.tools = environmentOverview.tools.map((item) => item.tool === tool.tool
-    ? { ...item, isGlobalDefault: item.id === id, updatedAt: now }
-    : item);
-  environmentOverview.restoreRuns = [
-    {
-      id: `env-restore-${randomUUID()}`,
-      status: (result.status === 0 ? "success" : "failed") as EnvironmentRestoreRun["status"],
-      summary: result.status === 0
-        ? `Set ${target} as global default via mise`
-        : [result.stderr, result.stdout].join("\n").trim() || `Failed to set ${target} as global default`,
-      createdAt: now,
-    },
-    ...environmentOverview.restoreRuns,
-  ].slice(0, 20);
-  environmentOverview.updatedAt = now;
-  saveEnvironmentOverview(environmentOverview);
-  if (result.status !== 0) return c.json({ error: "environment_tool_set_default_failed", detail: result.stderr || result.stdout, overview: environmentOverview }, 400);
-  return c.json(environmentOverview);
-});
-
-app.get("/api/settings/environment/tools/:id/packages", (c) => {
-  const id = c.req.param("id");
-  const toolRecord = environmentOverview.tools.find((item) => item.id === id) ?? null;
-  if (!toolRecord) return c.json({ error: "environment_tool_not_found" }, 404);
-  const recordedPackages = listPackagesForToolRecord(toolRecord);
-  const detectedPackages = environmentPackageRegistry.scanEnvironmentPackages(toolRecord)
-    .filter((item) => !recordedPackages.some((record) => record.packageName === item.packageName && record.manager === item.manager));
-  const response: EnvironmentPackageDetailResponse = {
-    toolRecord,
-    packages: [...recordedPackages, ...detectedPackages],
-    managers: environmentPackageRegistry.listEnvironmentPackageManagers(toolRecord),
-    restorePreview: buildEnvironmentRestorePreview(toolRecord, recordedPackages),
-  };
-  return c.json(response);
-});
-
-app.get("/api/settings/environment/tools/:id/packages/probe", (c) => {
-  const id = c.req.param("id");
-  const toolRecord = environmentOverview.tools.find((item) => item.id === id) ?? null;
-  if (!toolRecord) return c.json({ error: "environment_tool_not_found" }, 404);
-  const manager = c.req.query("manager")?.trim() ?? "";
-  const packageName = c.req.query("package")?.trim() ?? "";
-  if (!manager || !packageName) return c.json({ error: "invalid_environment_package_probe" }, 400);
-  const probe = environmentPackageRegistry.inspectEnvironmentPackage(manager, packageName);
-  return c.json({ ...probe, manager, packageName });
-});
-
-app.post("/api/settings/environment/bulk", async (c) => {
-  const body = await c.req.json<EnvironmentBulkActionRequest>().catch(() => null);
-  if (!body?.action) return c.json({ error: "invalid_environment_bulk_action" }, 400);
-  const now = new Date().toISOString();
-  if (body.action === "cleanup_stale_records") {
-    const before = environmentOverview.packageRecords.length;
-    const next = buildEnvironmentOverview();
-    next.packageRecords = next.packageRecords.filter((pkg) => pkg.status !== "missing");
-    next.restoreRuns = [
-      {
-        id: `env-restore-${randomUUID()}`,
-        status: "success" as const,
-        summary: `Cleaned up ${before - next.packageRecords.length} stale package records`,
-        createdAt: now,
-      },
-      ...next.restoreRuns,
-    ].slice(0, 20);
-    next.updatedAt = now;
-    environmentOverview = next;
-    saveEnvironmentOverview(environmentOverview);
-    return c.json(environmentOverview);
-  }
-  const toolRecord = body.toolRecordId ? environmentOverview.tools.find((item) => item.id === body.toolRecordId) ?? null : null;
-  if (!toolRecord) return c.json({ error: "environment_tool_not_found" }, 404);
-  if (body.action === "record_detected_packages" && toolRecord) {
-    const recordedPackages = listPackagesForToolRecord(toolRecord);
-    const detectedPackages = environmentPackageRegistry.scanEnvironmentPackages(toolRecord)
-      .filter((item) => !recordedPackages.some((record) => record.packageName === item.packageName && record.manager === item.manager));
-    environmentOverview = {
-      ...buildEnvironmentOverview(),
-      packageRecords: [
-        ...detectedPackages.map((pkg) => ({ ...pkg, id: `env-pkg-${randomUUID()}`, persisted: true })),
-        ...environmentOverview.packageRecords,
-      ],
-      restoreRuns: [
-        {
-          id: `env-restore-${randomUUID()}`,
-          status: "success" as const,
-          summary: `Recorded ${detectedPackages.length} detected packages for ${toolRecord.tool}@${toolRecord.requestedVersion}`,
-          createdAt: now,
-        },
-        ...environmentOverview.restoreRuns,
-      ].slice(0, 20),
-      updatedAt: now,
-    };
-    saveEnvironmentOverview(environmentOverview);
-    return c.json(environmentOverview);
-  }
-  if (body.action === "install_missing_packages" && toolRecord) {
-    const packageIds = new Set(body.packageIds ?? []);
-    const targets = environmentOverview.packageRecords.filter((pkg) => pkg.toolRecordId === toolRecord.id && pkg.status === "missing" && (!packageIds.size || packageIds.has(pkg.id)));
-    let successCount = 0;
-    const updatedRecords = [...environmentOverview.packageRecords];
-    for (const pkg of targets) {
-      const commandSpec = packageInstallCommandSpec(pkg.manager, pkg.packageName, pkg.versionSpec ?? null);
-      if (!commandSpec) continue;
-      const result = spawnSync(commandSpec.command, commandSpec.args, { encoding: "utf8" });
-      if (result.status === 0) {
-        successCount += 1;
-        const index = updatedRecords.findIndex((item) => item.id === pkg.id);
-        if (index >= 0) updatedRecords[index] = { ...updatedRecords[index], status: "installed", persisted: true, updatedAt: now };
-      }
-    }
-    const bulkInstallStatus: EnvironmentRestoreRun["status"] = successCount === targets.length ? "success" : successCount > 0 ? "partial" : "failed";
-    environmentOverview = {
-      ...buildEnvironmentOverview(),
-      packageRecords: updatedRecords,
-      restoreRuns: [
-        {
-          id: `env-restore-${randomUUID()}`,
-          status: bulkInstallStatus,
-          summary: `Installed ${successCount}/${targets.length} missing packages for ${toolRecord.tool}@${toolRecord.requestedVersion}`,
-          createdAt: now,
-        },
-        ...environmentOverview.restoreRuns,
-      ].slice(0, 20),
-      updatedAt: now,
-    };
-    saveEnvironmentOverview(environmentOverview);
-    return c.json(environmentOverview);
-  }
-  return c.json({ error: "environment_bulk_action_not_supported" }, 400);
-});
-
-app.post("/api/settings/environment/packages/install", async (c) => {
-  const body = await c.req.json<InstallEnvironmentPackageRequest>().catch(() => null);
-  if (!body?.toolRecordId || !body.packageName?.trim() || !body.manager?.trim()) return c.json({ error: "invalid_environment_package" }, 400);
-  const toolRecord = environmentOverview.tools.find((item) => item.id === body.toolRecordId) ?? null;
-  if (!toolRecord) return c.json({ error: "environment_tool_not_found" }, 404);
-  const manager = body.manager.trim();
-  const packageName = body.packageName.trim();
-  const versionSpec = body.versionSpec?.trim() || null;
-  const spec = versionSpec ? `${packageName}@${versionSpec}` : packageName;
-  const probe = environmentPackageRegistry.inspectEnvironmentPackage(manager, packageName);
-  const commandSpec = packageInstallCommandSpec(manager, packageName, versionSpec);
-  if (!commandSpec) return c.json({ error: "environment_package_manager_not_supported" }, 400);
-  const result = probe.installed ? { status: 0, stdout: "already installed", stderr: "" } : spawnSync(commandSpec.command, commandSpec.args, { encoding: "utf8" });
-  const now = new Date().toISOString();
-  const record: EnvironmentPackageRecord = {
-    id: `env-pkg-${randomUUID()}`,
-    toolRecordId: toolRecord.id,
-    tool: toolRecord.tool,
-    runtimeVersion: toolRecord.requestedVersion,
-    ecosystem: toolRecord.tool.toLowerCase(),
-    manager,
-    packageName,
-    versionSpec,
-    installedVersion: probe.version ?? versionSpec,
-    installCommand: commandSpec.text,
-    uninstallCommand: packageUninstallCommandText(manager, packageName),
-    targetLabel: `${toolRecord.tool}@${toolRecord.requestedVersion}`,
-    scope: "global",
-    autoRestore: body.autoRestore !== false,
-    persisted: result.status === 0,
-    status: result.status === 0 ? "installed" : "failed",
-    notes: body.notes?.trim() || null,
-    createdAt: now,
-    updatedAt: now,
-  };
-  environmentOverview = {
-    ...buildEnvironmentOverview(),
-    packageRecords: [
-      record,
-      ...environmentOverview.packageRecords.filter((item) => !(item.toolRecordId === toolRecord.id && item.manager === manager && item.packageName === packageName)),
-    ],
-    restoreRuns: [
-      {
-        id: `env-restore-${randomUUID()}`,
-        status: (result.status === 0 ? "success" : "failed") as EnvironmentRestoreRun["status"],
-        summary: result.status === 0
-          ? (probe.installed
-            ? `Recorded existing ${packageName} for ${toolRecord.tool}@${toolRecord.requestedVersion} via ${manager}`
-            : `Installed ${spec} for ${toolRecord.tool}@${toolRecord.requestedVersion} via ${manager}`)
-          : [result.stderr, result.stdout].join("\n").trim() || `Failed to install ${spec}`,
-        createdAt: now,
-      },
-      ...environmentOverview.restoreRuns,
-    ].slice(0, 20),
-    updatedAt: now,
-  };
-  saveEnvironmentOverview(environmentOverview);
-  if (result.status !== 0) return c.json({ error: "environment_package_install_failed", detail: result.stderr || result.stdout, overview: environmentOverview }, 400);
-  return c.json(environmentOverview, 201);
-});
-
-app.delete("/api/settings/environment/packages/:id", async (c) => {
-  const id = c.req.param("id");
-  const body = await c.req.json<UninstallEnvironmentPackageRequest>().catch(() => null);
-  const pkg = environmentOverview.packageRecords.find((item) => item.id === id) ?? null;
-  if (!pkg) return c.json({ error: "environment_package_not_found" }, 404);
-  const manager = body?.manager?.trim() || pkg.manager;
-  const commandSpec = packageUninstallCommandSpec(manager, pkg.packageName);
-  if (!commandSpec) return c.json({ error: "environment_package_manager_not_supported" }, 400);
-  const result = spawnSync(commandSpec.command, commandSpec.args, { encoding: "utf8" });
-  const now = new Date().toISOString();
-  environmentOverview = {
-    ...buildEnvironmentOverview(),
-    packageRecords: result.status === 0
-      ? environmentOverview.packageRecords.filter((item) => item.id !== id)
-      : environmentOverview.packageRecords.map((item) => item.id === id ? { ...item, status: "failed", updatedAt: now } : item),
-    restoreRuns: [
-      {
-        id: `env-restore-${randomUUID()}`,
-        status: (result.status === 0 ? "success" : "failed") as EnvironmentRestoreRun["status"],
-        summary: result.status === 0
-          ? `Uninstalled ${pkg.packageName} from ${pkg.targetLabel} via ${manager}`
-          : [result.stderr, result.stdout].join("\n").trim() || `Failed to uninstall ${pkg.packageName}`,
-        createdAt: now,
-      },
-      ...environmentOverview.restoreRuns,
-    ].slice(0, 20),
-    updatedAt: now,
-  };
-  saveEnvironmentOverview(environmentOverview);
-  if (result.status !== 0) return c.json({ error: "environment_package_uninstall_failed", detail: result.stderr || result.stdout, overview: environmentOverview }, 400);
-  return c.json(environmentOverview);
-});
-
-app.delete("/api/settings/environment/restore-runs/:id", (c) => {
-  const id = c.req.param("id");
-  environmentOverview = {
-    ...buildEnvironmentOverview(),
-    restoreRuns: environmentOverview.restoreRuns.filter((item) => item.id !== id),
-    updatedAt: new Date().toISOString(),
-  };
-  saveEnvironmentOverview(environmentOverview);
-  return c.json(environmentOverview);
-});
-
-app.delete("/api/settings/environment/restore-runs", (c) => {
-  environmentOverview = {
-    ...buildEnvironmentOverview(),
-    restoreRuns: [],
-    updatedAt: new Date().toISOString(),
-  };
-  saveEnvironmentOverview(environmentOverview);
-  return c.json(environmentOverview);
-});
-
-app.get("/api/notifications", (c) => c.json({
-  channels: listNotificationChannels(),
-  accounts: listNotificationAccounts(),
-  recipients: listNotificationRecipients(),
-  rules: listNotificationRules(20).items,
-  ephemeralRules: listNotificationEphemeralRules(20).items,
-  recentDeliveries: listNotificationDeliveries(20).items,
-}));
-
-app.get("/api/notifications/platforms", (c) => c.json(platformOverview({
-  db,
-  sessions: appData.sessions,
-  listNotificationAccounts,
-  webhookRoutes: listWebhookRoutes(),
-})));
-
-app.get("/api/webhook-routes", (c) => c.json(listWebhookRoutes()));
-
-app.post("/api/webhook-routes", async (c) => {
-  const body = await c.req.json<{ name?: unknown; enabled?: unknown; secret?: unknown; commandTemplate?: unknown; promptTemplate?: unknown; routeKey?: unknown }>().catch(() => null);
-  const name = String(body?.name ?? "").trim();
-  if (!name) return c.json({ error: "invalid_webhook_route" }, 400);
-  const now = new Date().toISOString();
-  const id = `webhook-route-${randomUUID()}`;
-  const routeKeyBase = slugifyWebhookRouteName(String(body?.routeKey ?? name));
-  const routeKey = `${routeKeyBase}-${randomUUID().slice(0, 8)}`;
-  const secret = normalizeWebhookRouteSecret(String(body?.secret ?? ""));
-  if (!webhookSecretIsSafe(secret)) return c.json({ error: "webhook_insecure_secret_requires_loopback" }, 400);
-  const commandTemplate = String(body?.commandTemplate ?? body?.promptTemplate ?? "").trim() || "Webhook event from {{routeName}} ({{eventType}})\n\n{{body}}";
-  upsertWebhookRoute({
-    id,
-    routeKey,
-    name,
-    enabled: body?.enabled === false ? false : true,
-    secret,
-    sessionId: null,
-    promptTemplate: commandTemplate,
-    createdAt: now,
-    updatedAt: now,
-  });
-  return c.json(webhookRouteFromRow(db.prepare("select * from webhook_routes where id = ?").get(id) as Record<string, unknown>), 201);
-});
-
-app.patch("/api/webhook-routes/:id", async (c) => {
-  const current = db.prepare("select * from webhook_routes where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!current) return c.json({ error: "webhook_route_not_found" }, 404);
-  const body = await c.req.json<{ name?: unknown; enabled?: unknown; secret?: unknown; commandTemplate?: unknown; promptTemplate?: unknown }>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_webhook_route" }, 400);
-  const now = new Date().toISOString();
-  const secret = String(body.secret ?? "").trim() ? normalizeWebhookRouteSecret(String(body.secret ?? "")) : String(current.secret ?? "");
-  if (!webhookSecretIsSafe(secret)) return c.json({ error: "webhook_insecure_secret_requires_loopback" }, 400);
-  upsertWebhookRoute({
-    id: String(current.id),
-    routeKey: String(current.route_key),
-    name: String(body.name ?? current.name).trim() || String(current.name),
-    enabled: body.enabled === undefined ? Boolean(current.enabled) : body.enabled !== false,
-    secret,
-    sessionId: current.session_id ? String(current.session_id) : null,
-    promptTemplate: String(body.commandTemplate ?? body.promptTemplate ?? current.prompt_template ?? "").trim() || "Webhook event from {{routeName}} ({{eventType}})\n\n{{body}}",
-    createdAt: String(current.created_at),
-    updatedAt: now,
-  });
-  return c.json(webhookRouteFromRow(db.prepare("select * from webhook_routes where id = ?").get(c.req.param("id")) as Record<string, unknown>));
-});
-
-app.delete("/api/webhook-routes/:id", (c) => {
-  const result = db.prepare("delete from webhook_routes where id = ?").run(c.req.param("id"));
-  if (!result.changes) return c.json({ error: "webhook_route_not_found" }, 404);
-  return c.json({ ok: true });
-});
-
-async function handleWebhookCommandRoute(c: any) {
-  const route = db.prepare("select * from webhook_routes where route_key = ?").get(c.req.param("routeKey")) as Record<string, unknown> | undefined;
-  if (!route) return c.json({ error: "webhook_route_not_found" }, 404);
-  if (!Boolean(route.enabled)) return c.json({ error: "webhook_route_disabled" }, 403);
-
-  let rawBody = Buffer.from("");
-  try {
-    const body = await c.req.raw.clone().arrayBuffer();
-    rawBody = Buffer.from(body);
-  } catch {
-    return c.json({ error: "webhook_bad_request" }, 400);
-  }
-  if (rawBody.byteLength > 1_048_576) return c.json({ error: "webhook_payload_too_large" }, 413);
-
-  const secret = String(route.secret ?? "");
-  if (!validateWebhookToken(secret, c.req.raw)) {
-    return c.json({ error: "invalid_signature" }, 401);
-  }
-
-  const payload = parseWebhookPayload(c.req.raw, rawBody);
-  const command = String(c.req.query("command") ?? payload.command ?? payload.action ?? "").trim().toLowerCase();
-  const payloadSessionId = String(payload.sessionId ?? payload.session_id ?? payload.targetSessionId ?? "").trim();
-  const payloadSessionTarget = String(payload.target ?? payload.session ?? payload.bind ?? "").trim();
-  const payloadMessage = String(payload.message ?? payload.content ?? payload.text ?? "").trim();
-  const sessionId = String(c.req.query("sessionId") ?? payloadSessionId ?? payloadSessionTarget).trim();
-  const message = String(c.req.query("message") ?? payloadMessage).trim();
-  const routeSummary = webhookRouteFromRow(db.prepare("select * from webhook_routes where id = ?").get(String(route.id)) as Record<string, unknown>);
-  const routeSessionId = String(route.session_id ?? "").trim();
-  const boundSession = routeSessionId ? appData.sessions.find((item) => item.id === routeSessionId) ?? null : null;
-
-  if (!command || command === "help") {
-    return c.json({
-      ok: true,
-      command: "help",
-      route: routeSummary,
-      commands: [
-        {
-          command: "help",
-          usage: `GET /api/webhook/${routeSummary.routeKey}?command=help`,
-          description: "Show command list and usage.",
-        },
-        {
-          command: "sessions",
-          usage: `GET /api/webhook/${routeSummary.routeKey}?command=sessions`,
-          description: "List recent sessions.",
-        },
-        {
-          command: "agents",
-          usage: `GET /api/webhook/${routeSummary.routeKey}?command=agents`,
-          description: "List recent agents.",
-        },
-        {
-          command: "rooms",
-          usage: `GET /api/webhook/${routeSummary.routeKey}?command=rooms`,
-          description: "List recent rooms.",
-        },
-        {
-          command: "bind",
-          usage: `POST /api/webhook/${routeSummary.routeKey}?command=bind&sessionId=<sessionId>`,
-          description: "Bind this route to an existing session.",
-        },
-        {
-          command: "unbind",
-          usage: `POST /api/webhook/${routeSummary.routeKey}?command=unbind`,
-          description: "Clear the bound session.",
-        },
-        {
-          command: "send",
-          usage: `POST /api/webhook/${routeSummary.routeKey}?command=send&sessionId=<sessionId>&message=<message>`,
-          description: "Send a message to an existing session.",
-        },
-      ],
-    });
-  }
-
-  if (command === "sessions") {
-    return c.json({
-      ok: true,
-      command: "sessions",
-      route: routeSummary,
-      sessions: listWebhookSessionSummaries(parsePageLimit(c.req.query("limit"), 20)),
-    });
-  }
-
-  if (command === "agents") {
-    return c.json({
-      ok: true,
-      command: "agents",
-      route: routeSummary,
-      agents: listWebhookAgentSummaries(parsePageLimit(c.req.query("limit"), 20)),
-    });
-  }
-
-  if (command === "rooms") {
-    return c.json({
-      ok: true,
-      command: "rooms",
-      route: routeSummary,
-      rooms: listWebhookRoomSummaries(parsePageLimit(c.req.query("limit"), 20)),
-    });
-  }
-
-  if (command === "bind") {
-    if (!sessionId) {
-      return c.json({
-        ok: false,
-        command: "bind",
-        error: "webhook_session_id_required",
-        route: routeSummary,
-        boundSession,
-        sessions: listWebhookSessionSummaries(parsePageLimit(c.req.query("limit"), 20)),
-      }, 400);
-    }
-    const targetSession = appData.sessions.find((item) => item.id === sessionId) ?? null;
-    if (!targetSession) return c.json({ error: "session_not_found" }, 404);
-    db.prepare("update webhook_routes set session_id = ?, updated_at = ? where id = ?").run(targetSession.id, new Date().toISOString(), String(route.id));
-    return c.json({
-      ok: true,
-      command: "bind",
-      route: webhookRouteFromRow(db.prepare("select * from webhook_routes where id = ?").get(String(route.id)) as Record<string, unknown>),
-      boundSession: {
-        id: targetSession.id,
-        title: targetSession.title,
-        status: targetSession.status,
-        conversationType: targetSession.conversationType,
-        roomId: targetSession.roomId ?? null,
-        projectId: targetSession.projectId ?? null,
-        updatedAt: targetSession.updatedAt,
-      },
-    });
-  }
-
-  if (command === "unbind") {
-    db.prepare("update webhook_routes set session_id = null, updated_at = ? where id = ?").run(new Date().toISOString(), String(route.id));
-    return c.json({
-      ok: true,
-      command: "unbind",
-      route: webhookRouteFromRow(db.prepare("select * from webhook_routes where id = ?").get(String(route.id)) as Record<string, unknown>),
-    });
-  }
-
-  if (command === "send") {
-    const targetSessionId = sessionId || routeSessionId;
-    if (!targetSessionId) {
-      return c.json({
-        error: "webhook_session_id_required",
-        route: routeSummary,
-        boundSession,
-        sessions: listWebhookSessionSummaries(parsePageLimit(c.req.query("limit"), 20)),
-      }, 400);
-    }
-    if (!message) return c.json({ error: "webhook_message_required" }, 400);
-    const targetSession = appData.sessions.find((item) => item.id === targetSessionId) ?? null;
-    if (!targetSession) return c.json({ error: "session_not_found" }, 404);
-    const result = dispatchMessageToSession(targetSession, message);
-    return c.json({
-      ok: true,
-      command: "send",
-      route: routeSummary,
-      sessionId: targetSession.id,
-      dispatch: result,
-    }, 202);
-  }
-
-  return c.json({
-    error: "unsupported_webhook_command",
-    allowedCommands: ["help", "sessions", "agents", "rooms", "bind", "unbind", "send"],
-  }, 400);
-}
-
-app.all("/api/webhook/:routeKey", handleWebhookCommandRoute);
-app.all("/webhooks/:routeKey", handleWebhookCommandRoute);
-
-app.get("/api/app-notifications", (c) => c.json(listAppNotifications(parsePageLimit(c.req.query("limit"), 30))));
-
-app.patch("/api/app-notifications/read", async (c) => {
-  const body = await c.req.json<{ ids?: string[]; all?: boolean }>().catch((): { ids?: string[]; all?: boolean } => ({}));
-  const now = new Date().toISOString();
-  if (body?.all) {
-    db.prepare("update app_notifications set read_at = coalesce(read_at, ?) where read_at is null").run(now);
-  } else {
-    const ids = Array.isArray(body?.ids) ? body.ids.map((id: string) => String(id)).filter(Boolean).slice(0, 100) : [];
-    const update = db.prepare("update app_notifications set read_at = coalesce(read_at, ?) where id = ?");
-    for (const id of ids) update.run(now, id);
-  }
-  const next = listAppNotifications(30);
-  publishAppNotificationEvent({ type: "snapshot", ...next });
-  return c.json(next);
-});
-
-app.delete("/api/app-notifications", (c) => {
-  const result = db.prepare("delete from app_notifications").run();
-  publishAppNotificationsSnapshot();
-  return c.json({ ok: true, deleted: result.changes });
-});
-
-app.get("/api/notifications/accounts", (c) => c.json(listNotificationAccounts()));
-
-app.get("/api/notifications/channels", (c) => c.json(listNotificationChannels()));
-
-app.post("/api/notifications/channels", async (c) => {
-  const body = await c.req.json<UpsertNotificationChannelRequest>().catch(() => null);
-  if (!body?.name?.trim() || !body.urlTemplate?.trim()) return c.json({ error: "invalid_notification_channel" }, 400);
-  const now = new Date().toISOString();
-  const id = `notification-channel-${randomUUID()}`;
-  const adapter = body.adapter === "authenticated_webhook" ? "authenticated_webhook" : "webhook";
-  const authType = body.authType && ["none", "bearer", "query_token", "token_request"].includes(body.authType) ? body.authType : "none";
-  db.prepare(`
-    insert into notification_channels (id, name, kind, adapter, auth_type, description, method, url_template, headers_template, body_template, account_fields, builtin, created_at, updated_at)
-    values (?, ?, 'webhook', ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-  `).run(
-    id,
-    body.name.trim(),
-    adapter,
-    authType,
-    body.description?.trim() ?? "",
-    body.method?.trim().toUpperCase() || "POST",
-    body.urlTemplate.trim(),
-    body.headersTemplate ?? "",
-    body.bodyTemplate ?? "",
-    JSON.stringify((body.accountFields ?? []).map((field) => field.trim()).filter(Boolean)),
-    now,
-    now,
-  );
-  return c.json(notificationChannelFromRow(db.prepare("select * from notification_channels where id = ?").get(id) as Record<string, unknown>), 201);
-});
-
-app.patch("/api/notifications/channels/:id", async (c) => {
-  const current = db.prepare("select * from notification_channels where id = ? and builtin = 0").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!current) return c.json({ error: "notification_channel_not_found" }, 404);
-  const body = await c.req.json<UpsertNotificationChannelRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_notification_channel" }, 400);
-  const channel = notificationChannelFromRow(current);
-  const adapter = body.adapter === "authenticated_webhook" ? "authenticated_webhook" : channel.adapter ?? "webhook";
-  const authType = body.authType && ["none", "bearer", "query_token", "token_request"].includes(body.authType) ? body.authType : channel.authType ?? "none";
-  db.prepare(`
-    update notification_channels
-    set name = ?, adapter = ?, auth_type = ?, description = ?, method = ?, url_template = ?, headers_template = ?, body_template = ?, account_fields = ?, updated_at = ?
-    where id = ?
-  `).run(
-    body.name?.trim() || channel.name,
-    adapter,
-    authType,
-    body.description?.trim() ?? channel.description,
-    body.method?.trim().toUpperCase() || channel.method || "POST",
-    body.urlTemplate?.trim() || channel.urlTemplate || "",
-    body.headersTemplate ?? channel.headersTemplate ?? "",
-    body.bodyTemplate ?? channel.bodyTemplate ?? "",
-    JSON.stringify(body.accountFields ? body.accountFields.map((field) => field.trim()).filter(Boolean) : channel.accountFields ?? []),
-    new Date().toISOString(),
-    c.req.param("id"),
-  );
-  return c.json(notificationChannelFromRow(db.prepare("select * from notification_channels where id = ?").get(c.req.param("id")) as Record<string, unknown>));
-});
-
-app.delete("/api/notifications/channels/:id", (c) => {
-  const used = db.prepare("select id from notification_accounts where channel_id = ? limit 1").get(c.req.param("id"))
-    ?? db.prepare("select id from notification_recipients where channel_id = ? limit 1").get(c.req.param("id"));
-  if (used) return c.json({ error: "notification_channel_in_use" }, 409);
-  const result = db.prepare("delete from notification_channels where id = ? and builtin = 0").run(c.req.param("id"));
-  if (!result.changes) return c.json({ error: "notification_channel_not_found" }, 404);
-  return c.json({ ok: true });
-});
-
-app.post("/api/notifications/accounts", async (c) => {
-  const body = await c.req.json<UpsertNotificationAccountRequest>().catch(() => null);
-  const selectedChannel = getNotificationChannel(body?.channelId) ?? (body?.channelKind ? notificationChannels.find((channel) => channel.kind === body.channelKind) : null);
-  const channelKind = selectedChannel?.kind ?? null;
-  if (!body?.name?.trim() || !channelKind) return c.json({ error: "invalid_notification_account" }, 400);
-  const now = new Date().toISOString();
-  const id = `notification-account-${randomUUID()}`;
-  const config = selectedChannel?.builtin === false ? (body.config ?? {}) : sanitizeNotificationConfig(channelKind, body.config);
-  db.prepare(`
-    insert into notification_accounts (id, name, channel_id, channel_kind, enabled, config, permissions, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, body.name.trim(), selectedChannel?.id ?? null, channelKind, body.enabled === false ? 0 : 1, JSON.stringify(config), JSON.stringify(sanitizeNotificationPermissions(body.permissions)), now, now);
-  const account = notificationAccountFromRow(db.prepare("select * from notification_accounts where id = ?").get(id) as Record<string, unknown>, true);
-  void syncTelegramBotCommands(account).catch((error) => console.warn("telegram command menu sync failed", account.id, error));
-  void Promise.resolve(feishuPlatform.syncConnections()).catch((error: unknown) => console.warn("feishu sync failed", error));
-  void Promise.resolve(wecomPlatform.syncConnections()).catch((error: unknown) => console.warn("wecom sync failed", error));
-  void Promise.resolve(qqPlatform.syncConnections()).catch((error: unknown) => console.warn("qq sync failed", error));
-  return c.json(notificationAccountFromRow(db.prepare("select * from notification_accounts where id = ?").get(id) as Record<string, unknown>), 201);
-});
-
-app.patch("/api/notifications/accounts/:id", async (c) => {
-  const current = db.prepare("select * from notification_accounts where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!current) return c.json({ error: "notification_account_not_found" }, 404);
-  const body = await c.req.json<UpsertNotificationAccountRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_notification_account" }, 400);
-  const currentKind = String(current.channel_kind) as NotificationAccountSummary["channelKind"];
-  const selectedChannel = getNotificationChannel(body.channelId ?? (current.channel_id ? String(current.channel_id) : null)) ?? (body.channelKind ? notificationChannels.find((channel) => channel.kind === body.channelKind) : null);
-  const channelKind = selectedChannel?.kind ?? currentKind;
-  const previousConfig = parseJsonValue<Record<string, unknown>>(current.config, {});
-  db.prepare(`
-    update notification_accounts
-    set name = ?, channel_id = ?, channel_kind = ?, enabled = ?, config = ?, permissions = ?, updated_at = ?
-    where id = ?
-  `).run(
-    body.name?.trim() || String(current.name),
-    selectedChannel?.id ?? current.channel_id ?? null,
-    channelKind,
-    body.enabled === undefined ? (Boolean(current.enabled) ? 1 : 0) : body.enabled ? 1 : 0,
-    JSON.stringify(selectedChannel?.builtin === false ? { ...previousConfig, ...(body.config ?? {}) } : sanitizeNotificationConfig(channelKind, body.config, previousConfig)),
-    JSON.stringify(body.permissions === undefined ? sanitizeNotificationPermissions(parseJsonValue<NotificationPermissionPolicy>(current.permissions, {})) : sanitizeNotificationPermissions(body.permissions)),
-    new Date().toISOString(),
-    c.req.param("id"),
-  );
-  const account = notificationAccountFromRow(db.prepare("select * from notification_accounts where id = ?").get(c.req.param("id")) as Record<string, unknown>, true);
-  void syncTelegramBotCommands(account).catch((error) => console.warn("telegram command menu sync failed", account.id, error));
-  void Promise.resolve(feishuPlatform.syncConnections()).catch((error: unknown) => console.warn("feishu sync failed", error));
-  void Promise.resolve(wecomPlatform.syncConnections()).catch((error: unknown) => console.warn("wecom sync failed", error));
-  void Promise.resolve(qqPlatform.syncConnections()).catch((error: unknown) => console.warn("qq sync failed", error));
-  return c.json(notificationAccountFromRow(db.prepare("select * from notification_accounts where id = ?").get(c.req.param("id")) as Record<string, unknown>));
-});
-
-app.post("/api/notifications/accounts/:id/weixin/qr/start", async (c) => {
-  const row = db.prepare("select * from notification_accounts where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!row || String(row.channel_kind) !== "weixin") return c.json({ error: "notification_account_not_found" }, 404);
-  const body = (await c.req.json().catch(() => ({}))) as { botType?: string };
-  try {
-    return c.json(await weixinPlatform.startQrLogin(String(row.id), String(body.botType ?? "3")));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
-  }
-});
-
-app.post("/api/notifications/weixin/qr/start", async (c) => {
-  const body = (await c.req.json().catch(() => ({}))) as { botType?: string };
-  try {
-    return c.json(await weixinPlatform.startDraftQrLogin(String(body.botType ?? "3")));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
-  }
-});
-
-app.get("/api/notifications/accounts/:id/weixin/qr/status", async (c) => {
-  const row = db.prepare("select * from notification_accounts where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!row || String(row.channel_kind) !== "weixin") return c.json({ error: "notification_account_not_found" }, 404);
-  try {
-    const state = weixinPlatform.getQrLoginState(String(row.id));
-    if (!state) return c.json({ error: "weixin_qr_session_not_found" }, 404);
-    if (state.status === "wait" || state.status === "scaned" || state.status === "scaned_but_redirect") {
-      return c.json(await weixinPlatform.refreshQrLogin(String(row.id)));
-    }
-    return c.json(state);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
-  }
-});
-
-app.get("/api/notifications/weixin/qr/status", async (c) => {
-  const qrKey = String(c.req.query("qrKey") ?? "").trim();
-  if (!qrKey) return c.json({ error: "weixin_qr_session_not_found" }, 404);
-  try {
-    const state = weixinPlatform.getQrLoginState(qrKey);
-    if (!state) return c.json({ error: "weixin_qr_session_not_found" }, 404);
-    if (state.status === "wait" || state.status === "scaned" || state.status === "scaned_but_redirect") {
-      return c.json(await weixinPlatform.refreshQrLogin(qrKey));
-    }
-    return c.json(state);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
-  }
-});
-
-app.delete("/api/notifications/accounts/:id", (c) => {
-  const deleteLinkedRecipients = c.req.query("deleteLinkedRecipients") === "true";
-  const result = deleteNotificationAccount(c.req.param("id"), { deleteLinkedRecipients });
-  if (!result.deleted) return c.json({ error: "notification_account_not_found" }, 404);
-  void Promise.resolve(feishuPlatform.syncConnections()).catch((error: unknown) => console.warn("feishu sync failed", error));
-  void Promise.resolve(wecomPlatform.syncConnections()).catch((error: unknown) => console.warn("wecom sync failed", error));
-  void Promise.resolve(qqPlatform.syncConnections()).catch((error: unknown) => console.warn("qq sync failed", error));
-  return c.json({ ok: true, deletedRecipientIds: deleteLinkedRecipients ? result.linkedRecipientIds : [] });
-});
-
-app.post("/api/notifications/accounts/:id/test", async (c) => {
-  const row = db.prepare("select * from notification_accounts where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!row) return c.json({ error: "notification_account_not_found" }, 404);
-  const body = await c.req.json<TestNotificationAccountRequest>().catch((): TestNotificationAccountRequest => ({}));
-  const account = notificationAccountFromRow(row, true);
-  const config = account.config as Record<string, unknown>;
-  const language = notificationLanguageFromConfig(config);
-  const emailTo = body?.emailTo?.length
-    ? body.emailTo
-    : Array.isArray(config.testEmailTo)
-      ? config.testEmailTo.map((item) => String(item).trim()).filter(Boolean)
-      : String(config.testEmailTo ?? "").split(",").map((item) => item.trim()).filter(Boolean);
-  const chatId = String(body?.chatId ?? config.testChatId ?? "").trim() || undefined;
-  if (account.channelKind === "wecom" && !chatId) {
-    void Promise.resolve(wecomPlatform.syncConnections()).catch((error: unknown) => console.warn("wecom sync failed", error));
-    let status = wecomPlatform.connectionStatus(account);
-    const deadline = Date.now() + 3_000;
-    while (!status.ok && status.status === "subscribing" && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 250));
-      status = wecomPlatform.connectionStatus(account);
-    }
-    db.prepare("update notification_accounts set last_test_status = ?, last_error = ?, updated_at = ? where id = ?")
-      .run(status.ok ? "sent" : "failed", status.error, new Date().toISOString(), account.id);
-    return c.json({
-      ok: status.ok,
-      status: status.status,
-      error: status.error,
-      account: notificationAccountFromRow(db.prepare("select * from notification_accounts where id = ?").get(account.id) as Record<string, unknown>),
-    }, status.ok ? 200 : 400);
-  }
-  const helpText = account.channelKind === "telegram"
-    ? telegramPlatform.telegramHelpText(account)
-    : account.channelKind === "weixin"
-      ? weixinPlatform.weixinHelpText(account)
-      : account.channelKind === "wecom"
-        ? wecomPlatform.wecomHelpText(account)
-      : account.channelKind === "dingtalk"
-        ? dingtalkPlatform.dingtalkHelpText(account)
-        : account.channelKind === "feishu"
-          ? feishuPlatform.feishuHelpText(account)
-          : account.channelKind === "qq"
-            ? qqPlatform.qqHelpText(account)
-            : "";
-  const customTitle = String(body?.title ?? "").trim();
-  const customMessage = String(body?.message ?? "").trim();
-  const includeHelp = body?.includeHelp !== false;
-  const title = customTitle || notificationLocaleText(language, notificationTestSettings.titleZh, notificationTestSettings.titleEn);
-  const message = customMessage
-    ? [customMessage, includeHelp ? helpText : ""].filter(Boolean).join("\n\n")
-    : [
-      notificationLocaleText(language, notificationTestSettings.messageZh, notificationTestSettings.messageEn),
-      "",
-      notificationTestSettings.includeHelp ? helpText : "",
-    ].filter((item, index) => index === 1 || Boolean(item)).join("\n");
-  const ok = await deliverNotification(account, {
-    eventType: "task_completed",
-    severity: "info",
-    title,
-    message,
-    sourceType: "notification-account",
-    sourceId: account.id,
-  }, null, { accountId: account.id, emailTo, chatId });
-  db.prepare("update notification_accounts set last_test_status = ?, last_error = (select last_error from notification_deliveries where account_id = ? order by created_at desc limit 1), updated_at = ? where id = ?")
-    .run(ok ? "sent" : "failed", account.id, new Date().toISOString(), account.id);
-  return c.json({ ok, account: notificationAccountFromRow(db.prepare("select * from notification_accounts where id = ?").get(account.id) as Record<string, unknown>) }, ok ? 200 : 400);
-});
-
-app.get("/api/notifications/recipients", (c) => c.json(listNotificationRecipients()));
-
-app.post("/api/notifications/recipients", async (c) => {
-  const body = await c.req.json<UpsertNotificationRecipientRequest>().catch(() => null);
-  const kind = body?.kind && ["email", "webhook", "bark", "telegram", "weixin", "wecom", "dingtalk", "feishu", "qq"].includes(body.kind) ? body.kind : null;
-  if (!body?.name?.trim() || !kind) return c.json({ error: "invalid_notification_recipient" }, 400);
-  const now = new Date().toISOString();
-  const id = `notification-recipient-${randomUUID()}`;
-  db.prepare(`
-    insert into notification_recipients (id, name, kind, enabled, sender_account_id, channel_id, config, permissions, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, body.name.trim(), kind, body.enabled === false ? 0 : 1, body.senderAccountId ?? null, body.channelId ?? null, JSON.stringify(body.config ?? {}), JSON.stringify(sanitizeNotificationPermissions(body.permissions)), now, now);
-  return c.json(notificationRecipientFromRow(db.prepare("select * from notification_recipients where id = ?").get(id) as Record<string, unknown>), 201);
-});
-
-app.patch("/api/notifications/recipients/:id", async (c) => {
-  const current = db.prepare("select * from notification_recipients where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!current) return c.json({ error: "notification_recipient_not_found" }, 404);
-  const body = await c.req.json<UpsertNotificationRecipientRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_notification_recipient" }, 400);
-  const recipient = notificationRecipientFromRow(current, true);
-  db.prepare(`
-    update notification_recipients
-    set name = ?, kind = ?, enabled = ?, sender_account_id = ?, channel_id = ?, config = ?, permissions = ?, updated_at = ?
-    where id = ?
-  `).run(
-    body.name?.trim() || recipient.name,
-    body.kind ?? recipient.kind,
-    body.enabled === undefined ? (recipient.enabled ? 1 : 0) : body.enabled ? 1 : 0,
-    body.senderAccountId === undefined ? recipient.senderAccountId : body.senderAccountId,
-    body.channelId === undefined ? recipient.channelId : body.channelId,
-    JSON.stringify({ ...recipient.config, ...(body.config ?? {}) }),
-    JSON.stringify(body.permissions === undefined ? recipient.permissions ?? {} : sanitizeNotificationPermissions(body.permissions)),
-    new Date().toISOString(),
-    c.req.param("id"),
-  );
-  return c.json(notificationRecipientFromRow(db.prepare("select * from notification_recipients where id = ?").get(c.req.param("id")) as Record<string, unknown>));
-});
-
-app.post("/api/notifications/recipients/:id/test", async (c) => {
-  const row = db.prepare("select * from notification_recipients where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!row) return c.json({ error: "notification_recipient_not_found" }, 404);
-  const recipient = notificationRecipientFromRow(row, true);
-  try {
-    const ok = await deliverNotificationToRecipient(recipient, {
-      eventType: "task_completed",
-      severity: "info",
-      title: "Codex Web test notification",
-      message: [
-        "This is a test notification from Codex Web.",
-        "",
-        recipient.kind === "telegram"
-          ? telegramPlatform.telegramHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
-          : recipient.kind === "weixin"
-            ? weixinPlatform.weixinHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
-            : recipient.kind === "wecom"
-              ? wecomPlatform.wecomHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
-              : recipient.kind === "dingtalk"
-                ? dingtalkPlatform.dingtalkHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
-              : recipient.kind === "qq"
-                ? qqPlatform.qqHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
-                : recipient.kind === "feishu"
-                  ? feishuPlatform.feishuHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
-            : "",
-      ].join("\n"),
-      sourceType: "notification-recipient",
-      sourceId: recipient.id,
-    }, null, { recipientId: recipient.id });
-    return c.json({ ok, recipient: notificationRecipientFromRow(row) }, ok ? 200 : 400);
-  } catch (error) {
-    return c.json({ ok: false, error: error instanceof Error ? error.message : String(error), recipient: notificationRecipientFromRow(row) }, 400);
-  }
-});
-
-app.post("/api/notifications/ephemeral-rules", async (c) => {
-  const body = await c.req.json<{
-    scopeType?: "session" | "task" | "room_task" | "automation";
-    scopeId?: string;
-    eventTypes?: NotificationEventType[];
-    targets?: NotificationRuleTarget[];
-    expireMode?: "after_trigger" | "session_end" | "manual";
-  }>().catch(() => null);
-  const rule = body ? createNotificationEphemeralRule(body) : null;
-  if (!rule) return c.json({ error: "invalid_notification_ephemeral_rule" }, 400);
-  return c.json(rule, 201);
-});
-
-app.delete("/api/notifications/ephemeral-rules/:id", (c) => {
-  const result = db.prepare("delete from notification_ephemeral_rules where id = ?").run(c.req.param("id"));
-  if (!result.changes) return c.json({ error: "notification_ephemeral_rule_not_found" }, 404);
-  return c.json({ ok: true });
-});
-
-app.delete("/api/notifications/recipients/:id", (c) => {
-  const recipientId = c.req.param("id");
-  const result = db.prepare("delete from notification_recipients where id = ?").run(recipientId);
-  if (!result.changes) return c.json({ error: "notification_recipient_not_found" }, 404);
-  cleanupNotificationTargetsForDeletedReferences({ recipientIds: [recipientId] });
-  return c.json({ ok: true });
-});
-
-app.get("/api/notifications/ephemeral-rules", (c) => c.json(listNotificationEphemeralRules(parsePageLimit(c.req.query("limit"), 50), c.req.query("cursor"))));
-
-app.get("/api/notifications/rules", (c) => c.json(listNotificationRules(
-  parsePageLimit(c.req.query("limit"), 50),
-  c.req.query("cursor"),
-  { enabled: c.req.query("enabled") === "true" ? true : c.req.query("enabled") === "false" ? false : undefined },
-)));
-
-app.delete("/api/notifications/rules", (c) => {
-  const rules = db.prepare("delete from notification_rules").run();
-  const ephemeral = db.prepare("delete from notification_ephemeral_rules").run();
-  return c.json({ ok: true, deleted: rules.changes + ephemeral.changes });
-});
-
-app.post("/api/notifications/rules", async (c) => {
-  const body = await c.req.json<UpsertNotificationRuleRequest>().catch(() => null);
-  if (!body?.name?.trim()) return c.json({ error: "invalid_notification_rule" }, 400);
-  const eventTypes = (body.eventTypes ?? []).filter((type) => notificationEventTypes.includes(type));
-  const targets = sanitizeNotificationTargets(body.targets);
-  if (!eventTypes.length || !targets.length) return c.json({ error: "notification_rule_requires_events_and_targets" }, 400);
-  const now = new Date().toISOString();
-  const id = `notification-rule-${randomUUID()}`;
-  db.prepare(`
-    insert into notification_rules (id, name, enabled, event_types, min_severity, targets, dedupe_minutes, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    id,
-    body.name.trim(),
-    body.enabled === false ? 0 : 1,
-    JSON.stringify(eventTypes),
-    body.minSeverity && notificationSeverityRank[body.minSeverity] !== undefined ? body.minSeverity : "info",
-    JSON.stringify(targets),
-    Math.max(0, Number(body.dedupeMinutes) || 0),
-    now,
-    now,
-  );
-  return c.json(notificationRuleFromRow(db.prepare("select * from notification_rules where id = ?").get(id) as Record<string, unknown>), 201);
-});
-
-app.patch("/api/notifications/rules/:id", async (c) => {
-  const current = db.prepare("select * from notification_rules where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!current) return c.json({ error: "notification_rule_not_found" }, 404);
-  const body = await c.req.json<UpsertNotificationRuleRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_notification_rule" }, 400);
-  const rule = notificationRuleFromRow(current);
-  const eventTypes = body.eventTypes ? body.eventTypes.filter((type) => notificationEventTypes.includes(type)) : rule.eventTypes;
-  const targets = body.targets ? sanitizeNotificationTargets(body.targets) : rule.targets;
-  if (!eventTypes.length || !targets.length) return c.json({ error: "notification_rule_requires_events_and_targets" }, 400);
-  db.prepare(`
-    update notification_rules
-    set name = ?, enabled = ?, event_types = ?, min_severity = ?, targets = ?, dedupe_minutes = ?, updated_at = ?
-    where id = ?
-  `).run(
-    body.name?.trim() || rule.name,
-    body.enabled === undefined ? (rule.enabled ? 1 : 0) : body.enabled ? 1 : 0,
-    JSON.stringify(eventTypes),
-    body.minSeverity && notificationSeverityRank[body.minSeverity] !== undefined ? body.minSeverity : rule.minSeverity,
-    JSON.stringify(targets),
-    Math.max(0, Number(body.dedupeMinutes ?? rule.dedupeMinutes) || 0),
-    new Date().toISOString(),
-    c.req.param("id"),
-  );
-  return c.json(notificationRuleFromRow(db.prepare("select * from notification_rules where id = ?").get(c.req.param("id")) as Record<string, unknown>));
-});
-
-app.delete("/api/notifications/rules/:id", (c) => {
-  const result = db.prepare("delete from notification_rules where id = ?").run(c.req.param("id"));
-  if (!result.changes) return c.json({ error: "notification_rule_not_found" }, 404);
-  return c.json({ ok: true });
-});
-
-app.get("/api/notifications/deliveries", (c) => {
-  const eventType = c.req.query("eventType") as NotificationEventType | undefined;
-  const status = c.req.query("status") as NotificationDeliveryStatus | undefined;
-  const severity = c.req.query("severity") as NotificationSeverity | undefined;
-  return c.json(listNotificationDeliveries(
-    parsePageLimit(c.req.query("limit"), 50),
-    c.req.query("cursor"),
-    {
-      eventType: eventType && notificationEventTypes.includes(eventType) ? eventType : undefined,
-      status: status && ["pending", "sent", "failed", "skipped"].includes(status) ? status : undefined,
-      severity: severity && notificationSeverityRank[severity] !== undefined ? severity : undefined,
-    },
-  ));
-});
-
-app.delete("/api/notifications/deliveries", (c) => {
-  const result = db.prepare("delete from notification_deliveries").run();
-  return c.json({ ok: true, deleted: result.changes });
-});
-
-app.post("/api/notifications/deliveries/:id/retry", async (c) => {
-  const row = db.prepare("select * from notification_deliveries where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!row) return c.json({ error: "notification_delivery_not_found" }, 404);
-  const delivery = notificationDeliveryFromRow(row);
-  const metadata = delivery.metadata ?? {};
-  const metadataTarget = metadata.target && typeof metadata.target === "object" ? metadata.target as Record<string, unknown> : {};
-  const metadataRecipient = metadata.recipient && typeof metadata.recipient === "object" ? metadata.recipient as Record<string, unknown> : {};
-  const target: NotificationRuleTarget = sanitizeNotificationTargets([{
-    accountId: metadataTarget.accountId ? String(metadataTarget.accountId) : delivery.accountId ?? undefined,
-    recipientId: metadataTarget.recipientId ? String(metadataTarget.recipientId) : metadataRecipient.id ? String(metadataRecipient.id) : undefined,
-    senderAccountId: metadataTarget.senderAccountId ? String(metadataTarget.senderAccountId) : undefined,
-    chatId: metadataTarget.chatId ? String(metadataTarget.chatId) : undefined,
-    emailTo: Array.isArray(metadataTarget.emailTo) ? metadataTarget.emailTo.map((item) => String(item)) : undefined,
-  }])[0] ?? {};
-  const event: NotificationEventInput = {
-    eventType: delivery.eventType,
-    severity: delivery.severity,
-    title: delivery.title,
-    message: delivery.message,
-    sourceType: typeof metadata.sourceType === "string" ? metadata.sourceType : undefined,
-    sourceId: typeof metadata.sourceId === "string" ? metadata.sourceId : undefined,
-    metadata: {
-      ...(metadata.eventMetadata && typeof metadata.eventMetadata === "object" ? metadata.eventMetadata as Record<string, unknown> : {}),
-      retryOfDeliveryId: delivery.id,
-    },
-  };
-  if (target.recipientId) {
-    const recipientRow = db.prepare("select * from notification_recipients where id = ?").get(target.recipientId) as Record<string, unknown> | undefined;
-    if (!recipientRow) return c.json({ error: "notification_recipient_not_found" }, 404);
-    const ok = await deliverNotificationToRecipient(notificationRecipientFromRow(recipientRow, true), event, delivery.ruleId ?? null, target);
-    return c.json({ ok });
-  }
-  if (!delivery.accountId) return c.json({ error: "notification_delivery_target_missing" }, 400);
-  const accountRow = db.prepare("select * from notification_accounts where id = ?").get(delivery.accountId) as Record<string, unknown> | undefined;
-  if (!accountRow) {
-    const recipientRow = db.prepare("select * from notification_recipients where id = ?").get(delivery.accountId) as Record<string, unknown> | undefined;
-    if (recipientRow) {
-      const ok = await deliverNotificationToRecipient(notificationRecipientFromRow(recipientRow, true), event, delivery.ruleId ?? null, { ...target, recipientId: delivery.accountId });
-      return c.json({ ok });
-    }
-  }
-  if (!accountRow) return c.json({ error: "notification_account_not_found" }, 404);
-  const ok = await deliverNotification(notificationAccountFromRow(accountRow, true), event, delivery.ruleId ?? null, { ...target, accountId: delivery.accountId });
-  return c.json({ ok });
-});
-
-app.delete("/api/notifications/deliveries/:id", (c) => {
-  const result = db.prepare("delete from notification_deliveries where id = ?").run(c.req.param("id"));
-  if (!result.changes) return c.json({ error: "notification_delivery_not_found" }, 404);
-  return c.json({ ok: true });
-});
-
-app.get("/api/settings/storage", (c) => c.json(listStorageItems()));
-
-app.post("/api/settings/storage/delete", async (c) => {
-  const body = await c.req.json<{ type?: string; path?: string; force?: boolean }>().catch(() => null);
-  if (!body?.type || !body.path) return c.json({ error: "invalid_storage_item" }, 400);
-  try {
-    deleteStorageItem(body.type, body.path, body.force === true);
-    return c.json(listStorageItems());
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "storage_delete_failed" }, 400);
-  }
-});
-
-app.post("/api/settings/storage/delete-batch", async (c) => {
-  const body = await c.req.json<{ items?: Array<{ type?: string; path?: string }>; force?: boolean }>().catch(() => null);
-  const items = Array.isArray(body?.items) ? body.items : [];
-  if (!items.length) return c.json({ error: "invalid_storage_items" }, 400);
-  const currentItems = listStorageItems().items;
-  if (body?.force !== true && items.some((item) => currentItems.some((entry) => entry.type === item.type && entry.path === item.path && entry.status === "active"))) {
-    return c.json({ error: "storage_item_active", deleted: 0 }, 400);
-  }
-  let deleted = 0;
-  try {
-    for (const item of items) {
-      if (!item.type || !item.path) continue;
-      deleteStorageItem(item.type, item.path, body?.force === true);
-      deleted += 1;
-    }
-    return c.json({ ...listStorageItems(), deleted });
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "storage_delete_failed", deleted }, 400);
-  }
-});
-
-app.get("/api/settings/backup", (c) => c.json(systemBackupSettings));
-
-app.patch("/api/settings/backup", async (c) => {
-  const body = await c.req.json<UpdateSystemBackupSettingsRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_body" }, 400);
-  systemBackupSettings = sanitizeSystemBackupSettings({ ...body, updatedAt: new Date().toISOString() });
-  saveSystemBackupSettings(systemBackupSettings);
-  return c.json(systemBackupSettings);
-});
-
-app.get("/api/settings/backup/preview", (c) => {
-  try {
-    const backup = createSystemBackupArchive();
-    const response: SystemBackupPreviewResponse = {
-      ok: true,
-      manifest: backup.manifest,
-      entries: backup.entries,
-      bytes: backup.bytes,
-      restartRequired: false,
-    };
-    return c.json(response);
-  } catch (error) {
-    emitExternalNotification({
-      eventType: "backup_failed",
-      severity: "error",
-      title: "备份预览失败",
-      message: error instanceof Error ? error.message : "backup_preview_failed",
-      sourceType: "backup",
-      sourceId: "preview",
-    });
-    return c.json({ error: error instanceof Error ? error.message : "backup_preview_failed" }, 500);
-  }
-});
-
-app.get("/api/settings/backup/download", (c) => {
-  try {
-    const backup = createSystemBackupArchive();
-    const filename = `codex-web-system-backup-${backup.manifest.createdAt.replace(/[:.]/g, "-")}.zip`;
-    c.header("content-type", "application/zip");
-    c.header("content-disposition", `attachment; filename="${filename}"`);
-    return c.body(backup.buffer);
-  } catch (error) {
-    emitExternalNotification({
-      eventType: "backup_failed",
-      severity: "error",
-      title: "备份下载失败",
-      message: error instanceof Error ? error.message : "backup_download_failed",
-      sourceType: "backup",
-      sourceId: "download",
-    });
-    return c.json({ error: error instanceof Error ? error.message : "backup_download_failed" }, 500);
-  }
-});
-
-app.post("/api/settings/restore/preview", async (c) => {
-  try {
-    const buffer = await readBackupUpload(c);
-    return c.json(systemBackupPreviewFromArchive(buffer));
-  } catch (error) {
-    emitExternalNotification({
-      eventType: "restore_failed",
-      severity: "error",
-      title: "恢复预览失败",
-      message: error instanceof Error ? error.message : "restore_preview_failed",
-      sourceType: "restore",
-      sourceId: "preview",
-    });
-    return c.json({ error: error instanceof Error ? error.message : "restore_preview_failed" }, 400);
-  }
-});
-
-app.post("/api/settings/restore", async (c) => {
-  try {
-    const buffer = await readBackupUpload(c);
-    const parsed = readSystemBackupArchive(buffer);
-    if (!parsed.entries.length) return c.json({ error: "backup_has_no_app_data" }, 400);
-    const beforeRestore = createSystemBackupArchive();
-    const restoreBackupRoot = join(dirname(dataDir), "restore-backups");
-    mkdirSync(restoreBackupRoot, { recursive: true });
-    const backupBeforeRestorePath = join(restoreBackupRoot, `pre-restore-${backupTimestamp()}.zip`);
-    writeFileSync(backupBeforeRestorePath, beforeRestore.buffer);
-
-    try {
-      db.pragma("wal_checkpoint(FULL)");
-      db.close();
-    } catch {
-      // The API service must be restarted after restore, so failure to close cleanly is reported by the restart requirement.
-    }
-
-    rmSync(dataDir, { recursive: true, force: true });
-    mkdirSync(dataDir, { recursive: true });
-    for (const entry of parsed.entries) {
-      const targetPath = join(dataDir, entry.relativePath);
-      if (!pathWithinRoot(targetPath, dataDir)) throw new Error("invalid_backup_entry");
-      mkdirSync(dirname(targetPath), { recursive: true });
-      writeFileSync(targetPath, entry.data);
-    }
-
-    const response: SystemRestoreResponse = {
-      ok: true,
-      manifest: parsed.manifest,
-      restoredAt: new Date().toISOString(),
-      backupBeforeRestorePath,
-      restartRequired: true,
-      warnings: [
-        ...parsed.manifest.warnings,
-        "系统数据已还原到 apps/api/data。请通过终端重启 API 服务后再继续使用；无需重启前端或 Docker 容器。",
-      ],
-    };
-    return c.json(response);
-  } catch (error) {
-    emitExternalNotification({
-      eventType: "restore_failed",
-      severity: "error",
-      title: "系统恢复失败",
-      message: error instanceof Error ? error.message : "restore_failed",
-      sourceType: "restore",
-      sourceId: "apply",
-    });
-    return c.json({ error: error instanceof Error ? error.message : "restore_failed" }, 400);
-  }
-});
-
-app.get("/api/settings/codex-runtime", (c) => c.json(codexRuntimeSettings));
-
-app.patch("/api/settings/codex-runtime", async (c) => {
-  const body = await c.req.json<UpdateCodexRuntimeSettingsRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_body" }, 400);
-  const next = runtimeSettingsStore.codexRuntime.sanitize({
-    ...codexRuntimeSettings,
-    ...body,
-    updatedAt: new Date().toISOString(),
-  });
-  const risk = codexRuntimeRisk(codexRuntimeSettings, next);
-  if (risk) {
-    if (approvalAlwaysAllowed("codex-runtime-update", next)) return c.json(applyCodexRuntimeSettings(next));
-    const approval = createApproval({
-      actionType: "codex-runtime-update",
-      risk,
-      title: "Codex execution permission change",
-      description: risk === "critical"
-        ? "Enable Codex sandbox and approval bypass for new tasks."
-        : "Enable full filesystem access for new Codex tasks.",
-      details: codexRuntimeDetails(next),
-      payload: next,
-    });
-    return c.json({ error: "approval_required", approval: publicApproval(approval) }, 409);
-  }
-  return c.json(applyCodexRuntimeSettings(next));
-});
-
-app.get("/api/approvals", (c) => {
-  expirePreviewAccessRequests();
-  const status = c.req.query("status");
-  if (status && !["pending", "approved", "denied"].includes(status)) return c.json({ error: "invalid_status" }, 400);
-  const archived = c.req.query("archived") === "true";
-  const page = listApprovals(status, archived, parsePageLimit(c.req.query("limit")), c.req.query("cursor"));
-  return c.json({ ...page, items: page.items.map(publicApproval) });
-});
-
-app.get("/api/approval-grants", (c) => c.json(listApprovalGrants(parsePageLimit(c.req.query("limit")), c.req.query("cursor"))));
-
-app.delete("/api/approval-grants/:id", (c) => {
-  const result = db.prepare("delete from approval_grants where id = ?").run(c.req.param("id"));
-  if (!result.changes) return c.json({ error: "approval_grant_not_found" }, 404);
-  return c.json({ ok: true, id: c.req.param("id") });
-});
-
-app.post("/api/approvals/:id/archive", (c) => {
-  const approval = getApproval(c.req.param("id"));
-  if (!approval) return c.json({ error: "approval_not_found" }, 404);
-  if (approval.status === "pending") return c.json({ error: "approval_pending_cannot_archive", approval: publicApproval(approval) }, 409);
-  const archived = archiveApproval(approval.id);
-  if (!archived?.archivedAt) return c.json({ error: "approval_archive_failed" }, 400);
-  return c.json(publicApproval(archived));
-});
-
-app.post("/api/approvals/:id/restore", (c) => {
-  const approval = getApproval(c.req.param("id"));
-  if (!approval) return c.json({ error: "approval_not_found" }, 404);
-  const restored = restoreApproval(approval.id);
-  if (!restored) return c.json({ error: "approval_not_found" }, 404);
-  return c.json(publicApproval(restored));
-});
-
-app.post("/api/approvals/:id/approve", (c) => {
-  const approval = getApproval(c.req.param("id"));
-  if (!approval) return c.json({ error: "approval_not_found" }, 404);
-  if (approval.status !== "pending") return c.json({ error: "approval_already_resolved", approval: publicApproval(approval) }, 409);
-  if (c.req.query("always") === "true" || c.req.query("expiresIn")) {
-    const expiresIn = Number(c.req.query("expiresIn") ?? 0);
-    const expiresAt = Number.isFinite(expiresIn) && expiresIn > 0 ? new Date(Date.now() + Math.min(expiresIn, 30 * 24 * 60 * 60) * 1000).toISOString() : null;
-    saveApprovalGrant(approval, expiresAt);
-  }
-  let codexRuntime: CodexRuntimeSettings | undefined;
-  if (approval.actionType === "codex-runtime-update") {
-    codexRuntime = applyCodexRuntimeSettings(runtimeSettingsStore.codexRuntime.sanitize(approval.payload as Partial<CodexRuntimeSettings>));
-  }
-  let preview: PreviewSummary | undefined;
-  if (approval.actionType === "preview-command-run") {
-    const payload = approval.payload && typeof approval.payload === "object" ? approval.payload as { previewId?: unknown } : {};
-    const record = previews.get(String(payload.previewId ?? ""));
-    if (!record) return c.json({ error: "preview_not_found" }, 404);
-    try {
-      startPreviewProcess(record);
-      preview = publicPreview(record);
-    } catch (error) {
-      record.status = "error";
-      updatePreview(record);
-      return c.json({ error: error instanceof Error ? error.message : "preview_start_failed", preview: publicPreview(record) }, 400);
-    }
-  }
-  if (approval.actionType === "preview-access") {
-    const payload = approval.payload && typeof approval.payload === "object" ? approval.payload as { requestId?: unknown; previewId?: unknown } : {};
-    const request = previewAccessRequests.get(String(payload.requestId ?? ""));
-    if (!request) return c.json({ error: "preview_access_request_not_found" }, 404);
-    const expiresIn = Number(c.req.query("expiresIn") ?? 15 * 60);
-    const ttlSeconds = c.req.query("always") === "true"
-      ? 30 * 24 * 60 * 60
-      : Number.isFinite(expiresIn) && expiresIn > 0
-        ? Math.min(expiresIn, 30 * 24 * 60 * 60)
-        : 15 * 60;
-    const approvedUntil = new Date(Date.now() + ttlSeconds * 1000).toISOString();
-    const requests = Array.from(previewAccessRequests.values()).filter((item) =>
-      item.id === request.id || (payload.previewId && item.previewId === String(payload.previewId) && item.status === "pending")
-    );
-    for (const item of requests) {
-      item.status = "approved";
-      item.approvedUntil = approvedUntil;
-      item.updatedAt = new Date().toISOString();
-      upsertPreviewAccessRequest(item);
-    }
-  }
-  if (approval.actionType === "project-delete-files") {
-    const payload = approval.payload && typeof approval.payload === "object" ? approval.payload as { projectId?: unknown } : {};
-    try {
-      deleteProjectRecord(String(payload.projectId ?? ""), true);
-    } catch (error) {
-      return c.json({ error: error instanceof Error ? error.message : "project_delete_failed" }, 400);
-    }
-  }
-  let merge: RoomRunMergeResponse | undefined;
-  if (approval.actionType === "room-run-merge") {
-    const payload = approval.payload && typeof approval.payload === "object" ? approval.payload as { roomId?: unknown; runId?: unknown } : {};
-    try {
-      merge = applyRoomRunMerge(String(payload.roomId ?? ""), String(payload.runId ?? ""));
-      if (!merge.ok) return c.json({ error: merge.message || "merge_failed", merge }, 409);
-    } catch (error) {
-      return c.json({ error: error instanceof Error ? error.message : "merge_failed" }, 400);
-    }
-  }
-  let gitOperation: ProjectGitOperationSummary | undefined;
-  if (approval.actionType === "project-git-operation") {
-    const payload = approval.payload && typeof approval.payload === "object" ? approval.payload as { projectId?: unknown; operation?: unknown; args?: unknown } : {};
-    const project = appData.projects.find((item) => item.id === String(payload.projectId ?? ""));
-    if (!project) return c.json({ error: "project_not_found" }, 404);
-    const args = Array.isArray(payload.args) ? payload.args.map(String) : [];
-    const operation = String(payload.operation ?? "") as ProjectGitOperationType;
-    gitOperation = runProjectGitOperation(project, operation, args);
-  }
-  const resolved = resolveApproval(approval.id, "approved");
-  if (!resolved) return c.json({ error: "approval_not_found" }, 404);
-  const response: ApprovalDecisionResponse = { approval: publicApproval(resolved), codexRuntime, preview, merge, gitOperation };
-  return c.json(response);
-});
-
-app.post("/api/approvals/:id/deny", (c) => {
-  const approval = getApproval(c.req.param("id"));
-  if (!approval) return c.json({ error: "approval_not_found" }, 404);
-  if (approval.status !== "pending") return c.json({ error: "approval_already_resolved", approval: publicApproval(approval) }, 409);
-  const resolved = resolveApproval(approval.id, "denied");
-  if (!resolved) return c.json({ error: "approval_not_found" }, 404);
-  if (approval.actionType === "room-run-merge") {
-    const payload = approval.payload && typeof approval.payload === "object" ? approval.payload as { roomId?: unknown; runId?: unknown } : {};
-    const roomId = String(payload.roomId ?? "");
-    if (roomId) createRoomDecision(roomId, {
-      title: "Merge approval denied",
-      status: "rejected",
-      payload: { approvalId: approval.id, runId: payload.runId ?? null },
-      resolvedAt: new Date().toISOString(),
-    });
-  }
-  if (approval.actionType === "preview-access") {
-    const payload = approval.payload && typeof approval.payload === "object" ? approval.payload as { requestId?: unknown } : {};
-    const request = previewAccessRequests.get(String(payload.requestId ?? ""));
-    if (request) {
-      request.status = "denied";
-      request.updatedAt = new Date().toISOString();
-      upsertPreviewAccessRequest(request);
-    }
-  }
-  const response: ApprovalDecisionResponse = { approval: publicApproval(resolved) };
-  return c.json(response);
-});
-
-app.get("/api/goals", (c) => {
-  const ownerType = goalOwnerType(c.req.query("ownerType"));
-  const ownerId = c.req.query("ownerId")?.trim();
-  const status = c.req.query("status");
-  const limit = parsePageLimit(c.req.query("limit"), 30);
-  const rows = db.prepare(`
-    select * from goals
-    where (@ownerType is null or owner_type = @ownerType)
-      and (@ownerId is null or owner_id = @ownerId)
-      and (@status is null or status = @status)
-    order by updated_at desc, id desc
-    limit @limit
-  `).all({ ownerType, ownerId: ownerId || null, status: status || null, limit }) as Array<Record<string, unknown>>;
-  return c.json(rows.map(goalFromRow));
-});
-
-app.post("/api/goals", async (c) => {
-  const body = await c.req.json<CreateGoalRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_goal" }, 400);
-  try {
-    const actor = goalActorFromRequest(c, body as unknown as Record<string, unknown>);
-    if (actor.type === "agent") return c.json({ error: "goal_agent_must_propose" }, 403);
-    return c.json(createGoal(body, actor.type, actor.agentId), 201);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "goal_create_failed";
-    return c.json({ error: message }, message.endsWith("_not_found") ? 404 : 400);
-  }
-});
-
-app.get("/api/goals/:id", (c) => {
-  try {
-    return c.json(goalDetail(c.req.param("id")));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "goal_not_found" }, 404);
-  }
-});
-
-app.patch("/api/goals/:id", async (c) => {
-  const body = await c.req.json<UpdateGoalRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_goal_update" }, 400);
-  try {
-    const actor = goalActorFromRequest(c, body as unknown as Record<string, unknown>);
-    const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>);
-    assertCanManageGoal(goal, actor);
-    return c.json(updateGoal(c.req.param("id"), body, actor.type, actor.agentId));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "goal_update_failed";
-    return c.json({ error: message }, message === "goal_agent_must_propose" || message === "agent_actor_not_found" ? 403 : 404);
-  }
-});
-
-app.delete("/api/goals/:id", (c) => {
-  try {
-    const actor = goalActorFromRequest(c);
-    const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>);
-    assertCanManageGoal(goal, actor);
-    return c.json(updateGoal(c.req.param("id"), { status: "cancelled" }, actor.type, actor.agentId));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "goal_cancel_failed";
-    return c.json({ error: message }, message === "goal_agent_must_propose" || message === "agent_actor_not_found" ? 403 : 404);
-  }
-});
-
-app.get("/api/goals/:id/events", (c) => {
-  const rows = db.prepare("select * from goal_events where goal_id = ? order by created_at desc, id desc limit ?").all(c.req.param("id"), parsePageLimit(c.req.query("limit"), 80)) as Array<Record<string, unknown>>;
-  return c.json(rows.map(goalEventFromRow));
-});
-
-app.post("/api/goals/:id/focuses", async (c) => {
-  const body = await c.req.json<CreateGoalFocusRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_goal_focus" }, 400);
-  try {
-    const actor = goalActorFromRequest(c, body as unknown as Record<string, unknown>);
-    const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>);
-    assertCanManageGoal(goal, actor);
-    return c.json(createGoalFocus(c.req.param("id"), body, actor.type, actor.agentId), 201);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "goal_focus_create_failed";
-    return c.json({ error: message }, message === "goal_agent_must_propose" || message === "agent_actor_not_found" ? 403 : 400);
-  }
-});
-
-app.patch("/api/goals/:id/focuses/:focusId", async (c) => {
-  const body = await c.req.json<UpdateGoalFocusRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_goal_focus_update" }, 400);
-  try {
-    const actor = goalActorFromRequest(c, body as unknown as Record<string, unknown>);
-    const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>);
-    assertCanManageGoal(goal, actor);
-    return c.json(updateGoalFocus(c.req.param("id"), c.req.param("focusId"), body, actor.type, actor.agentId));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "goal_focus_update_failed";
-    return c.json({ error: message }, message === "goal_agent_must_propose" || message === "agent_actor_not_found" ? 403 : 404);
-  }
-});
-
-app.get("/api/goals/:id/items", (c) => {
-  const rows = db.prepare("select * from goal_items where goal_id = ? order by priority desc, updated_at desc, id desc").all(c.req.param("id")) as Array<Record<string, unknown>>;
-  return c.json(rows.map(goalItemFromRow));
-});
-
-app.post("/api/goals/:id/items", async (c) => {
-  const body = await c.req.json<CreateGoalItemRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_goal_item" }, 400);
-  try {
-    const actor = goalActorFromRequest(c, body as unknown as Record<string, unknown>);
-    const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>);
-    assertCanManageGoal(goal, actor);
-    return c.json(createGoalItem(c.req.param("id"), body, actor.type, actor.agentId), 201);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "goal_item_create_failed";
-    return c.json({ error: message }, message === "goal_agent_must_propose" || message === "agent_actor_not_found" ? 403 : 400);
-  }
-});
-
-app.patch("/api/goals/:id/items/:itemId", async (c) => {
-  const body = await c.req.json<UpdateGoalItemRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_goal_item_update" }, 400);
-  try {
-    const actor = goalActorFromRequest(c, body as unknown as Record<string, unknown>);
-    assertCanUpdateGoalItem(c.req.param("id"), c.req.param("itemId"), actor);
-    return c.json(updateGoalItem(c.req.param("id"), c.req.param("itemId"), body, actor.type, actor.agentId));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "goal_item_update_failed";
-    return c.json({ error: message }, message === "goal_item_agent_not_assigned" || message === "agent_actor_not_found" ? 403 : 404);
-  }
-});
-
-app.delete("/api/goals/:id/items/:itemId", (c) => {
-  try {
-    const actor = goalActorFromRequest(c);
-    assertCanUpdateGoalItem(c.req.param("id"), c.req.param("itemId"), actor);
-    return c.json(updateGoalItem(c.req.param("id"), c.req.param("itemId"), { status: "cancelled" }, actor.type, actor.agentId));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "goal_item_cancel_failed";
-    return c.json({ error: message }, message === "goal_item_agent_not_assigned" || message === "agent_actor_not_found" ? 403 : 404);
-  }
-});
-
-app.get("/api/goals/:id/proposals", (c) => {
-  return c.json(listGoalProposals(c.req.param("id")));
-});
-
-app.post("/api/goals/:id/proposals", async (c) => {
-  const body = await c.req.json<{ kind?: unknown; title?: unknown; payload?: unknown; proposedByAgentId?: unknown }>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_goal_proposal" }, 400);
-  try {
-    const actor = goalActorFromRequest(c, body);
-    return c.json(createGoalProposal(c.req.param("id"), body, actor.type === "agent" ? "agent" : "user", actor.agentId), 201);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "goal_proposal_create_failed";
-    return c.json({ error: message }, message === "agent_actor_not_found" ? 403 : 400);
-  }
-});
-
-app.post("/api/goals/:id/proposals/:proposalId/approve", (c) => {
-  try {
-    const actor = goalActorFromRequest(c);
-    const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>);
-    assertCanManageGoal(goal, actor);
-    return c.json(applyGoalProposal(c.req.param("id"), c.req.param("proposalId"), actor.type, actor.agentId));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "goal_proposal_approve_failed";
-    return c.json({ error: message }, message === "goal_agent_must_propose" || message === "agent_actor_not_found" ? 403 : 404);
-  }
-});
-
-app.post("/api/goals/:id/proposals/:proposalId/reject", (c) => {
-  try {
-    const actor = goalActorFromRequest(c);
-    const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>);
-    assertCanManageGoal(goal, actor);
-    return c.json(rejectGoalProposal(c.req.param("id"), c.req.param("proposalId"), actor.type, actor.agentId));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "goal_proposal_reject_failed";
-    return c.json({ error: message }, message === "goal_agent_must_propose" || message === "agent_actor_not_found" ? 403 : 404);
-  }
-});
-
-app.post("/api/goals/:id/plan", (c) => {
-  try {
-    const actor = goalActorFromRequest(c);
-    const goal = goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>);
-    assertCanManageGoal(goal, actor);
-    const items = createDefaultGoalPlan(c.req.param("id"), actor.type, actor.agentId);
-    return c.json({ goal: goalFromRow(db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown>), items }, 201);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "goal_plan_failed";
-    return c.json({ error: message }, message === "goal_agent_must_propose" || message === "agent_actor_not_found" ? 403 : 400);
-  }
-});
-
-app.post("/api/goals/:id/orchestrate", (c) => {
-  const goalRow = db.prepare("select * from goals where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!goalRow) return c.json({ error: "goal_not_found" }, 404);
-  const goal = goalFromRow(goalRow);
-  try {
-    assertCanManageGoal(goal, goalActorFromRequest(c));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "goal_orchestrate_forbidden";
-    return c.json({ error: message }, 403);
-  }
-  if (goal.ownerType !== "room") return c.json({ error: "goal_owner_not_room" }, 400);
-  const room = db.prepare("select * from rooms where id = ?").get(goal.ownerId) as Record<string, unknown> | undefined;
-  if (!room) return c.json({ error: "room_not_found" }, 404);
-  let items = (db.prepare("select * from goal_items where goal_id = ? and room_task_id is null and status not in ('completed', 'cancelled') order by priority desc, updated_at asc").all(goal.id) as Array<Record<string, unknown>>).map(goalItemFromRow);
-  if (!items.length) {
-    items = [createGoalItem(goal.id, {
-      title: goal.currentFocus?.text || goal.text.slice(0, 120),
-      description: goal.currentFocus ? goal.text : null,
-      status: "planned",
-      assignedAgentId: goal.coordinatorAgentId ?? goal.managerAgentId ?? null,
-      priority: 1,
-    }, "system")];
-  }
-  const now = new Date().toISOString();
-  const created: RoomTaskSummary[] = [];
-  for (const item of items) {
-    const assignedAgentId = item.assignedAgentId && db.prepare("select agent_id from room_agents where room_id = ? and agent_id = ?").get(goal.ownerId, item.assignedAgentId)
-      ? item.assignedAgentId
-      : goal.coordinatorAgentId ?? goal.managerAgentId ?? null;
-    const taskId = `room-task-${randomUUID()}`;
-    db.prepare(`
-      insert into room_tasks (id, room_id, goal_item_id, title, prompt, status, assigned_agent_id, priority, depends_on_task_id, scheduled_at, payload, created_at, updated_at)
-      values (?, ?, ?, ?, ?, ?, ?, ?, null, null, ?, ?, ?)
-    `).run(
-      taskId,
-      goal.ownerId,
-      item.id,
-      item.title,
-      [item.description, "", `Goal: ${goal.text}`, goal.currentFocus ? `Current focus: ${goal.currentFocus.text}` : ""].filter(Boolean).join("\n"),
-      assignedAgentId ? "assigned" : "queued",
-      assignedAgentId,
-      item.priority,
-      JSON.stringify({ source: "goal-orchestrated", goalId: goal.id, goalItemId: item.id }),
-      now,
-      now,
-    );
-    updateGoalItem(goal.id, item.id, { roomTaskId: taskId, status: "active", assignedAgentId }, "system");
-    const task = roomTaskFromRow(db.prepare("select * from room_tasks where id = ?").get(taskId) as Record<string, unknown>);
-    created.push(task);
-    roomEvent(goal.ownerId, "goal.task.created", { goalId: goal.id, goalItemId: item.id, taskId, title: item.title }, assignedAgentId);
-  }
-  recordGoalEvent(goal.id, "goal.orchestrated", { roomId: goal.ownerId, taskIds: created.map((task) => task.id) }, "system");
-  if (created.length) orchestrateRoom(goal.ownerId, "goal.orchestrated");
-  return c.json({ goal: goalFromRow(db.prepare("select * from goals where id = ?").get(goal.id) as Record<string, unknown>), tasks: created }, 201);
-});
-
-app.get("/api/previews", (c) => {
-  const scopeType = c.req.query("scopeType");
-  const scopeId = c.req.query("scopeId");
-  const q = c.req.query("q")?.trim().toLowerCase() ?? "";
-  const status = c.req.query("status");
-  const cursor = decodePageCursor(c.req.query("cursor"));
-  const items = Array.from(previews.values()).map(publicPreview).filter((preview) => {
-    if (scopeType && preview.scopeType !== scopeType) return false;
-    if (scopeId && preview.scopeId !== scopeId) return false;
-    if (status && preview.status !== status) return false;
-    if (q && ![preview.label, preview.scopeType, preview.scopeId, preview.targetHost, String(preview.port), preview.command, preview.cwd, preview.access].some((value) => value?.toLowerCase().includes(q))) return false;
-    if (cursor && !(preview.updatedAt < cursor.sortValue || (preview.updatedAt === cursor.sortValue && preview.id < cursor.id))) return false;
-    return true;
-  }).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.id.localeCompare(a.id));
-  if (!c.req.query("limit") && !c.req.query("cursor") && !q && !status) return c.json(items);
-  return c.json(pageFromRows(items.slice(0, parsePageLimit(c.req.query("limit"), 20) + 1), parsePageLimit(c.req.query("limit"), 20), (item) => item.updatedAt));
-});
-
-app.post("/api/previews", async (c) => {
-  const body = await c.req.json<CreatePreviewRequest>().catch(() => null);
-  if (!body || (body.scopeType !== "project" && body.scopeType !== "session" && body.scopeType !== "folder")) return c.json({ error: "invalid_scope" }, 400);
-  if (!body.scopeId?.trim()) return c.json({ error: "invalid_scope" }, 400);
-  const folderScopePath = body.scopeType === "folder" ? resolve(body.scopeId) : "";
-  const scopeExists = body.scopeType === "project"
-    ? appData.projects.some((project) => project.id === body.scopeId)
-    : body.scopeType === "folder"
-      ? existsSync(folderScopePath) && statSync(folderScopePath).isDirectory()
-      : appData.sessions.some((session) => session.id === body.scopeId);
-  if (!scopeExists) return c.json({ error: "scope_not_found" }, 404);
-  const port = Number(body.port);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) return c.json({ error: "invalid_port" }, 400);
-  const targetHost = body.targetHost?.trim() || "127.0.0.1";
-  if (!validPreviewHost(targetHost)) return c.json({ error: "invalid_target_host" }, 400);
-  const requestedCommand = body.command?.trim() || undefined;
-  const requestedCwd = body.cwd?.trim() || undefined;
-  const requestedAccess = previewAccess(body.access);
-  const existing = Array.from(previews.values()).find((preview) =>
-    preview.scopeType === body.scopeType
-    && preview.scopeId === body.scopeId
-    && preview.targetHost === targetHost
-    && preview.port === port
-  );
-  if (existing) {
-    if (requestedCommand && existing.command && existing.command !== requestedCommand) {
-      return c.json({ error: "preview_port_in_use", preview: publicPreview(existing) }, 409);
-    }
-    if (requestedCommand && !existing.command) {
-      existing.command = requestedCommand;
-      existing.cwd = requestedCwd;
-      updatePreview(existing);
-    }
-    if (existing.access !== requestedAccess) {
-      existing.access = requestedAccess;
-      updatePreview(existing);
-    }
-    if (body.autoStart && existing.command && existing.status !== "running" && existing.status !== "starting") {
-      const risk = previewCommandRisk(existing);
-      if (risk && !approvalAlwaysAllowed("preview-command-run", { previewId: existing.id, command: existing.command ?? "", cwd: existing.cwd ?? "", targetHost: existing.targetHost, port: existing.port, scopeType: existing.scopeType, scopeId: existing.scopeId })) {
-        const approval = createPreviewApproval(existing, risk);
-        return c.json({ error: "approval_required", approval: publicApproval(approval), preview: publicPreview(existing) }, 409);
-      }
-      try {
-        startPreviewProcess(existing);
-      } catch {
-        existing.status = "error";
-        updatePreview(existing);
-        return c.json({ error: "preview_start_failed", preview: publicPreview(existing) }, 400);
-      }
-    }
-    return c.json(publicPreview(existing));
-  }
-  const conflict = previewUsingPort({ id: "", targetHost, port });
-  if (conflict) return c.json({ error: "preview_port_in_use", preview: publicPreview(conflict) }, 409);
-  const now = new Date().toISOString();
-  const preview: PreviewRecord = {
-    id: randomUUID(),
-    scopeType: body.scopeType,
-    scopeId: body.scopeId,
-    label: body.label?.trim() || `${body.scopeType}:${body.scopeId}:${port}`,
-    targetHost,
-    port,
-    command: requestedCommand,
-    cwd: requestedCwd,
-    status: "registered",
-    access: requestedAccess,
-    token: randomUUID(),
-    createdAt: now,
-    updatedAt: now,
-  };
-  insertPreview(preview);
-  if (body.autoStart && preview.command) {
-    const risk = previewCommandRisk(preview);
-    if (risk && !approvalAlwaysAllowed("preview-command-run", { previewId: preview.id, command: preview.command ?? "", cwd: preview.cwd ?? "", targetHost: preview.targetHost, port: preview.port, scopeType: preview.scopeType, scopeId: preview.scopeId })) {
-      const approval = createPreviewApproval(preview, risk);
-      return c.json({ error: "approval_required", approval: publicApproval(approval), preview: publicPreview(preview) }, 409);
-    }
-    try {
-      startPreviewProcess(preview);
-    } catch (error) {
-      preview.status = "error";
-      updatePreview(preview);
-      return c.json({ error: error instanceof Error ? error.message : "preview_start_failed", preview: publicPreview(preview) }, 400);
-    }
-  }
-  return c.json(publicPreview(preview), 201);
-});
-
-app.post("/api/previews/:id/start", (c) => {
-  const preview = previews.get(c.req.param("id"));
-  if (!preview) return c.json({ error: "preview_not_found" }, 404);
-  if (preview.status === "running" || preview.status === "starting") return c.json(publicPreview(preview));
-  const risk = previewCommandRisk(preview);
-  if (risk && !approvalAlwaysAllowed("preview-command-run", { previewId: preview.id, command: preview.command ?? "", cwd: preview.cwd ?? "", targetHost: preview.targetHost, port: preview.port, scopeType: preview.scopeType, scopeId: preview.scopeId })) {
-    const approval = createPreviewApproval(preview, risk);
-    return c.json({ error: "approval_required", approval: publicApproval(approval), preview: publicPreview(preview) }, 409);
-  }
-  try {
-    startPreviewProcess(preview);
-  } catch (error) {
-    preview.status = "error";
-    updatePreview(preview);
-    return c.json({ error: error instanceof Error ? error.message : "preview_start_failed", preview: publicPreview(preview) }, 400);
-  }
-  return c.json(publicPreview(preview));
-});
-
-app.post("/api/previews/:id/access", (c) => {
-  const preview = previews.get(c.req.param("id"));
-  if (!preview) return c.json({ error: "preview_not_found" }, 404);
-  if (preview.access === "private") c.header("set-cookie", previewAccessCookie(preview));
-  return c.json({ url: previewUrl(preview), preview: publicPreview(preview) });
-});
-
-app.put("/api/previews/:id/access", async (c) => {
-  const preview = previews.get(c.req.param("id"));
-  if (!preview) return c.json({ error: "preview_not_found" }, 404);
-  const body = await c.req.json<{ access?: PreviewAccess }>().catch(() => null);
-  preview.access = previewAccess(body?.access);
-  updatePreview(preview);
-  return c.json(publicPreview(preview));
-});
-
-app.get("/api/previews/:id/logs", (c) => {
-  const preview = previews.get(c.req.param("id"));
-  if (!preview) return c.json({ error: "preview_not_found" }, 404);
-  return c.json({ previewId: preview.id, logs: previewLogs.get(preview.id) ?? "" });
-});
-
-app.post("/api/previews/:id/stop", (c) => {
-  const preview = previews.get(c.req.param("id"));
-  if (!preview) return c.json({ error: "preview_not_found" }, 404);
-  stopPreviewProcess(preview.id);
-  preview.status = "stopped";
-  updatePreview(preview);
-  return c.json(publicPreview(preview));
-});
-
-app.delete("/api/previews/:id", (c) => {
-  const preview = previews.get(c.req.param("id"));
-  if (!preview) return c.json({ error: "preview_not_found" }, 404);
-  deletePreview(preview.id);
-  return c.json({ ok: true });
-});
-
-app.get("/api/sessions", (c) => {
-  const limitQuery = c.req.query("limit");
-  const includeAgentChildren = c.req.query("includeAgentChildren") === "true" || c.req.query("includeAgentChildren") === "1";
-  const includeAutomations = c.req.query("includeAutomations") === "true" || c.req.query("includeAutomations") === "1";
-  const visibleSessions = appData.sessions.filter((session) => {
-    if (!includeAgentChildren && session.conversationType === "agent" && session.roomId) return false;
-    if (!includeAutomations && session.conversationType === "automation" && sessionHasExistingAutomationOwner(session.id)) return false;
-    return true;
-  });
-  if (!limitQuery && !c.req.query("cursor") && !c.req.query("q") && !c.req.query("projectId") && !c.req.query("status")) return c.json(visibleSessions);
-  const limit = parsePageLimit(limitQuery, 30);
-  const cursor = decodePageCursor(c.req.query("cursor"));
-  const q = c.req.query("q")?.trim().toLowerCase() ?? "";
-  const projectId = c.req.query("projectId");
-  const status = c.req.query("status");
-  const filtered = visibleSessions
-    .filter((session) => !q || session.title.toLowerCase().includes(q) || session.workspacePath.toLowerCase().includes(q) || session.id.toLowerCase().includes(q))
-    .filter((session) => !projectId || (projectId === "scratch" ? !session.projectId : session.projectId === projectId))
-    .filter((session) => !status || session.status === status)
-    .filter((session) => !cursor || session.updatedAt < cursor.sortValue || (session.updatedAt === cursor.sortValue && session.id < cursor.id))
-    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.id.localeCompare(a.id));
-  return c.json(pageFromRows(filtered, limit, (item) => item.updatedAt));
-});
-app.get("/api/sessions/:id", (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "session_not_found" }, 404);
-  return c.json(session);
-});
-app.post("/api/sessions", async (c) => {
-  const body = await c.req.json<CreateSessionRequest>();
-  const requestedProjectId = body.projectId && body.projectId !== "scratch" ? body.projectId : null;
-  const project = requestedProjectId ? appData.projects.find((item) => item.id === requestedProjectId) : null;
-  if (requestedProjectId && !project) return c.json({ error: "project_not_found" }, 404);
-  const id = `task-${randomUUID()}`;
-  const session: SessionSummary = {
-    id,
-    kind: project ? "project" : "scratch",
-    conversationType: conversationType(body.conversationType),
-    roomId: body.roomId ?? null,
-    title: body.title,
-    projectId: project?.id ?? null,
-    workspacePath: project?.workspacePath ? resolveTerminalCwd(project.workspacePath) : ensureScratchSessionWorkspace(id),
-    status: "running",
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  };
-  appData.sessions.unshift(session);
-  if (body.goal?.text?.trim()) {
-    const ownerType: GoalOwnerType = session.conversationType === "agent" ? "agent_session" : "session";
-    session.goal = createGoal({ ...body.goal, ownerType, ownerId: session.id }, "user");
-  }
-  saveAppData();
-  return c.json(session, 201);
-});
-app.patch("/api/sessions/:id", async (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "session_not_found" }, 404);
-  const body = await c.req.json<UpdateSessionRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_session_update" }, 400);
-  if (body.title !== undefined) session.title = body.title.trim() || session.title;
-  if (body.notificationsEnabled !== undefined) session.notificationsEnabled = body.notificationsEnabled !== false;
-  session.updatedAt = new Date().toISOString();
-  upsertSession(session);
-  return c.json(session);
-});
-app.delete("/api/sessions/:id", (c) => {
-  const index = appData.sessions.findIndex((item) => item.id === c.req.param("id"));
-  if (index === -1) return c.json({ error: "session_not_found" }, 404);
-  const [session] = appData.sessions.splice(index, 1);
-  const deleteWorkspace = c.req.query("deleteWorkspace") === "true";
-  const deleteLogs = c.req.query("deleteLogs") === "true";
-  clearCodexTaskRuntime(session.id, true);
-  if (session.roomId) {
-    const childSessions = appData.sessions.filter((item) => item.conversationType === "agent" && item.roomId === session.roomId);
-    for (const childSession of childSessions) {
-      clearCodexTaskRuntime(childSession.id, true);
-      deleteSessionDatabaseRows(childSession.id);
-      deleteSessionData(childSession, deleteWorkspace, deleteLogs);
-    }
-    appData.sessions = appData.sessions.filter((item) => !(item.conversationType === "agent" && item.roomId === session.roomId));
-    deleteRoomDatabaseRows(session.roomId);
-  }
-  deleteSessionDatabaseRows(session.id);
-  deleteSessionData(session, deleteWorkspace, deleteLogs);
-  return c.json({ ok: true, id: session.id });
-});
-
-app.post("/api/codex/tasks", async (c) => {
-  const body = await c.req.json<CreateCodexTaskRequest>().catch(() => null);
-  if (!body?.prompt?.trim()) return c.json({ error: "prompt_required" }, 400);
-  const project = body.projectId ? appData.projects.find((item) => item.id === body.projectId) : null;
-  const providerId = body.providerId ?? null;
-  const provider = providerId ? appData.providers.find((item) => item.id === providerId) : appData.providers[0];
-  const selectedModel = body.model ?? provider?.defaultModel ?? null;
-  const id = `task-${randomUUID()}`;
-  const workspacePath = body.cwd
-    ? resolveTerminalCwd(body.cwd)
-    : project?.workspacePath ? resolveTerminalCwd(project.workspacePath) : ensureScratchSessionWorkspace(id);
-  const cwd = workspacePath;
-  const session: SessionSummary = {
-    id,
-    kind: project ? "project" : "scratch",
-    conversationType: "codex",
-    roomId: null,
-    title: body.prompt.trim().slice(0, 60),
-    projectId: project?.id ?? null,
-    workspacePath,
-    providerId: provider?.id ?? null,
-    model: selectedModel,
-    status: "running",
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  };
-  appData.sessions.unshift(session);
-  deleteSessionMessages(session.id);
-  let attachments: SavedSessionAttachment[] = [];
-  try {
-    attachments = saveSessionAttachments(session.id, body.attachments);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "attachment_upload_failed" }, 400);
-  }
-  const userMessage = appendSessionMessage(session.id, "user", messageWithAttachments(body.prompt, attachments));
-  for (const notificationRule of body.ephemeralNotifications ?? []) {
-    createNotificationEphemeralRule({
-      scopeType: "session",
-      scopeId: session.id,
-      eventTypes: notificationRule.eventTypes,
-      targets: notificationRule.targets,
-      expireMode: notificationRule.expireMode,
-    });
-  }
-  saveAppData();
-  startCodexTask(session, promptWithAttachments(body.prompt, attachments), cwd, provider, selectedModel, true, attachments.length ? [sessionAttachmentsPath(session.id)] : [], { currentMessageId: userMessage.id });
-  return c.json(session, 201);
-});
-app.get("/api/codex/tasks/:id", (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  restoreCodexSessionIdFromLog(session);
-  if (session.status !== "running") backfillSessionFromTaskLog(session);
-  const output = readCodexOutput(session.id);
-  const response: CodexTaskDetail = {
-    session,
-    messages: allSessionMessages(session.id),
-    output: output.output,
-    exitCode: output.exitCode,
-    errorSummary: output.exitCode && output.exitCode !== 0 ? readTaskErrorSummary(session.id) : undefined,
-  };
-  return c.json(response);
-});
-app.get("/api/codex/tasks/:id/log", (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  const maxBytes = Math.min(Number(c.req.query("maxBytes") ?? 80_000), 300_000);
-  let log = "";
-  try {
-    const content = session.conversationType === "room" ? readRoomTaskLogContent(session, maxBytes) : readTaskLogContent(session.id);
-    log = content.length > maxBytes ? content.slice(content.length - maxBytes) : content;
-  } catch {
-    log = "";
-  }
-  const response: TaskLogResponse = { sessionId: session.id, log };
-  return c.json(response);
-});
-app.get("/api/codex/tasks/:id/context", (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  if (session.conversationType === "room") return c.json(listRoomTaskContextFiles(session));
-  return c.json(listTaskContextFiles(session.id));
-});
-app.get("/api/codex/tasks/:id/context/:file", (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  try {
-    if (session.conversationType === "room") return c.json(readRoomTaskContextFile(session, c.req.param("file")));
-    return c.json(readTaskContextFile(session.id, c.req.param("file")));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "context_file_not_found" }, 404);
-  }
-});
-app.get("/api/codex/tasks/:id/activity", (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  if (!listTaskActivities(session.id, 1).items.length) backfillTaskActivitiesFromLog(session.id);
-  if (!listTaskActivities(session.id, 1).items.length) backfillRoomActivitiesFromAgentLogs(session);
-  const page = listTaskActivities(session.id, parsePageLimit(c.req.query("limit"), 30), c.req.query("cursor"));
-  const response: TaskActivityResponse = {
-    sessionId: session.id,
-    items: page.items,
-    nextCursor: page.nextCursor,
-    hasMore: page.hasMore,
-  };
-  return c.json(response);
-});
-app.get("/api/codex/tasks/:id/runs", (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  return c.json(listTaskRunsForSession(session.id, parsePageLimit(c.req.query("limit"), 20), c.req.query("cursor")));
-});
-app.get("/api/task-runs", (c) => {
-  const status = c.req.query("status");
-  return c.json(listTaskRuns(status, parsePageLimit(c.req.query("limit"), 50), c.req.query("cursor")));
-});
-app.get("/api/execution-contexts", (c) => {
-  const sessionId = c.req.query("sessionId");
-  const agentId = c.req.query("agentId");
-  const limit = parsePageLimit(c.req.query("limit"), 50);
-  const session = sessionId ? appData.sessions.find((item) => item.id === sessionId) : null;
-  const rows = db.prepare(`
-    select * from execution_contexts
-    where (
-        @sessionId is null
-        or session_id = @sessionId
-        or (@roomId is not null and room_id = @roomId)
-      )
-      and (@agentId is null or agent_id = @agentId)
-    order by created_at desc, id desc
-    limit @limit
-  `).all({ sessionId: sessionId || null, roomId: session?.conversationType === "room" ? session.roomId : null, agentId: agentId || null, limit }) as Array<Record<string, unknown>>;
-  return c.json(rows.map(executionContextFromRow));
-});
-app.get("/api/sessions/:id/messages", (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "session_not_found" }, 404);
-  if (session.status !== "running") backfillSessionFromTaskLog(session);
-  return c.json(listSessionMessages(session.id, Number(c.req.query("limit") ?? 20), c.req.query("before") || undefined));
-});
-app.get("/api/sessions/:id/compaction", (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "session_not_found" }, 404);
-  const latest = latestSessionCompaction(session.id);
-  if (!latest) return c.json({ compaction: null, summary: "" });
-  const summary = existsSync(latest.filePath) ? readFileSync(latest.filePath, "utf8") : "";
-  return c.json({ compaction: latest, summary });
-});
-app.get("/api/sessions/:id/compactions", (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "session_not_found" }, 404);
-  return c.json(listSessionCompactions(session.id, Number(c.req.query("limit") ?? 20)));
-});
-app.patch("/api/sessions/:id/compaction", async (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "session_not_found" }, 404);
-  const body = await c.req.json<UpdateSessionCompactionRequest>().catch(() => null);
-  try {
-    return c.json(updateLatestSessionCompaction(session, String(body?.summary ?? "")));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "session_compaction_update_failed" }, 400);
-  }
-});
-app.post("/api/sessions/:id/compactions/:compactionId/restore", (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "session_not_found" }, 404);
-  try {
-    return c.json(restoreSessionCompaction(session, c.req.param("compactionId")));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "session_compaction_restore_failed" }, 400);
-  }
-});
-app.post("/api/sessions/:id/compact", async (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "session_not_found" }, 404);
-  const body = await c.req.json<CreateSessionCompactionRequest>().catch(() => null);
-  try {
-    return c.json(await createSessionCompaction(session, body));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "session_compaction_failed" }, 400);
-  }
-});
-app.get("/api/sessions/:id/cards", (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "session_not_found" }, 404);
-  return c.json(listSessionCards(session.id));
-});
-app.delete("/api/sessions/:id/cards/:cardId", (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "session_not_found" }, 404);
-  const cardId = c.req.param("cardId");
-  if (cardId.startsWith("preview:")) {
-    const previewId = cardId.slice("preview:".length);
-    const preview = previews.get(previewId);
-    if (!preview || preview.scopeType !== "session" || preview.scopeId !== session.id) return c.json({ error: "card_not_found" }, 404);
-    dismissMessageCard(session.id, "preview", publicPreview(preview));
-    deletePreview(previewId);
-    db.prepare("delete from message_cards where session_id = ? and json_extract(payload, '$.previewId') = ?").run(session.id, previewId);
-    return c.json({ ok: true, id: cardId });
-  }
-  const cardRow = db.prepare(`
-    select type, payload
-    from message_cards
-    where id = ? and session_id = ?
-  `).get(cardId, session.id) as { type: MessageCardSummary["type"]; payload: string } | undefined;
-  if (!cardRow) return c.json({ error: "card_not_found" }, 404);
-  let payload: unknown = {};
-  try {
-    payload = JSON.parse(cardRow.payload);
-  } catch {
-    payload = {};
-  }
-  dismissMessageCard(session.id, cardRow.type, payload);
-  const result = db.prepare("delete from message_cards where id = ? and session_id = ?").run(cardId, session.id);
-  if (!result.changes) return c.json({ error: "card_not_found" }, 404);
-  return c.json({ ok: true, id: cardId });
-});
-app.get("/api/codex/tasks/:id/queue", (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  return c.json(listQueuedMessages(session.id));
-});
-app.post("/api/codex/tasks/:id/queue", async (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  const body = await c.req.json<QueueMessageRequest>().catch(() => null);
-  if (!body?.prompt?.trim()) return c.json({ error: "prompt_required" }, 400);
-  return c.json(enqueueMessage(session, body), 201);
-});
-app.patch("/api/codex/tasks/:id/queue/:queueId", async (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  const body = await c.req.json<UpdateQueuedMessageRequest>().catch(() => null);
-  if (!body?.prompt?.trim()) return c.json({ error: "prompt_required" }, 400);
-  const item = updateQueuedMessage(session, c.req.param("queueId"), body);
-  if (!item) return c.json({ error: "queued_message_not_found" }, 404);
-  return c.json(item);
-});
-app.patch("/api/codex/tasks/:id/queue", async (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  const body = await c.req.json<ReorderQueuedMessagesRequest>().catch(() => null);
-  if (!Array.isArray(body?.orderedIds)) return c.json({ error: "ordered_ids_required" }, 400);
-  const queue = reorderQueuedMessages(session, body.orderedIds);
-  if (!queue) return c.json({ error: "queued_message_order_mismatch" }, 409);
-  return c.json(queue);
-});
-app.delete("/api/codex/tasks/:id/queue/:queueId", (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  deleteQueuedMessage(session, c.req.param("queueId"));
-  return c.json({ ok: true });
-});
-app.get("/api/codex/tasks/:id/diff", async (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  const cwd = resolveSessionCwd(session);
-  const status = await runGitCommand(cwd, ["status", "--short", "--", "."]);
-  if (status.exitCode !== 0) {
-    const response: CodexTaskDiff = { ok: false, cwd, status: "", stat: "", diff: "", error: status.stderr || "git_status_failed" };
-    return c.json(response);
-  }
-  const stat = await runGitCommand(cwd, ["diff", "--relative", "--stat", "--", "."]);
-  const diff = await runGitCommand(cwd, ["diff", "--", "."]);
-  const response: CodexTaskDiff = {
-    ok: true,
-    cwd,
-    status: status.stdout,
-    stat: stat.stdout,
-    diff: diff.stdout,
-    error: stat.exitCode === 0 && diff.exitCode === 0 ? undefined : stat.stderr || diff.stderr || "git_diff_failed",
-  };
-  return c.json(response);
-});
-app.get("/api/codex/tasks/:id/changes", async (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  return c.json(await collectWorkspaceChanges(session));
-});
-app.post("/api/codex/tasks/:id/changes/revert-file", async (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  const body = await c.req.json<RevertWorkspaceFileRequest>().catch(() => null);
-  if (!body?.path) return c.json({ error: "path_required" }, 400);
-  try {
-    const cwd = resolveWorkspaceChangeActionCwd(session, body.cwd);
-    const changes = await collectWorkspaceChangesForCwd(cwd);
-    const { change, absolutePath } = assertWorkspaceChangePath(changes, body.path);
-    if (change.status === "??") {
-      const stat = statSync(absolutePath);
-      if (!stat.isFile()) return c.json({ error: "untracked_directories_not_supported" }, 400);
-      rmSync(absolutePath);
-    } else {
-      const result = await runGitCommand(changes.cwd, ["checkout", "--", body.path]);
-      if (result.exitCode !== 0) return c.json({ error: result.stderr || "git_checkout_failed" }, 400);
-    }
-    return c.json(await collectWorkspaceChanges(session));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "revert_failed" }, 400);
-  }
-});
-app.post("/api/codex/tasks/:id/changes/stage-file", async (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  const body = await c.req.json<WorkspaceGitFileRequest>().catch(() => null);
-  if (!body?.path) return c.json({ error: "path_required" }, 400);
-  try {
-    await applyWorkspaceGitFileAction(resolveWorkspaceChangeActionCwd(session, body.cwd), body.path, "stage");
-    return c.json(await collectWorkspaceChanges(session));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "git_stage_failed" }, 400);
-  }
-});
-app.post("/api/codex/tasks/:id/changes/unstage-file", async (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  const body = await c.req.json<WorkspaceGitFileRequest>().catch(() => null);
-  if (!body?.path) return c.json({ error: "path_required" }, 400);
-  try {
-    await applyWorkspaceGitFileAction(resolveWorkspaceChangeActionCwd(session, body.cwd), body.path, "unstage");
-    return c.json(await collectWorkspaceChanges(session));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "git_unstage_failed" }, 400);
-  }
-});
-app.post("/api/codex/tasks/:id/stop", (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  const child = codexTaskProcesses.get(session.id);
-  const running = latestRunningTaskRun(session.id);
-  const runnerPid = typeof running?.pid === "number" ? running.pid : null;
-  if (!child && !isProcessAlive(runnerPid)) {
-    session.status = session.status === "running" ? "paused" : session.status;
-    session.updatedAt = new Date().toISOString();
-    saveAppData();
-    return c.json(session);
-  }
-  codexTaskStopRequested.add(session.id);
-  markTaskRunStopRequested(session.id);
-  if (child) child.kill("SIGTERM");
-  else if (runnerPid) process.kill(runnerPid, "SIGTERM");
-  session.status = "paused";
-  session.updatedAt = new Date().toISOString();
-  saveAppData();
-  appendCodexErrorOutput(session, "\n[task stopped]\n");
-  appendSessionMessage(session.id, "assistant", `用户主动停止任务。停止时间：${new Date().toISOString()}。待发送队列：${listQueuedMessages(session.id).length} 条。`);
-  return c.json(session);
-});
-app.post("/api/codex/tasks/:id/recover", async (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  if (codexTaskProcesses.has(session.id) || session.status === "running") return c.json({ error: "task_running" }, 409);
-  restoreCodexSessionIdFromLog(session);
-  const body = await c.req.json<RecoverCodexTaskRequest>().catch(() => null);
-  const prompt = body?.prompt?.trim() || "Recover the interrupted task from the current conversation, task log, workspace files, and Git changes. Summarize completed and pending work first, then continue with the next concrete step.";
-  const providerId = body?.providerId ?? session.providerId ?? null;
-  const provider = providerId ? appData.providers.find((item) => item.id === providerId) : appData.providers[0];
-  const selectedModel = body?.model ?? session.model ?? provider?.defaultModel ?? null;
-  session.providerId = provider?.id ?? null;
-  session.model = selectedModel;
-  session.status = "running";
-  session.updatedAt = new Date().toISOString();
-  const userMessage = appendSessionMessage(session.id, "user", prompt);
-  saveAppData();
-  startCodexTask(session, prompt, resolveSessionCwd(session), provider, selectedModel, false, [], { currentMessageId: userMessage.id });
-  const response: CodexTaskDetail = {
-    session,
-    messages: allSessionMessages(session.id),
-    output: readCodexOutput(session.id).output,
-    exitCode: null,
-  };
-  return c.json(response, 202);
-});
-app.post("/api/codex/tasks/:id/messages", async (c) => {
-  const session = appData.sessions.find((item) => item.id === c.req.param("id"));
-  if (!session) return c.json({ error: "task_not_found" }, 404);
-  const body = await c.req.json<ContinueCodexTaskRequest>().catch(() => null);
-  if (!body?.prompt?.trim()) return c.json({ error: "prompt_required" }, 400);
-  restoreCodexSessionIdFromLog(session);
-  if (codexTaskProcesses.has(session.id) || session.status === "running") {
-    if (body.attachments?.length) return c.json({ error: "attachments_cannot_queue" }, 409);
-    return c.json(enqueueMessage(session, body), 202);
-  }
-  const providerId = body.providerId ?? session.providerId ?? null;
-  const provider = providerId ? appData.providers.find((item) => item.id === providerId) : appData.providers[0];
-  const selectedModel = body.model ?? session.model ?? provider?.defaultModel ?? null;
-  const cwd = resolveSessionCwd(session);
-  session.providerId = provider?.id ?? null;
-  session.model = selectedModel;
-  session.status = "running";
-  session.updatedAt = new Date().toISOString();
-  let attachments: SavedSessionAttachment[] = [];
-  try {
-    attachments = saveSessionAttachments(session.id, body.attachments);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "attachment_upload_failed" }, 400);
-  }
-  const userMessage = appendSessionMessage(session.id, "user", messageWithAttachments(body.prompt, attachments), body.replyToMessageId);
-  saveAppData();
-  const prompt = promptWithReplyContext(session.id, promptWithAttachments(body.prompt, attachments), body.replyToMessageId);
-  startCodexTask(session, promptForDirectAgentSession(session, prompt), cwd, provider, selectedModel, !session.codexSessionId, attachments.length ? [sessionAttachmentsPath(session.id)] : [], {
-    currentMessageId: userMessage.id,
-    replyToMessageId: body.replyToMessageId,
-  });
-  return c.json(session);
-});
-
-app.get("/api/projects", async (c) => {
-  const limitQuery = c.req.query("limit");
-  if (!limitQuery && !c.req.query("cursor") && !c.req.query("q")) {
-    const projects = await Promise.all(appData.projects.map((project) => refreshProjectGitStatus(project)));
-    return c.json(projects);
-  }
-  const limit = parsePageLimit(limitQuery, 20);
-  const cursor = decodePageCursor(c.req.query("cursor"));
-  const q = c.req.query("q")?.trim().toLowerCase() ?? "";
-  const filtered = appData.projects
-    .filter((project) => !q || project.name.toLowerCase().includes(q) || project.workspacePath.toLowerCase().includes(q) || project.id.toLowerCase().includes(q))
-    .filter((project) => !cursor || project.name > cursor.sortValue || (project.name === cursor.sortValue && project.id > cursor.id))
-    .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
-  const pageItems = filtered.slice(0, limit + 1);
-  await Promise.all(pageItems.slice(0, limit).map((project) => refreshProjectGitStatus(project)));
-  return c.json(pageFromRows(pageItems, limit, (item) => item.name));
-});
-app.post("/api/projects", async (c) => {
-  const body = await c.req.json<CreateProjectRequest>();
-  const name = body.name?.trim();
-  if (!name) return c.json({ error: "invalid_project_name" }, 400);
-  const id = uniqueProjectId(name);
-  const workspacePath = body.workspacePath?.trim()
-    ? resolveTerminalCwd(body.workspacePath)
-    : defaultProjectWorkspacePath(id);
-  if (!body.workspacePath?.trim()) mkdirSync(workspacePath, { recursive: true });
-  const project: ProjectSummary = { id, name, workspacePath, runner: "docker", changedFiles: 0, checkCommand: undefined };
-  await ensureGitRepositoryForProject(project.workspacePath);
-  writeProjectWorkspaceMetadata(project);
-  await refreshProjectGitStatus(project);
-  appData.projects.unshift(project);
-  saveAppData();
-  return c.json(project, 201);
-});
-app.patch("/api/projects/:id", async (c) => {
-  const project = appData.projects.find((item) => item.id === c.req.param("id"));
-  if (!project) return c.json({ error: "project_not_found" }, 404);
-  const body = await c.req.json<UpdateProjectRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_project_update" }, 400);
-  if (body.name !== undefined) project.name = body.name.trim() || project.name;
-  if (body.workspacePath !== undefined) project.workspacePath = body.workspacePath.trim() || project.workspacePath;
-  if (body.checkCommand !== undefined) project.checkCommand = body.checkCommand.trim() || undefined;
-  writeProjectWorkspaceMetadata(project);
-  upsertProject(project);
-  return c.json(await refreshProjectGitStatus(project));
-});
-app.get("/api/projects/:id/changes", async (c) => {
-  const project = appData.projects.find((item) => item.id === c.req.param("id"));
-  if (!project) return c.json({ error: "project_not_found" }, 404);
-  try {
-    return c.json(await collectWorkspaceChangesForCwd(resolveTerminalCwd(project.workspacePath)));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "project_changes_failed" }, 400);
-  }
-});
-app.post("/api/projects/:id/changes/revert-file", async (c) => {
-  const project = appData.projects.find((item) => item.id === c.req.param("id"));
-  if (!project) return c.json({ error: "project_not_found" }, 404);
-  const body = await c.req.json<RevertWorkspaceFileRequest>().catch(() => null);
-  if (!body?.path) return c.json({ error: "path_required" }, 400);
-  const cwd = resolveTerminalCwd(project.workspacePath);
-  const changes = await collectWorkspaceChangesForCwd(cwd);
-  try {
-    const { change, absolutePath } = assertWorkspaceChangePath(changes, body.path);
-    if (change.status === "??") {
-      const stat = statSync(absolutePath);
-      if (!stat.isFile()) return c.json({ error: "untracked_directories_not_supported" }, 400);
-      rmSync(absolutePath);
-    } else {
-      const result = await runGitCommand(cwd, ["checkout", "--", body.path]);
-      if (result.exitCode !== 0) return c.json({ error: result.stderr || "git_checkout_failed" }, 400);
-    }
-    return c.json(await collectWorkspaceChangesForCwd(cwd));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "revert_failed" }, 400);
-  }
-});
-app.post("/api/projects/:id/changes/stage-file", async (c) => {
-  const project = appData.projects.find((item) => item.id === c.req.param("id"));
-  if (!project) return c.json({ error: "project_not_found" }, 404);
-  const body = await c.req.json<WorkspaceGitFileRequest>().catch(() => null);
-  if (!body?.path) return c.json({ error: "path_required" }, 400);
-  try {
-    return c.json(await applyWorkspaceGitFileAction(resolveTerminalCwd(project.workspacePath), body.path, "stage"));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "git_stage_failed" }, 400);
-  }
-});
-app.post("/api/projects/:id/changes/unstage-file", async (c) => {
-  const project = appData.projects.find((item) => item.id === c.req.param("id"));
-  if (!project) return c.json({ error: "project_not_found" }, 404);
-  const body = await c.req.json<WorkspaceGitFileRequest>().catch(() => null);
-  if (!body?.path) return c.json({ error: "path_required" }, 400);
-  try {
-    return c.json(await applyWorkspaceGitFileAction(resolveTerminalCwd(project.workspacePath), body.path, "unstage"));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "git_unstage_failed" }, 400);
-  }
-});
-app.get("/api/projects/:id/check-runs", (c) => {
-  const project = appData.projects.find((item) => item.id === c.req.param("id"));
-  if (!project) return c.json({ error: "project_not_found" }, 404);
-  return c.json(listProjectCheckRuns(project.id, parsePageLimit(c.req.query("limit"), 20), c.req.query("cursor")));
-});
-app.get("/api/projects/:id/git-operations", (c) => {
-  const project = appData.projects.find((item) => item.id === c.req.param("id"));
-  if (!project) return c.json({ error: "project_not_found" }, 404);
-  return c.json(listProjectGitOperations(project.id, parsePageLimit(c.req.query("limit"), 20), c.req.query("cursor")));
-});
-app.post("/api/projects/:id/git", async (c) => {
-  const project = appData.projects.find((item) => item.id === c.req.param("id"));
-  if (!project) return c.json({ error: "project_not_found" }, 404);
-  const body = await c.req.json<ProjectGitOperationRequest>().catch(() => null);
-  if (!body?.operation) return c.json({ error: "git_operation_required" }, 400);
-  try {
-    const args = projectGitArgs(body);
-    const changes = await collectWorkspaceChangesForCwd(resolveTerminalCwd(project.workspacePath)).catch(() => null);
-    const dirty = Boolean(changes?.summary.filesChanged);
-    const needsApproval = body.operation === "push" || ((body.operation === "pull" || body.operation === "branch-checkout") && dirty);
-    if (needsApproval && !approvalAlwaysAllowed("project-git-operation", { projectId: project.id, operation: body.operation })) {
-      const reason = body.operation === "push" ? "push changes to remote" : "workspace has uncommitted changes";
-      const approval = createProjectGitApproval(project, body.operation, args, reason);
-      saveProjectGitOperation(project.id, body.operation, args, { exitCode: null, stdout: "", stderr: `approval:${approval.id}` }, "approval_required");
-      return c.json({ error: "approval_required", approval: publicApproval(approval) }, 409);
-    }
-    const record = runProjectGitOperation(project, body.operation, args);
-    await refreshProjectGitStatus(project);
-    return c.json(record, record.status === "done" ? 200 : 400);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "project_git_failed" }, 400);
-  }
-});
-app.get("/api/projects/:id/sessions", (c) => {
-  const project = appData.projects.find((item) => item.id === c.req.param("id"));
-  if (!project) return c.json({ error: "project_not_found" }, 404);
-  const limit = parsePageLimit(c.req.query("limit"), 20);
-  const cursor = decodePageCursor(c.req.query("cursor"));
-  const q = c.req.query("q")?.trim().toLowerCase() ?? "";
-  const status = c.req.query("status");
-  const filtered = appData.sessions
-    .filter((session) => session.projectId === project.id)
-    .filter((session) => !q || session.title.toLowerCase().includes(q) || session.id.toLowerCase().includes(q) || session.workspacePath.toLowerCase().includes(q))
-    .filter((session) => !status || session.status === status)
-    .filter((session) => !cursor || session.updatedAt < cursor.sortValue || (session.updatedAt === cursor.sortValue && session.id < cursor.id))
-    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.id.localeCompare(a.id));
-  return c.json(pageFromRows(filtered, limit, (item) => item.updatedAt));
-});
-app.get("/api/projects/:id/stats", (c) => {
-  const project = appData.projects.find((item) => item.id === c.req.param("id"));
-  if (!project) return c.json({ error: "project_not_found" }, 404);
-  const projectSessions = appData.sessions.filter((session) => session.projectId === project.id);
-  const latestCheck = listProjectCheckRuns(project.id, 1).items[0];
-  const previewStatusCounts = Array.from(previews.values())
-    .filter((preview) => preview.scopeType === "project" && preview.scopeId === project.id)
-    .reduce<Record<string, number>>((counts, preview) => {
-      counts[preview.status] = (counts[preview.status] ?? 0) + 1;
-      return counts;
-    }, {});
-  const response: ProjectStatsSummary = {
-    projectId: project.id,
-    totalSessions: projectSessions.length,
-    runningSessions: projectSessions.filter((session) => session.status === "running").length,
-    latestSessionUpdatedAt: projectSessions.map((session) => session.updatedAt).sort().at(-1) ?? null,
-    latestCheckStatus: latestCheck?.status ?? null,
-    previewStatusCounts,
-  };
-  return c.json(response);
-});
-app.post("/api/projects/:id/check", async (c) => {
-  const project = appData.projects.find((item) => item.id === c.req.param("id"));
-  if (!project) return c.json({ error: "project_not_found" }, 404);
-  const body = await c.req.json<{ command?: string }>().catch(() => null);
-  const command = body?.command?.trim() || splitProjectCheckCommands(project.checkCommand)[0];
-  if (!command) return c.json({ error: "check_command_missing" }, 400);
-  try {
-    const startedAt = new Date().toISOString();
-    const result = await runShellCommand(command, resolveTerminalCwd(project.workspacePath));
-    saveProjectCheckRun(project.id, result, startedAt);
-    return c.json(result);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "project_check_failed" }, 400);
-  }
-});
-app.delete("/api/projects/:id", async (c) => {
-  const index = appData.projects.findIndex((item) => item.id === c.req.param("id"));
-  if (index === -1) return c.json({ error: "project_not_found" }, 404);
-
-  const deleteFiles = c.req.query("deleteFiles") === "true";
-  const project = appData.projects[index];
-  if (deleteFiles) {
-    if (approvalAlwaysAllowed("project-delete-files", { projectId: project.id, deleteFiles: true })) {
-      return c.json(deleteProjectRecord(project.id, true));
-    }
-    const approval = createProjectDeleteApproval(project);
-    return c.json({ error: "approval_required", approval: publicApproval(approval) }, 409);
-  }
-
-  return c.json(deleteProjectRecord(project.id, false));
-});
-
-app.get("/api/automations", (c) => {
-  const limitQuery = c.req.query("limit");
-  if (!limitQuery && !c.req.query("cursor") && !c.req.query("q") && !c.req.query("status") && !c.req.query("projectId") && !c.req.query("actionType")) {
-    return c.json(appData.automations.map(automationWithRuntimeFields));
-  }
-  const limit = parsePageLimit(limitQuery, 20);
-  const cursor = decodePageCursor(c.req.query("cursor"));
-  const q = c.req.query("q")?.trim().toLowerCase() ?? "";
-  const status = c.req.query("status");
-  const projectId = c.req.query("projectId");
-  const actionType = c.req.query("actionType");
-  const filtered = appData.automations
-    .map(automationWithRuntimeFields)
-    .filter((automation) => !q || automation.name.toLowerCase().includes(q) || automation.prompt.toLowerCase().includes(q) || (automation.command ?? "").toLowerCase().includes(q) || automation.id.toLowerCase().includes(q))
-    .filter((automation) => !status || automation.status === status)
-    .filter((automation) => !projectId || (projectId === "global" ? !automation.projectId : automation.projectId === projectId))
-    .filter((automation) => !actionType || automation.actionType === actionType)
-    .filter((automation) => !cursor || automation.updatedAt < cursor.sortValue || (automation.updatedAt === cursor.sortValue && automation.id < cursor.id))
-    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || b.id.localeCompare(a.id));
-  return c.json(pageFromRows(filtered, limit, (item) => item.updatedAt));
-});
-app.post("/api/automations", async (c) => {
-  const body = await c.req.json<CreateAutomationRequest>().catch(() => null);
-  const actionType = body?.actionType === "command" ? "command" : "agent";
-  if (!body?.name?.trim() || !body.schedule?.trim()) return c.json({ error: "invalid_automation" }, 400);
-  if (actionType === "agent" && !body.prompt?.trim()) return c.json({ error: "invalid_automation_prompt" }, 400);
-  if (actionType === "command" && !body.command?.trim()) return c.json({ error: "invalid_automation_command" }, 400);
-  if (!isValidAutomationSchedule(body.schedule)) return c.json({ error: "invalid_automation_schedule" }, 400);
-  const project = body.projectId ? appData.projects.find((item) => item.id === body.projectId) : null;
-  const provider = body.providerId ? appData.providers.find((item) => item.id === body.providerId) : null;
-  const now = new Date().toISOString();
-  const automation: AutomationSummary = {
-    id: `automation-${randomUUID()}`,
-    name: body.name.trim(),
-    projectId: project?.id ?? null,
-    providerId: provider?.id ?? null,
-    model: body.model?.trim() || null,
-    actionType,
-    prompt: body.prompt?.trim() || body.command?.trim() || "",
-    command: body.command?.trim() || null,
-    cwd: body.cwd?.trim() || null,
-    commandTimeoutSeconds: actionType === "command" ? automationCommandTimeoutSeconds(body.commandTimeoutSeconds) : null,
-    retryMax: sanitizeAutomationRetryMax(body.retryMax),
-    retryDelayMinutes: sanitizeAutomationRetryDelayMinutes(body.retryDelayMinutes),
-    overlapPolicy: sanitizeAutomationOverlapPolicy(body.overlapPolicy),
-    schedule: body.schedule.trim(),
-    status: "active",
-    createdAt: now,
-    updatedAt: now,
-  };
-  appData.automations.unshift(automation);
-  upsertAutomation(automation);
-  return c.json(automationWithRuntimeFields(automation), 201);
-});
-app.patch("/api/automations/:id", async (c) => {
-  const automation = appData.automations.find((item) => item.id === c.req.param("id"));
-  if (!automation) return c.json({ error: "automation_not_found" }, 404);
-  const body = await c.req.json<UpdateAutomationRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_automation_update" }, 400);
-  if (body.name !== undefined) automation.name = body.name.trim() || automation.name;
-  if (body.projectId !== undefined) automation.projectId = appData.projects.find((item) => item.id === body.projectId)?.id ?? null;
-  if (body.providerId !== undefined) automation.providerId = appData.providers.find((item) => item.id === body.providerId)?.id ?? null;
-  if (body.model !== undefined) automation.model = body.model?.trim() || null;
-  if (body.actionType !== undefined) automation.actionType = body.actionType === "command" ? "command" : "agent";
-  if (body.prompt !== undefined) automation.prompt = body.prompt.trim() || automation.prompt;
-  if (body.command !== undefined) automation.command = body.command?.trim() || null;
-  if (body.cwd !== undefined) automation.cwd = body.cwd?.trim() || null;
-  if (body.commandTimeoutSeconds !== undefined) automation.commandTimeoutSeconds = automation.actionType === "command" ? automationCommandTimeoutSeconds(body.commandTimeoutSeconds) : null;
-  if (body.retryMax !== undefined) automation.retryMax = sanitizeAutomationRetryMax(body.retryMax);
-  if (body.retryDelayMinutes !== undefined) automation.retryDelayMinutes = sanitizeAutomationRetryDelayMinutes(body.retryDelayMinutes);
-  if (body.overlapPolicy !== undefined) automation.overlapPolicy = sanitizeAutomationOverlapPolicy(body.overlapPolicy);
-  if ((automation.actionType ?? "agent") === "agent" && !automation.prompt.trim()) return c.json({ error: "invalid_automation_prompt" }, 400);
-  if (automation.actionType === "command" && !automation.command?.trim()) return c.json({ error: "invalid_automation_command" }, 400);
-  if (body.schedule !== undefined) {
-    if (!isValidAutomationSchedule(body.schedule)) return c.json({ error: "invalid_automation_schedule" }, 400);
-    automation.schedule = body.schedule.trim() || automation.schedule;
-  }
-  if (body.status !== undefined) automation.status = body.status;
-  automation.updatedAt = new Date().toISOString();
-  upsertAutomation(automation);
-  return c.json(automationWithRuntimeFields(automation));
-});
-app.delete("/api/automations/:id", (c) => {
-  const index = appData.automations.findIndex((item) => item.id === c.req.param("id"));
-  if (index === -1) return c.json({ error: "automation_not_found" }, 404);
-  const [automation] = appData.automations.splice(index, 1);
-  const session = latestAutomationSession(automation.id);
-  const deleteSession = c.req.query("deleteSession") !== "false";
-  db.prepare("delete from automations where id = ?").run(automation.id);
-  db.prepare("delete from automation_runs where automation_id = ?").run(automation.id);
-  if (deleteSession && session) {
-    clearCodexTaskRuntime(session.id, true);
-    appData.sessions = appData.sessions.filter((item) => item.id !== session.id);
-    deleteSessionDatabaseRows(session.id);
-    deleteSessionData(session, true, true);
-  }
-  return c.json({ ok: true, id: automation.id });
-});
-app.get("/api/automations/:id/runs", (c) => {
-  const automation = appData.automations.find((item) => item.id === c.req.param("id"));
-  if (!automation) return c.json({ error: "automation_not_found" }, 404);
-  const limit = parsePageLimit(c.req.query("limit"), 20);
-  const cursor = decodePageCursor(c.req.query("cursor"));
-  const status = c.req.query("status");
-  const statusFilter = status === "queued" || status === "running" || status === "done" || status === "failed" || status === "stopped" || status === "skipped" || status === "canceled" ? status : null;
-  const rows = db.prepare(`
-    select id, automation_id, session_id, status, exit_code, started_at, finished_at
-    from automation_runs
-    where automation_id = @automationId
-      ${statusFilter ? "and status = @status" : ""}
-      ${cursor ? "and (started_at < @cursorSort or (started_at = @cursorSort and id < @cursorId))" : ""}
-    order by started_at desc, id desc
-    limit @limit
-  `).all({ automationId: automation.id, status: statusFilter, cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
-  return c.json(pageFromRows(rows.map(automationRunFromRow), limit, (item) => item.startedAt));
-});
-app.delete("/api/automations/:id/runs", (c) => {
-  const automation = appData.automations.find((item) => item.id === c.req.param("id"));
-  if (!automation) return c.json({ error: "automation_not_found" }, 404);
-  const result = db.prepare("delete from automation_runs where automation_id = ? and status in ('done', 'failed', 'stopped', 'skipped', 'canceled')").run(automation.id);
-  return c.json({ ok: true, cleared: result.changes });
-});
-app.post("/api/automations/:id/runs/cancel-queued", (c) => {
-  const automation = appData.automations.find((item) => item.id === c.req.param("id"));
-  if (!automation) return c.json({ error: "automation_not_found" }, 404);
-  const now = new Date().toISOString();
-  const result = db.prepare(`
-    update automation_runs
-    set status = 'canceled', finished_at = ?
-    where automation_id = ? and status = 'queued'
-  `).run(now, automation.id);
-  const session = latestAutomationSession(automation.id);
-  if (session && result.changes > 0) {
-    appendSessionMessage(session.id, "system", `Automation queued runs canceled: ${automation.name} (${now})`);
-    saveAppData();
-  }
-  return c.json({ ok: true, canceled: result.changes, automation: automationWithRuntimeFields(automation) });
-});
-app.post("/api/automations/:id/runs/stop-running", (c) => {
-  const automation = appData.automations.find((item) => item.id === c.req.param("id"));
-  if (!automation) return c.json({ error: "automation_not_found" }, 404);
-  const runningRun = db.prepare(`
-    select session_id
-    from automation_runs
-    where automation_id = ? and status = 'running'
-    order by started_at desc, id desc
-    limit 1
-  `).get(automation.id) as { session_id?: string | null } | undefined;
-  const sessionId = runningRun?.session_id ? String(runningRun.session_id) : "";
-  const session = sessionId ? appData.sessions.find((item) => item.id === sessionId) : null;
-  if (!session) return c.json({ error: "automation_run_not_found" }, 404);
-  const runningTaskRun = latestRunningTaskRun(session.id);
-  const runnerPid = typeof runningTaskRun?.pid === "number" ? runningTaskRun.pid : null;
-  const shellChild = shellTaskProcesses.get(session.id);
-  const codexChild = codexTaskProcesses.get(session.id);
-  if (!shellChild && !codexChild && !isProcessAlive(runnerPid)) {
-    session.status = session.status === "running" ? "paused" : session.status;
-    session.updatedAt = new Date().toISOString();
-    upsertSession(session);
-    finishAutomationRun(session.id, null, true);
-    return c.json({ ok: true, stopped: false, session, automation: automationWithRuntimeFields(automation) });
-  }
-  shellTaskStopRequested.add(session.id);
-  codexTaskStopRequested.add(session.id);
-  markTaskRunStopRequested(session.id);
-  try {
-    if (shellChild) shellChild.kill("SIGTERM");
-    else if (codexChild) codexChild.kill("SIGTERM");
-    else if (runnerPid) process.kill(runnerPid, "SIGTERM");
-  } catch {
-    finishAutomationRun(session.id, null, true);
-  }
-  session.status = "paused";
-  session.updatedAt = new Date().toISOString();
-  upsertSession(session);
-  appendCodexErrorOutput(session, "\n[automation run stop requested]\n");
-  appendSessionMessage(session.id, "assistant", `用户主动停止自动化运行。停止时间：${new Date().toISOString()}。`);
-  return c.json({ ok: true, stopped: true, session, automation: automationWithRuntimeFields(automation) });
-});
-app.post("/api/automations/:id/run", (c) => {
-  const automation = appData.automations.find((item) => item.id === c.req.param("id"));
-  if (!automation) return c.json({ error: "automation_not_found" }, 404);
-  try {
-    const result = runAutomationNow(automation);
-    return c.json({ ...result.session, automationRunStatus: result.runStatus }, 201);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "automation_run_failed" }, 400);
-  }
-});
-
-app.get("/api/agent-roles", (c) => c.json(listAgentRoles(parsePageLimit(c.req.query("limit"), 50), c.req.query("cursor"))));
-app.get("/api/agent-role-templates", (c) => c.json(listAgentRoleTemplates().map(publicAgentRoleTemplate)));
-app.post("/api/agent-roles", async (c) => {
-  const body = await c.req.json<CreateAgentRoleRequest>().catch(() => null);
-  const markdownContent = body?.markdownContent?.trim() || body?.systemPrompt?.trim() || "";
-  const description = body?.description?.trim() || markdownDescription(markdownContent);
-  const systemPrompt = systemPromptWithRoleDescription(body?.systemPrompt?.trim() || markdownContent, description, Boolean(body?.includeDescriptionInPrompt));
-  if (!body?.name?.trim() || !systemPrompt) return c.json({ error: "invalid_agent_role" }, 400);
-  const now = new Date().toISOString();
-  const idBase = slugify(body.name);
-  let id = idBase;
-  let suffix = 2;
-  while (db.prepare("select id from agent_roles where id = ?").get(id)) id = `${idBase}-${suffix++}`;
-  db.prepare(`
-    insert into agent_roles (id, name, description, source_type, source_path, source_url, markdown_content, system_prompt, capabilities, default_listen_mode, default_listen_events, default_workspace_mode, default_sandbox_mode, default_approval_policy, output_contract, safety_notes, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    id,
-    body.name.trim(),
-    description,
-    roleSourceType(body.sourceType),
-    body.sourcePath?.trim() || null,
-    body.sourceUrl?.trim() || null,
-    markdownContent,
-    systemPrompt,
-    JSON.stringify(body.capabilities ?? []),
-    listenMode(body.defaultListenMode),
-    JSON.stringify(body.defaultListenEvents ?? []),
-    workspaceMode(body.defaultWorkspaceMode),
-    body.defaultSandboxMode ?? null,
-    body.defaultApprovalPolicy ?? null,
-    body.outputContract?.trim() || null,
-    body.safetyNotes?.trim() || null,
-    now,
-    now,
-  );
-  return c.json(agentRoleFromRow(db.prepare("select * from agent_roles where id = ?").get(id) as Record<string, unknown>), 201);
-});
-app.post("/api/agent-roles/from-template", async (c) => {
-  const body = await c.req.json<CreateAgentRoleFromTemplateRequest>().catch(() => null);
-  if (!body?.templateId) return c.json({ error: "template_required" }, 400);
-  const template = listAgentRoleTemplates().find((item) => item.id === body.templateId);
-  if (!template) return c.json({ error: "agent_role_template_not_found" }, 404);
-  const now = new Date().toISOString();
-  const roleName = body.name?.trim() || template.name;
-  const description = body.description?.trim() || template.description;
-  const systemPrompt = systemPromptWithRoleDescription(template.markdownContent, description, Boolean(body.includeDescriptionInPrompt));
-  const idBase = slugify(roleName);
-  let id = idBase;
-  let suffix = 2;
-  while (db.prepare("select id from agent_roles where id = ?").get(id)) id = `${idBase}-${suffix++}`;
-  db.prepare(`
-    insert into agent_roles (id, name, description, source_type, source_path, source_url, markdown_content, system_prompt, capabilities, default_listen_mode, default_listen_events, default_workspace_mode, default_sandbox_mode, default_approval_policy, output_contract, safety_notes, created_at, updated_at)
-    values (?, ?, ?, 'builtin-template', ?, ?, ?, ?, '[]', 'passive', '[]', 'isolated-worktree-with-shared-room', null, null, null, null, ?, ?)
-  `).run(id, roleName, description, template.sourcePath, template.sourceUrl ?? null, template.markdownContent, systemPrompt, now, now);
-  return c.json(agentRoleFromRow(db.prepare("select * from agent_roles where id = ?").get(id) as Record<string, unknown>), 201);
-});
-app.post("/api/agent-roles/import-file", async (c) => {
-  const body = await c.req.json<{ path?: string; name?: string }>().catch(() => null);
-  if (!body?.path?.trim()) return c.json({ error: "path_required" }, 400);
-  try {
-    const absolutePath = resolveTerminalCwd(body.path);
-    const stat = statSync(absolutePath);
-    if (!stat.isFile() || stat.size > 1024 * 1024) return c.json({ error: "invalid_role_file" }, 400);
-    const markdownContent = readFileSync(absolutePath, "utf8");
-    const name = body.name?.trim() || markdownTitle(markdownContent) || basename(absolutePath).replace(/\.(md|markdown)$/i, "");
-    const request: CreateAgentRoleRequest = {
-      name,
-      description: markdownDescription(markdownContent),
-      sourceType: "file-import",
-      sourcePath: absolutePath,
-      markdownContent,
-      systemPrompt: markdownContent,
-    };
-    const now = new Date().toISOString();
-    const idBase = slugify(request.name);
-    let id = idBase;
-    let suffix = 2;
-    while (db.prepare("select id from agent_roles where id = ?").get(id)) id = `${idBase}-${suffix++}`;
-    db.prepare(`
-      insert into agent_roles (id, name, description, source_type, source_path, source_url, markdown_content, system_prompt, capabilities, default_listen_mode, default_listen_events, default_workspace_mode, default_sandbox_mode, default_approval_policy, output_contract, safety_notes, created_at, updated_at)
-      values (?, ?, ?, 'file-import', ?, null, ?, ?, '[]', 'passive', '[]', 'isolated-worktree-with-shared-room', null, null, null, null, ?, ?)
-    `).run(id, request.name, request.description ?? "", absolutePath, markdownContent, markdownContent, now, now);
-    return c.json(agentRoleFromRow(db.prepare("select * from agent_roles where id = ?").get(id) as Record<string, unknown>), 201);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "role_import_failed" }, 400);
-  }
-});
-app.patch("/api/agent-roles/:id", async (c) => {
-  const current = db.prepare("select * from agent_roles where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!current) return c.json({ error: "agent_role_not_found" }, 404);
-  const body = await c.req.json<UpdateAgentRoleRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_agent_role_update" }, 400);
-  const next = agentRoleFromRow(current);
-  const markdownContent = body.markdownContent?.trim() || next.markdownContent;
-  const description = body.description !== undefined ? body.description?.trim() || null : next.description;
-  const systemPrompt = systemPromptWithRoleDescription(body.systemPrompt?.trim() || markdownContent || next.systemPrompt, description, Boolean(body.includeDescriptionInPrompt));
-  db.prepare(`
-    update agent_roles set name = ?, description = ?, source_type = ?, source_path = ?, source_url = ?, markdown_content = ?, system_prompt = ?, capabilities = ?, default_listen_mode = ?, default_listen_events = ?, default_workspace_mode = ?, default_sandbox_mode = ?, default_approval_policy = ?, output_contract = ?, safety_notes = ?, updated_at = ?
-    where id = ?
-  `).run(
-    body.name?.trim() || next.name,
-    description,
-    roleSourceType(body.sourceType ?? next.sourceType),
-    body.sourcePath !== undefined ? body.sourcePath?.trim() || null : next.sourcePath ?? null,
-    body.sourceUrl !== undefined ? body.sourceUrl?.trim() || null : next.sourceUrl ?? null,
-    markdownContent,
-    systemPrompt,
-    JSON.stringify(body.capabilities ?? next.capabilities),
-    listenMode(body.defaultListenMode, next.defaultListenMode),
-    JSON.stringify(body.defaultListenEvents ?? next.defaultListenEvents),
-    workspaceMode(body.defaultWorkspaceMode, next.defaultWorkspaceMode),
-    body.defaultSandboxMode !== undefined ? body.defaultSandboxMode : next.defaultSandboxMode ?? null,
-    body.defaultApprovalPolicy !== undefined ? body.defaultApprovalPolicy : next.defaultApprovalPolicy ?? null,
-    body.outputContract !== undefined ? body.outputContract?.trim() || null : next.outputContract ?? null,
-    body.safetyNotes !== undefined ? body.safetyNotes?.trim() || null : next.safetyNotes ?? null,
-    new Date().toISOString(),
-    next.id,
-  );
-  return c.json(agentRoleFromRow(db.prepare("select * from agent_roles where id = ?").get(next.id) as Record<string, unknown>));
-});
-app.delete("/api/agent-roles/:id", (c) => {
-  const roleId = c.req.param("id");
-  const agents = db.prepare("select count(*) as count from agents where role_id = ?").get(roleId) as { count: number } | undefined;
-  if (agents && agents.count > 0) return c.json({ error: "agent_role_in_use" }, 409);
-  db.prepare("delete from agent_roles where id = ?").run(roleId);
-  return c.json({ ok: true, id: roleId });
-});
-
-app.get("/api/agents", (c) => c.json(listAgents(parsePageLimit(c.req.query("limit"), 50), c.req.query("cursor"))));
-app.get("/api/permission-profiles", (c) => c.json(Object.entries(permissionProfiles).map(([id, permissions]) => ({
-  id,
-  permissions: { ...defaultAgentPermissions, ...permissions },
-}))));
-app.post("/api/agents/batch", async (c) => {
-  const body = await c.req.json<{ ids?: string[]; enabled?: boolean }>().catch(() => null);
-  const ids = [...new Set((body?.ids ?? []).map(String))];
-  if (!ids.length || typeof body?.enabled !== "boolean") return c.json({ error: "invalid_agent_batch" }, 400);
-  const now = new Date().toISOString();
-  const update = db.prepare("update agents set enabled = ?, updated_at = ? where id = ?");
-  for (const id of ids) update.run(body.enabled ? 1 : 0, now, id);
-  return c.json({ ok: true, ids, enabled: body.enabled });
-});
-app.get("/api/agents/:id/sessions", (c) => {
-  const agentId = c.req.param("id");
-  if (!db.prepare("select id from agents where id = ?").get(agentId)) return c.json({ error: "agent_not_found" }, 404);
-  const limit = parsePageLimit(c.req.query("limit"), 20);
-  const cursor = decodePageCursor(c.req.query("cursor"));
-  const q = c.req.query("q")?.trim().toLowerCase() ?? "";
-  const status = c.req.query("status");
-  const projectId = c.req.query("projectId");
-  const rows = db.prepare(`
-    select sessions.*
-    from sessions
-    inner join agent_sessions on agent_sessions.session_id = sessions.id
-    where agent_sessions.agent_id = @agentId
-      ${status ? "and sessions.status = @status" : ""}
-      ${projectId ? "and coalesce(sessions.project_id, '') = @projectId" : ""}
-      ${cursor ? "and (sessions.updated_at < @cursorSort or (sessions.updated_at = @cursorSort and sessions.id < @cursorId))" : ""}
-    order by sessions.updated_at desc, sessions.id desc
-  `).all({ agentId, status, projectId: projectId === "scratch" ? "" : projectId, cursorSort: cursor?.sortValue, cursorId: cursor?.id }) as Array<Record<string, unknown>>;
-  const projects = appData.projects;
-  const filtered = rows.map((row) => sessionFromRow(row, projects))
-    .filter((session) => !q || session.title.toLowerCase().includes(q) || session.id.toLowerCase().includes(q) || session.workspacePath.toLowerCase().includes(q))
-    .slice(0, limit + 1);
-  return c.json(pageFromRows(filtered, limit, (item) => item.updatedAt));
-});
-app.get("/api/agents/:id/stats", (c) => {
-  const agentId = c.req.param("id");
-  if (!db.prepare("select id from agents where id = ?").get(agentId)) return c.json({ error: "agent_not_found" }, 404);
-  const runs = db.prepare("select status, started_at, finished_at from agent_runs where agent_id = ?").all(agentId) as Array<{ status: string; started_at: string; finished_at?: string | null }>;
-  const directSessions = db.prepare("select count(*) as count from agent_sessions where agent_id = ?").get(agentId) as { count: number } | undefined;
-  const completed = runs.filter((run) => run.finished_at);
-  const durations = completed.map((run) => new Date(run.finished_at ?? run.started_at).getTime() - new Date(run.started_at).getTime()).filter((value) => Number.isFinite(value) && value >= 0);
-  return c.json({
-    agentId,
-    totalRuns: runs.length,
-    runningRuns: runs.filter((run) => run.status === "running").length,
-    successfulRuns: runs.filter((run) => run.status === "done").length,
-    failedRuns: runs.filter((run) => run.status === "failed").length,
-    directSessions: directSessions?.count ?? 0,
-    averageDurationMs: durations.length ? Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length) : 0,
-    latestRunAt: runs.map((run) => run.started_at).sort().at(-1) ?? null,
-  });
-});
-app.post("/api/agents", async (c) => {
-  const body = await c.req.json<CreateAgentRequest>().catch(() => null);
-  if (!body?.name?.trim() || !body.roleId || !db.prepare("select id from agent_roles where id = ?").get(body.roleId)) return c.json({ error: "invalid_agent" }, 400);
-  const role = agentRoleFromRow(db.prepare("select * from agent_roles where id = ?").get(body.roleId) as Record<string, unknown>);
-  const now = new Date().toISOString();
-  const id = `agent-${randomUUID()}`;
-  const accessMode = projectAccessMode(body.projectAccessMode);
-  const allowedProjectIds = normalizeProjectIds(body.allowedProjectIds);
-  const favoriteProjectIds = normalizeProjectIds(body.favoriteProjectIds);
-  const defaultProjectId = body.defaultProjectId && agentCanAccessProject({
-    ...agentFromRow({
-      id,
-      name: body.name.trim(),
-      role_id: body.roleId,
-      workspace_mode: body.workspaceMode ?? role.defaultWorkspaceMode,
-      permissions: "{}",
-      max_concurrent_runs: 1,
-      enabled: 1,
-      created_at: now,
-      updated_at: now,
-      project_access_mode: accessMode,
-      allowed_project_ids: JSON.stringify(allowedProjectIds),
-      favorite_project_ids: JSON.stringify(favoriteProjectIds),
-    }),
-    projectAccessMode: accessMode,
-    allowedProjectIds,
-  }, body.defaultProjectId) ? body.defaultProjectId : null;
-  db.prepare(`
-    insert into agents (id, name, role_id, description, extra_prompt, provider_id, model, listen_mode, listen_events, workspace_mode, default_project_id, favorite_project_ids, project_access_mode, allowed_project_ids, permission_profile_id, permissions, max_concurrent_runs, enabled, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    id,
-    body.name.trim(),
-    body.roleId,
-    body.description?.trim() || null,
-    body.extraPrompt?.trim() || null,
-    body.providerId || null,
-    body.model?.trim() || null,
-    role.defaultListenMode,
-    JSON.stringify(role.defaultListenEvents),
-    workspaceMode(body.workspaceMode, role.defaultWorkspaceMode),
-    defaultProjectId,
-    JSON.stringify(favoriteProjectIds),
-    accessMode,
-    JSON.stringify(allowedProjectIds),
-    permissionProfileId(body.permissionProfileId),
-    JSON.stringify(agentPermissions({}, body.permissions)),
-    Math.max(1, Math.min(10, Number(body.maxConcurrentRuns ?? 1) || 1)),
-    body.enabled === false ? 0 : 1,
-    now,
-    now,
-  );
-  return c.json(agentFromRow(db.prepare("select * from agents where id = ?").get(id) as Record<string, unknown>), 201);
-});
-app.post("/api/agents/:id/sessions", async (c) => {
-  const agentRow = db.prepare("select * from agents where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!agentRow) return c.json({ error: "agent_not_found" }, 404);
-  const agent = agentFromRow(agentRow);
-  if (!agent.enabled) return c.json({ error: "agent_disabled" }, 400);
-  const body = await c.req.json<CreateAgentSessionRequest>().catch(() => null);
-  let project: ProjectSummary | null = null;
-  try {
-    project = resolveAgentProject(agent, body?.projectId);
-  } catch {
-    return c.json({ error: "agent_project_access_denied" }, 403);
-  }
-  const provider = agent.providerId ? appData.providers.find((item) => item.id === agent.providerId) : appData.providers[0];
-  const now = new Date().toISOString();
-  const id = `task-${randomUUID()}`;
-  const session: SessionSummary = {
-    id,
-    kind: project ? "project" : "scratch",
-    conversationType: "agent",
-    roomId: null,
-    directAgentId: agent.id,
-    title: agent.name,
-    projectId: project?.id ?? null,
-    workspacePath: project?.workspacePath ? resolveTerminalCwd(project.workspacePath) : ensureScratchSessionWorkspace(id),
-    providerId: provider?.id ?? null,
-    model: agent.model ?? provider?.defaultModel ?? null,
-    status: "paused",
-    createdAt: now,
-    updatedAt: now,
-  };
-  appData.sessions.unshift(session);
-  upsertSession(session);
-  db.prepare("insert into agent_sessions (session_id, agent_id, created_at) values (?, ?, ?)").run(session.id, agent.id, now);
-  return c.json(session, 201);
-});
-app.patch("/api/agents/:id", async (c) => {
-  const current = db.prepare("select * from agents where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!current) return c.json({ error: "agent_not_found" }, 404);
-  const body = await c.req.json<UpdateAgentRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_agent_update" }, 400);
-  const next = agentFromRow(current);
-  const roleId = body.roleId ?? next.roleId;
-  if (!db.prepare("select id from agent_roles where id = ?").get(roleId)) return c.json({ error: "agent_role_not_found" }, 404);
-  const currentListenMode = listenMode(current.listen_mode);
-  const currentListenEvents = jsonArray(current.listen_events);
-  const accessMode = projectAccessMode(body.projectAccessMode ?? next.projectAccessMode);
-  const allowedProjectIds = normalizeProjectIds(body.allowedProjectIds ?? next.allowedProjectIds);
-  const favoriteProjectIds = normalizeProjectIds(body.favoriteProjectIds ?? next.favoriteProjectIds);
-  const requestedDefaultProjectId = body.defaultProjectId !== undefined ? body.defaultProjectId : next.defaultProjectId;
-  const defaultProjectId = requestedDefaultProjectId && (accessMode === "all" || (accessMode === "selected" && allowedProjectIds.includes(requestedDefaultProjectId))) ? requestedDefaultProjectId : null;
-  db.prepare(`
-    update agents set name = ?, role_id = ?, description = ?, extra_prompt = ?, provider_id = ?, model = ?, listen_mode = ?, listen_events = ?, workspace_mode = ?, default_project_id = ?, favorite_project_ids = ?, project_access_mode = ?, allowed_project_ids = ?, permission_profile_id = ?, permissions = ?, max_concurrent_runs = ?, enabled = ?, updated_at = ?
-    where id = ?
-  `).run(
-    body.name?.trim() || next.name,
-    roleId,
-    body.description !== undefined ? body.description?.trim() || null : next.description ?? null,
-    body.extraPrompt !== undefined ? body.extraPrompt?.trim() || null : next.extraPrompt ?? null,
-    body.providerId !== undefined ? body.providerId || null : next.providerId ?? null,
-    body.model !== undefined ? body.model?.trim() || null : next.model ?? null,
-    currentListenMode,
-    JSON.stringify(currentListenEvents),
-    workspaceMode(body.workspaceMode, next.workspaceMode),
-    defaultProjectId,
-    JSON.stringify(favoriteProjectIds),
-    accessMode,
-    JSON.stringify(allowedProjectIds),
-    body.permissionProfileId !== undefined ? permissionProfileId(body.permissionProfileId) : next.permissionProfileId ?? null,
-    JSON.stringify(agentPermissions(next.permissions, body.permissions)),
-    Math.max(1, Math.min(10, Number(body.maxConcurrentRuns ?? next.maxConcurrentRuns) || 1)),
-    body.enabled !== undefined ? body.enabled ? 1 : 0 : next.enabled ? 1 : 0,
-    new Date().toISOString(),
-    next.id,
-  );
-  return c.json(agentFromRow(db.prepare("select * from agents where id = ?").get(next.id) as Record<string, unknown>));
-});
-app.delete("/api/agents/:id", (c) => {
-  const agentId = c.req.param("id");
-  db.prepare("delete from agent_group_members where agent_id = ?").run(agentId);
-  db.prepare("delete from room_agent_threads where agent_id = ?").run(agentId);
-  db.prepare("delete from agents where id = ?").run(agentId);
-  return c.json({ ok: true, id: agentId });
-});
-
-app.get("/api/agent-groups", (c) => c.json(listAgentGroups(parsePageLimit(c.req.query("limit"), 50), c.req.query("cursor"))));
-app.post("/api/agent-groups", async (c) => {
-  const body = await c.req.json<CreateAgentGroupRequest>().catch(() => null);
-  if (!body?.name?.trim()) return c.json({ error: "invalid_agent_group" }, 400);
-  const now = new Date().toISOString();
-  const id = `group-${randomUUID()}`;
-  db.prepare(`
-    insert into agent_groups (id, name, description, collaboration_rules, event_routing_rules, max_concurrent_agents, approval_policy, merge_strategy, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    id,
-    body.name.trim(),
-    body.description?.trim() || null,
-    body.collaborationRules?.trim() || "orchestrator-routed",
-    body.eventRoutingRules?.trim() || "orchestrator listens to room events and assigns agents explicitly",
-    Math.max(1, Math.min(20, Number(body.maxConcurrentAgents ?? 3) || 3)),
-    body.approvalPolicy?.trim() || "approval-required-for-risk",
-    body.mergeStrategy?.trim() || "isolated-worktree-review-then-approve",
-    now,
-    now,
-  );
-  replaceGroupMembers(id, body.agentIds ?? [], body.memberListenModes ?? {});
-  return c.json(agentGroupFromRow(db.prepare("select * from agent_groups where id = ?").get(id) as Record<string, unknown>), 201);
-});
-app.patch("/api/agent-groups/:id", async (c) => {
-  const current = db.prepare("select * from agent_groups where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!current) return c.json({ error: "agent_group_not_found" }, 404);
-  const body = await c.req.json<UpdateAgentGroupRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_agent_group_update" }, 400);
-  const next = agentGroupFromRow(current);
-  db.prepare(`
-    update agent_groups set name = ?, description = ?, collaboration_rules = ?, event_routing_rules = ?, max_concurrent_agents = ?, approval_policy = ?, merge_strategy = ?, updated_at = ?
-    where id = ?
-  `).run(
-    body.name?.trim() || next.name,
-    body.description !== undefined ? body.description?.trim() || null : next.description ?? null,
-    body.collaborationRules?.trim() || next.collaborationRules,
-    body.eventRoutingRules?.trim() || next.eventRoutingRules,
-    Math.max(1, Math.min(20, Number(body.maxConcurrentAgents ?? next.maxConcurrentAgents) || 3)),
-    body.approvalPolicy?.trim() || next.approvalPolicy,
-    body.mergeStrategy?.trim() || next.mergeStrategy,
-    new Date().toISOString(),
-    next.id,
-  );
-  if (body.agentIds) replaceGroupMembers(next.id, body.agentIds, body.memberListenModes ?? next.memberListenModes ?? {});
-  return c.json(agentGroupFromRow(db.prepare("select * from agent_groups where id = ?").get(next.id) as Record<string, unknown>));
-});
-app.delete("/api/agent-groups/:id", (c) => {
-  const groupId = c.req.param("id");
-  db.prepare("delete from agent_group_members where group_id = ?").run(groupId);
-  db.prepare("delete from agent_groups where id = ?").run(groupId);
-  return c.json({ ok: true, id: groupId });
-});
-
-app.get("/api/agent-groups/:id/rooms", (c) => {
-  const groupId = c.req.param("id");
-  if (!db.prepare("select id from agent_groups where id = ?").get(groupId)) return c.json({ error: "agent_group_not_found" }, 404);
-  const limit = parsePageLimit(c.req.query("limit"), 20);
-  const cursor = decodePageCursor(c.req.query("cursor"));
-  const q = c.req.query("q")?.trim().toLowerCase() ?? "";
-  const status = c.req.query("status");
-  const projectId = c.req.query("projectId");
-  const rows = db.prepare(`
-    select sessions.*
-    from rooms
-    inner join sessions on sessions.id = rooms.session_id
-    where rooms.group_id = @groupId
-      ${status ? "and sessions.status = @status" : ""}
-      ${projectId ? "and coalesce(sessions.project_id, '') = @projectId" : ""}
-      ${cursor ? "and (sessions.updated_at < @cursorSort or (sessions.updated_at = @cursorSort and sessions.id < @cursorId))" : ""}
-    order by sessions.updated_at desc, sessions.id desc
-  `).all({ groupId, status, projectId: projectId === "scratch" ? "" : projectId, cursorSort: cursor?.sortValue, cursorId: cursor?.id }) as Array<Record<string, unknown>>;
-  const filtered = rows.map((row) => sessionFromRow(row, appData.projects))
-    .filter((session) => !q || session.title.toLowerCase().includes(q) || session.id.toLowerCase().includes(q) || session.workspacePath.toLowerCase().includes(q))
-    .slice(0, limit + 1);
-  return c.json(pageFromRows(filtered, limit, (item) => item.updatedAt));
-});
-
-app.get("/api/agent-circles", (c) => {
-  if (c.req.query("limit") || c.req.query("cursor")) return c.json(listAgentCircles(parsePageLimit(c.req.query("limit"), 50), c.req.query("cursor")));
-  const rows = db.prepare("select * from agent_circles order by builtin desc, name asc").all() as Array<Record<string, unknown>>;
-  return c.json(rows.map(agentCircleFromRow));
-});
-app.get("/api/agent-circles/:id/rooms", (c) => {
-  const circleId = c.req.param("id");
-  if (!db.prepare("select id from agent_circles where id = ?").get(circleId)) return c.json({ error: "agent_circle_not_found" }, 404);
-  const limit = parsePageLimit(c.req.query("limit"), 20);
-  const cursor = decodePageCursor(c.req.query("cursor"));
-  const q = c.req.query("q")?.trim().toLowerCase() ?? "";
-  const status = c.req.query("status");
-  const projectId = c.req.query("projectId");
-  const rows = db.prepare(`
-    select sessions.*
-    from rooms
-    inner join sessions on sessions.id = rooms.session_id
-    where rooms.circle_id = @circleId
-      ${status ? "and sessions.status = @status" : ""}
-      ${projectId ? "and coalesce(sessions.project_id, '') = @projectId" : ""}
-      ${cursor ? "and (sessions.updated_at < @cursorSort or (sessions.updated_at = @cursorSort and sessions.id < @cursorId))" : ""}
-    order by sessions.updated_at desc, sessions.id desc
-  `).all({ circleId, status, projectId: projectId === "scratch" ? "" : projectId, cursorSort: cursor?.sortValue, cursorId: cursor?.id }) as Array<Record<string, unknown>>;
-  const filtered = rows.map((row) => sessionFromRow(row, appData.projects))
-    .filter((session) => !q || session.title.toLowerCase().includes(q) || session.id.toLowerCase().includes(q) || session.workspacePath.toLowerCase().includes(q))
-    .slice(0, limit + 1);
-  return c.json(pageFromRows(filtered, limit, (item) => item.updatedAt));
-});
-app.post("/api/agent-circles", async (c) => {
-  const body = await c.req.json<CreateAgentCircleRequest>().catch(() => null);
-  if (!body?.name?.trim()) return c.json({ error: "invalid_agent_circle" }, 400);
-  const roleIds = [...new Set(body.roleIds ?? [])].filter((roleId) => db.prepare("select id from agent_roles where id = ?").get(roleId));
-  const now = new Date().toISOString();
-  const idBase = `circle-${slugify(body.name)}`;
-  let id = idBase;
-  let suffix = 2;
-  while (db.prepare("select id from agent_circles where id = ?").get(id)) id = `${idBase}-${suffix++}`;
-  db.prepare(`
-    insert into agent_circles (id, name, description, group_template_id, collaboration_rules, event_routing_rules, max_concurrent_agents, approval_policy, merge_strategy, builtin, created_at, updated_at)
-    values (?, ?, ?, null, ?, ?, ?, ?, ?, 0, ?, ?)
-  `).run(
-    id,
-    body.name.trim(),
-    body.description?.trim() || null,
-    body.collaborationRules?.trim() || "",
-    body.eventRoutingRules?.trim() || "",
-    Math.max(1, Math.min(10, Number(body.maxConcurrentAgents ?? 3) || 3)),
-    body.approvalPolicy?.trim() || "bounded",
-    body.mergeStrategy?.trim() || "approval-required",
-    now,
-    now,
-  );
-  const insertRole = db.prepare("insert or ignore into agent_circle_roles (circle_id, role_id, position) values (?, ?, ?)");
-  roleIds.forEach((roleId, index) => insertRole.run(id, roleId, index));
-  return c.json(agentCircleFromRow(db.prepare("select * from agent_circles where id = ?").get(id) as Record<string, unknown>), 201);
-});
-app.patch("/api/agent-circles/:id", async (c) => {
-  const current = db.prepare("select * from agent_circles where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!current) return c.json({ error: "agent_circle_not_found" }, 404);
-  if (Number(current.builtin) === 1) return c.json({ error: "builtin_circle_locked" }, 409);
-  const body = await c.req.json<UpdateAgentCircleRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_agent_circle_update" }, 400);
-  const next = agentCircleFromRow(current);
-  db.prepare(`
-    update agent_circles set name = ?, description = ?, collaboration_rules = ?, event_routing_rules = ?, max_concurrent_agents = ?, approval_policy = ?, merge_strategy = ?, updated_at = ?
-    where id = ?
-  `).run(
-    body.name?.trim() || next.name,
-    body.description !== undefined ? body.description?.trim() || null : next.description ?? null,
-    body.collaborationRules?.trim() || next.collaborationRules,
-    body.eventRoutingRules?.trim() || next.eventRoutingRules,
-    Math.max(1, Math.min(10, Number(body.maxConcurrentAgents ?? next.maxConcurrentAgents) || 3)),
-    body.approvalPolicy?.trim() || next.approvalPolicy,
-    body.mergeStrategy?.trim() || next.mergeStrategy,
-    new Date().toISOString(),
-    next.id,
-  );
-  if (body.roleIds) {
-    db.prepare("delete from agent_circle_roles where circle_id = ?").run(next.id);
-    const insertRole = db.prepare("insert or ignore into agent_circle_roles (circle_id, role_id, position) values (?, ?, ?)");
-    [...new Set(body.roleIds)].filter((roleId) => db.prepare("select id from agent_roles where id = ?").get(roleId)).forEach((roleId, index) => insertRole.run(next.id, roleId, index));
-  }
-  return c.json(agentCircleFromRow(db.prepare("select * from agent_circles where id = ?").get(next.id) as Record<string, unknown>));
-});
-app.post("/api/agent-circles/:id/groups", async (c) => {
-  const circleRow = db.prepare("select * from agent_circles where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!circleRow) return c.json({ error: "agent_circle_not_found" }, 404);
-  const circle = agentCircleFromRow(circleRow);
-  try {
-    return c.json(createAgentGroupFromCircle(circle), 201);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "agent_circle_group_create_failed" }, 400);
-  }
-});
-app.delete("/api/agent-circles/:id", (c) => {
-  const circle = db.prepare("select * from agent_circles where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!circle) return c.json({ error: "agent_circle_not_found" }, 404);
-  if (Number(circle.builtin) === 1) return c.json({ error: "builtin_circle_locked" }, 409);
-  db.prepare("delete from agent_circle_roles where circle_id = ?").run(c.req.param("id"));
-  db.prepare("delete from agent_circles where id = ?").run(c.req.param("id"));
-  return c.json({ ok: true, id: c.req.param("id") });
-});
-
-app.get("/api/rooms", (c) => c.json(listRooms(c.req.query("status"), parsePageLimit(c.req.query("limit"), 50), c.req.query("cursor"))));
-app.get("/api/rooms/:id", (c) => {
-  const row = db.prepare("select * from rooms where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!row) return c.json({ error: "room_not_found" }, 404);
-  return c.json(roomFromRow(row));
-});
-app.post("/api/rooms", async (c) => {
-  const body = await c.req.json<CreateRoomRequest>().catch(() => null);
-  if (!body?.name?.trim()) return c.json({ error: "invalid_room" }, 400);
-  if (body.groupId && !db.prepare("select id from agent_groups where id = ?").get(body.groupId)) return c.json({ error: "agent_group_not_found" }, 404);
-  const circle = body.circleId ? db.prepare("select * from agent_circles where id = ?").get(body.circleId) as Record<string, unknown> | undefined : null;
-  if (body.circleId && !circle) return c.json({ error: "agent_circle_not_found" }, 404);
-  let groupId = body.groupId ?? (circle?.group_template_id ? String(circle.group_template_id) : null);
-  if (!groupId && circle) {
-    try {
-      groupId = createAgentGroupFromCircle(agentCircleFromRow(circle)).id;
-    } catch (error) {
-      return c.json({ error: error instanceof Error ? error.message : "agent_circle_group_create_failed" }, 400);
-    }
-  }
-  const now = new Date().toISOString();
-  const id = `room-${randomUUID()}`;
-  const project = body.projectId ? appData.projects.find((item) => item.id === body.projectId) : null;
-  const sessionId = `task-${randomUUID()}`;
-  const session: SessionSummary = {
-    id: sessionId,
-    kind: project ? "project" : "scratch",
-    conversationType: "room",
-    roomId: id,
-    title: body.name.trim(),
-    projectId: project?.id ?? null,
-    workspacePath: project?.workspacePath ? resolveTerminalCwd(project.workspacePath) : ensureScratchSessionWorkspace(sessionId),
-    status: "paused",
-    createdAt: now,
-    updatedAt: now,
-  };
-  appData.sessions.unshift(session);
-  upsertSession(session);
-  db.prepare(`
-    insert into rooms (id, session_id, name, group_id, circle_id, project_id, status, shared_context, orchestration_settings, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)
-  `).run(id, sessionId, body.name.trim(), groupId, body.circleId ?? null, project?.id ?? null, body.sharedContext?.trim() || null, JSON.stringify(defaultRoomOrchestration), now, now);
-  if (body.goal?.text?.trim()) {
-    session.goal = createGoal({ ...body.goal, ownerType: "room", ownerId: id, mode: body.goal.mode ?? "orchestrated" }, "user");
-  }
-  const group = groupId ? agentGroupFromRow(db.prepare("select * from agent_groups where id = ?").get(groupId) as Record<string, unknown>) : null;
-  const insertRoomAgent = db.prepare("insert or ignore into room_agents (room_id, agent_id, listen_mode) values (?, ?, ?)");
-  for (const agentId of group?.agentIds ?? []) insertRoomAgent.run(id, agentId, listenMode(group?.memberListenModes?.[agentId]));
-  roomEvent(id, "room.created", { name: body.name });
-  return c.json(roomFromRow(db.prepare("select * from rooms where id = ?").get(id) as Record<string, unknown>), 201);
-});
-app.patch("/api/rooms/:id", async (c) => {
-  const current = db.prepare("select * from rooms where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!current) return c.json({ error: "room_not_found" }, 404);
-  const body = await c.req.json<UpdateRoomRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_room_update" }, 400);
-  const next = roomFromRow(current);
-  const orchestration = roomOrchestrationSettings(current.orchestration_settings, body.orchestration);
-  db.prepare("update rooms set name = ?, status = ?, shared_context = ?, orchestration_settings = ?, updated_at = ? where id = ?").run(
-    body.name?.trim() || next.name,
-    roomStatus(body.status, next.status),
-    body.sharedContext !== undefined ? body.sharedContext?.trim() || null : next.sharedContext ?? null,
-    JSON.stringify(orchestration),
-    new Date().toISOString(),
-    next.id,
-  );
-  return c.json(roomFromRow(db.prepare("select * from rooms where id = ?").get(next.id) as Record<string, unknown>));
-});
-app.get("/api/rooms/:id/agents", (c) => {
-  const room = db.prepare("select id from rooms where id = ?").get(c.req.param("id"));
-  if (!room) return c.json({ error: "room_not_found" }, 404);
-  return c.json(roomAgentsWithListenModes(c.req.param("id")).map((member) => ({ ...member.agent, listenMode: member.listenMode })));
-});
-app.post("/api/rooms/:id/agents", async (c) => {
-  const room = db.prepare("select id from rooms where id = ?").get(c.req.param("id"));
-  if (!room) return c.json({ error: "room_not_found" }, 404);
-  const body = await c.req.json<{ agentId?: string; listenMode?: AgentListenMode }>().catch(() => null);
-  const agentId = body?.agentId?.trim() ?? "";
-  if (!agentId || !db.prepare("select id from agents where id = ?").get(agentId)) return c.json({ error: "agent_not_found" }, 404);
-  const mode = listenMode(body?.listenMode);
-  db.prepare("insert into room_agents (room_id, agent_id, listen_mode) values (?, ?, ?) on conflict(room_id, agent_id) do update set listen_mode = excluded.listen_mode").run(c.req.param("id"), agentId, mode);
-  roomEvent(c.req.param("id"), "room.agent.added", { agentId, listenMode: mode }, agentId);
-  return c.json(roomAgentsWithListenModes(c.req.param("id")).map((member) => ({ ...member.agent, listenMode: member.listenMode })), 201);
-});
-app.patch("/api/rooms/:id/agents/:agentId", async (c) => {
-  const body = await c.req.json<{ listenMode?: AgentListenMode }>().catch(() => null);
-  const mode = listenMode(body?.listenMode);
-  const result = db.prepare("update room_agents set listen_mode = ? where room_id = ? and agent_id = ?").run(mode, c.req.param("id"), c.req.param("agentId"));
-  if (!result.changes) return c.json({ error: "room_agent_not_found" }, 404);
-  roomEvent(c.req.param("id"), "room.agent.listen_mode.updated", { agentId: c.req.param("agentId"), listenMode: mode }, c.req.param("agentId"));
-  return c.json(roomAgentsWithListenModes(c.req.param("id")).map((member) => ({ ...member.agent, listenMode: member.listenMode })));
-});
-app.get("/api/rooms/:id/events", (c) => {
-  const room = db.prepare("select id from rooms where id = ?").get(c.req.param("id"));
-  if (!room) return c.json({ error: "room_not_found" }, 404);
-  const limit = parsePageLimit(c.req.query("limit"), 50);
-  const cursor = decodePageCursor(c.req.query("cursor"));
-  const rows = db.prepare(`
-    select * from room_events
-    where room_id = @roomId
-      ${cursor ? "and (created_at < @cursorSort or (created_at = @cursorSort and id < @cursorId))" : ""}
-    order by created_at desc, id desc
-    limit @limit
-  `).all({ roomId: c.req.param("id"), cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
-  return c.json(pageFromRows(rows.map(roomEventFromRow), limit, (item) => item.createdAt));
-});
-app.get("/api/rooms/:id/artifacts", (c) => {
-  const room = db.prepare("select id from rooms where id = ?").get(c.req.param("id"));
-  if (!room) return c.json({ error: "room_not_found" }, 404);
-  if (c.req.query("limit") || c.req.query("cursor")) {
-    const limit = parsePageLimit(c.req.query("limit"), 30);
-    const offset = decodeOffsetCursor(c.req.query("cursor"));
-    const rows = db.prepare("select * from room_artifacts where room_id = ? order by created_at desc, id desc limit ? offset ?").all(c.req.param("id"), limit + 1, offset) as Array<Record<string, unknown>>;
-    return c.json(offsetPageFromRows(rows.map(roomArtifactFromRow), limit, offset));
-  }
-  const rows = db.prepare("select * from room_artifacts where room_id = ? order by created_at desc, id desc limit 100").all(c.req.param("id")) as Array<Record<string, unknown>>;
-  return c.json(rows.map(roomArtifactFromRow));
-});
-app.post("/api/rooms/:id/artifacts", async (c) => {
-  const room = db.prepare("select id from rooms where id = ?").get(c.req.param("id"));
-  if (!room) return c.json({ error: "room_not_found" }, 404);
-  const body = await c.req.json<CreateRoomArtifactRequest>().catch(() => null);
-  if (!body?.title?.trim() || !body.kind) return c.json({ error: "invalid_room_artifact" }, 400);
-  if (body.agentId && !db.prepare("select agent_id from room_agents where room_id = ? and agent_id = ?").get(c.req.param("id"), body.agentId)) {
-    return c.json({ error: "agent_not_in_room" }, 400);
-  }
-  return c.json(createRoomArtifact(c.req.param("id"), {
-    agentId: body.agentId ?? null,
-    kind: body.kind,
-    title: body.title.trim(),
-    payload: body.payload ?? {},
-  }), 201);
-});
-app.get("/api/rooms/:id/decisions", (c) => {
-  const room = db.prepare("select id from rooms where id = ?").get(c.req.param("id"));
-  if (!room) return c.json({ error: "room_not_found" }, 404);
-  if (c.req.query("limit") || c.req.query("cursor")) {
-    const limit = parsePageLimit(c.req.query("limit"), 30);
-    const offset = decodeOffsetCursor(c.req.query("cursor"));
-    const rows = db.prepare("select * from room_decisions where room_id = ? order by created_at desc, id desc limit ? offset ?").all(c.req.param("id"), limit + 1, offset) as Array<Record<string, unknown>>;
-    return c.json(offsetPageFromRows(rows.map(roomDecisionFromRow), limit, offset));
-  }
-  const rows = db.prepare("select * from room_decisions where room_id = ? order by created_at desc, id desc limit 100").all(c.req.param("id")) as Array<Record<string, unknown>>;
-  return c.json(rows.map(roomDecisionFromRow));
-});
-app.post("/api/rooms/:id/decisions", async (c) => {
-  const room = db.prepare("select id from rooms where id = ?").get(c.req.param("id"));
-  if (!room) return c.json({ error: "room_not_found" }, 404);
-  const body = await c.req.json<CreateRoomDecisionRequest>().catch(() => null);
-  if (!body?.title?.trim()) return c.json({ error: "invalid_room_decision" }, 400);
-  const status = ["open", "approved", "rejected", "resolved"].includes(String(body.status)) ? body.status as RoomDecisionSummary["status"] : "open";
-  return c.json(createRoomDecision(c.req.param("id"), {
-    title: body.title.trim(),
-    status,
-    payload: body.payload ?? {},
-    resolvedAt: status !== "open" ? new Date().toISOString() : null,
-  }), 201);
-});
-app.patch("/api/rooms/:id/decisions/:decisionId", async (c) => {
-  const roomId = c.req.param("id");
-  const decisionId = c.req.param("decisionId");
-  const current = db.prepare("select * from room_decisions where room_id = ? and id = ?").get(roomId, decisionId) as Record<string, unknown> | undefined;
-  if (!current) return c.json({ error: "decision_not_found" }, 404);
-  const body = await c.req.json<UpdateRoomDecisionRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_room_decision" }, 400);
-  const currentDecision = roomDecisionFromRow(current);
-  const title = typeof body.title === "string" ? body.title.trim() : currentDecision.title;
-  if (!title) return c.json({ error: "invalid_room_decision" }, 400);
-  const status = body.status && ["open", "approved", "rejected", "resolved"].includes(body.status) ? body.status : currentDecision.status;
-  const resolvedAt = status === "open" ? null : (currentDecision.resolvedAt ?? new Date().toISOString());
-  const payload = Object.prototype.hasOwnProperty.call(body, "payload") ? body.payload : currentDecision.payload;
-  db.prepare("update room_decisions set title = ?, status = ?, payload = ?, resolved_at = ? where room_id = ? and id = ?")
-    .run(title, status, JSON.stringify(payload ?? {}), resolvedAt, roomId, decisionId);
-  roomEvent(roomId, "decision.updated", { decisionId, title, status });
-  const updated = db.prepare("select * from room_decisions where room_id = ? and id = ?").get(roomId, decisionId) as Record<string, unknown>;
-  return c.json(roomDecisionFromRow(updated));
-});
-app.get("/api/rooms/:id/handoffs", (c) => {
-  const room = db.prepare("select id from rooms where id = ?").get(c.req.param("id"));
-  if (!room) return c.json({ error: "room_not_found" }, 404);
-  if (c.req.query("limit") || c.req.query("cursor")) {
-    const limit = parsePageLimit(c.req.query("limit"), 30);
-    const offset = decodeOffsetCursor(c.req.query("cursor"));
-    const rows = db.prepare("select * from room_handoffs where room_id = ? order by created_at desc, id desc limit ? offset ?").all(c.req.param("id"), limit + 1, offset) as Array<Record<string, unknown>>;
-    return c.json(offsetPageFromRows(rows.map(roomHandoffFromRow), limit, offset));
-  }
-  const rows = db.prepare("select * from room_handoffs where room_id = ? order by created_at desc, id desc limit 100").all(c.req.param("id")) as Array<Record<string, unknown>>;
-  return c.json(rows.map(roomHandoffFromRow));
-});
-app.post("/api/rooms/:id/handoffs", async (c) => {
-  const room = db.prepare("select id from rooms where id = ?").get(c.req.param("id"));
-  if (!room) return c.json({ error: "room_not_found" }, 404);
-  const body = await c.req.json<CreateRoomHandoffRequest>().catch(() => null);
-  if (!body?.summary?.trim()) return c.json({ error: "invalid_room_handoff" }, 400);
-  const status = roomHandoffStatus(body.status);
-  return c.json(createRoomHandoff(c.req.param("id"), {
-    fromAgentId: body.fromAgentId ?? null,
-    toAgentId: body.toAgentId ?? null,
-    summary: body.summary.trim(),
-    status,
-    payload: body.payload ?? {},
-    resolvedAt: status !== "open" ? new Date().toISOString() : null,
-  }), 201);
-});
-app.patch("/api/rooms/:id/handoffs/:handoffId", async (c) => {
-  const roomId = c.req.param("id");
-  const handoffId = c.req.param("handoffId");
-  const current = db.prepare("select * from room_handoffs where room_id = ? and id = ?").get(roomId, handoffId) as Record<string, unknown> | undefined;
-  if (!current) return c.json({ error: "handoff_not_found" }, 404);
-  const body = await c.req.json<UpdateRoomHandoffRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_room_handoff" }, 400);
-  const currentHandoff = roomHandoffFromRow(current);
-  const summary = typeof body.summary === "string" ? body.summary.trim() : currentHandoff.summary;
-  if (!summary) return c.json({ error: "invalid_room_handoff" }, 400);
-  const status = body.status ? roomHandoffStatus(body.status) : currentHandoff.status;
-  const resolvedAt = status === "open" ? null : (currentHandoff.resolvedAt ?? new Date().toISOString());
-  const payload = Object.prototype.hasOwnProperty.call(body, "payload") ? body.payload : currentHandoff.payload;
-  db.prepare(`
-    update room_handoffs
-    set from_agent_id = ?, to_agent_id = ?, summary = ?, status = ?, payload = ?, resolved_at = ?
-    where room_id = ? and id = ?
-  `).run(
-    Object.prototype.hasOwnProperty.call(body, "fromAgentId") ? body.fromAgentId ?? null : currentHandoff.fromAgentId ?? null,
-    Object.prototype.hasOwnProperty.call(body, "toAgentId") ? body.toAgentId ?? null : currentHandoff.toAgentId ?? null,
-    summary,
-    status,
-    JSON.stringify(payload ?? {}),
-    resolvedAt,
-    roomId,
-    handoffId,
-  );
-  roomEvent(roomId, "handoff.updated", { handoffId, status });
-  const updated = db.prepare("select * from room_handoffs where room_id = ? and id = ?").get(roomId, handoffId) as Record<string, unknown>;
-  return c.json(roomHandoffFromRow(updated));
-});
-app.post("/api/rooms/:id/messages", async (c) => {
-  const room = db.prepare("select id, session_id from rooms where id = ?").get(c.req.param("id")) as { id: string; session_id?: string | null } | undefined;
-  if (!room) return c.json({ error: "room_not_found" }, 404);
-  const body = await c.req.json<CreateRoomMessageRequest>().catch(() => null);
-  const content = body?.content?.trim() ?? "";
-  if (!content) return c.json({ error: "message_required" }, 400);
-  const roomId = c.req.param("id");
-  const requestedSession = body?.sessionId ? appData.sessions.find((item) => item.id === body.sessionId && item.roomId === roomId) : null;
-  const linkedSession = room.session_id ? appData.sessions.find((item) => item.id === room.session_id) : null;
-  const fallbackSession = appData.sessions.find((item) => item.roomId === roomId) ?? null;
-  const session = requestedSession ?? linkedSession ?? fallbackSession;
-  let attachments: SavedSessionAttachment[] = [];
-  if (session) {
-    try {
-      attachments = saveSessionAttachments(session.id, body?.attachments);
-    } catch (error) {
-      return c.json({ error: error instanceof Error ? error.message : "attachment_upload_failed" }, 400);
-    }
-  }
-  const contentWithAttachments = messageWithAttachments(content, attachments);
-  const promptContent = promptWithAttachments(content, attachments);
-  const message = session ? appendSessionMessage(session.id, "user", contentWithAttachments, body?.replyToMessageId ?? null) : null;
-  if (session) {
-    session.updatedAt = message?.createdAt ?? new Date().toISOString();
-    upsertSession(session);
-    if (room.session_id !== session.id) db.prepare("update rooms set session_id = ?, updated_at = ? where id = ?").run(session.id, session.updatedAt, roomId);
-  }
-  const members = roomAgentsWithListenModes(roomId);
-  const mentionableAgents = members.filter((member) => member.listenMode !== "none").map((member) => member.agent);
-  const mentionedAgents = mentionedRoomAgents(content, mentionableAgents);
-  const mentionsUser = mentionsRoomUser(content);
-  const orchestration = roomOrchestrationSettings((db.prepare("select orchestration_settings from rooms where id = ?").get(roomId) as { orchestration_settings?: string } | undefined)?.orchestration_settings);
-  const autoListenAgents = !mentionedAgents.length && !mentionsUser ? autoListenAgentsForRoomMessage(roomId, orchestration.maxAutoListenTasksPerEvent) : [];
-  const tasks = [
-    ...mentionedAgents.map((agent) => insertRoomTask(roomId, `@${agent.name}`, promptContent, agent.id, 1, null, { kind: "mention", reason: "user.mentioned", mentionsUser })),
-    ...autoListenAgents.map((agent) => insertRoomTask(
-      roomId,
-      members.find((member) => member.agent.id === agent.id)?.listenMode === "orchestrator" ? `Orchestrate: ${content}`.slice(0, 120) : `Respond: ${content}`.slice(0, 120),
-      [
-        "Room event: user.message",
-        "",
-        promptContent,
-        "",
-        members.find((member) => member.agent.id === agent.id)?.listenMode === "orchestrator"
-          ? "As the orchestrator, decide whether the room needs follow-up work and summarize the next step."
-          : "You are an active listener in this room. Reply to the room in one concise message. If no action is needed, acknowledge briefly and say you will keep listening.",
-      ].join("\n"),
-      agent.id,
-      members.find((member) => member.agent.id === agent.id)?.listenMode === "orchestrator" ? 2 : 1,
-      null,
-      { kind: "listen", reason: "user.message", mentionsUser },
-    )),
-  ];
-  const runs = [];
-  for (const task of tasks) {
-    try {
-      runs.push(startRoomTaskRun(roomId, task.id).run);
-    } catch {
-      // Keep the assigned task visible even if the Agent cannot start immediately.
-    }
-  }
-  const event = roomEvent(roomId, "user.message", { content: contentWithAttachments, messageId: message?.id ?? null, sessionId: session?.id ?? null, replyToMessageId: body?.replyToMessageId ?? null, mentionsUser, mentionedAgentIds: mentionedAgents.map((agent) => agent.id), autoListenAgentIds: autoListenAgents.map((agent) => agent.id), taskIds: tasks.map((task) => task.id) });
-  for (const task of tasks) {
-    roomEvent(roomId, "agent.mentioned", { content: promptContent, taskId: task.id }, task.assignedAgentId ?? null);
-  }
-  const routed = orchestrateRoom(roomId, mentionsUser ? "user.mentioned" : "user.message");
-  return c.json({ event, message, session: session ?? null, tasks: [...tasks, ...routed.tasks], runs: [...runs, ...routed.runs] }, 201);
-});
-app.get("/api/rooms/:id/runs", (c) => {
-  const room = db.prepare("select id from rooms where id = ?").get(c.req.param("id"));
-  if (!room) return c.json({ error: "room_not_found" }, 404);
-  if (c.req.query("limit") || c.req.query("cursor")) {
-    const limit = parsePageLimit(c.req.query("limit"), 30);
-    const offset = decodeOffsetCursor(c.req.query("cursor"));
-    const rows = db.prepare("select * from agent_runs where room_id = ? order by started_at desc, id desc limit ? offset ?").all(c.req.param("id"), limit + 1, offset) as Array<Record<string, unknown>>;
-    return c.json(offsetPageFromRows(rows.map(agentRunFromRow), limit, offset));
-  }
-  const rows = db.prepare("select * from agent_runs where room_id = ? order by started_at desc, id desc limit 100").all(c.req.param("id")) as Array<Record<string, unknown>>;
-  return c.json(rows.map(agentRunFromRow));
-});
-app.get("/api/rooms/:id/runs/:runId/diff", (c) => {
-  const run = db.prepare("select * from agent_runs where id = ? and room_id = ?").get(c.req.param("runId"), c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!run) return c.json({ error: "agent_run_not_found" }, 404);
-  const workspacePath = run.workspace_path ? String(run.workspace_path) : "";
-  if (!workspacePath || !existsSync(workspacePath)) return c.json({ error: "workspace_not_found" }, 404);
-  const status = runGitSync(workspacePath, ["status", "--short"]);
-  const stat = runGitSync(workspacePath, ["diff", "--stat"]);
-  const diff = runGitSync(workspacePath, ["diff", "--"]);
-  const response: RoomRunDiffResponse = {
-    runId: String(run.id),
-    ok: status.exitCode === 0 && stat.exitCode === 0 && diff.exitCode === 0,
-    workspacePath,
-    status: status.stdout,
-    stat: stat.stdout,
-    diff: diff.stdout,
-    error: status.stderr || stat.stderr || diff.stderr || undefined,
-  };
-  return c.json(response);
-});
-app.post("/api/rooms/:id/runs/:runId/merge", (c) => {
-  const run = db.prepare("select * from agent_runs where id = ? and room_id = ?").get(c.req.param("runId"), c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!run) return c.json({ error: "agent_run_not_found" }, 404);
-  const group = roomGroupForRoom(c.req.param("id"));
-  const permissions = agentPermissionsForRun(run);
-  const strategyRequiresApproval = group?.mergeStrategy.toLowerCase().includes("approval") ?? false;
-  const agentRequiresApproval = !permissions.canMergeChanges;
-  if ((strategyRequiresApproval || agentRequiresApproval) && !approvalAlwaysAllowed("room-run-merge", { roomId: c.req.param("id") })) {
-    const reason = agentRequiresApproval ? "agent permission does not allow direct merge" : `group merge strategy is ${group?.mergeStrategy}`;
-    const approval = createRoomRunMergeApproval(c.req.param("id"), c.req.param("runId"), agentRequiresApproval ? "high" : "medium", reason);
-    roomEvent(c.req.param("id"), "audit.operation", { action: "merge-approval-requested", runId: c.req.param("runId"), approvalId: approval.id, reason }, run.agent_id ? String(run.agent_id) : null);
-    createRoomDecision(c.req.param("id"), {
-      title: "Merge approval requested",
-      status: "open",
-      payload: { approvalId: approval.id, runId: c.req.param("runId"), reason },
-    });
-    if (run.session_id) {
-      appendMessageCard(String(run.session_id), "approval", "Merge approval requested", {
-        approvalId: approval.id,
-        roomId: c.req.param("id"),
-        runId: c.req.param("runId"),
-        reason,
-        risk: approval.risk,
-      });
-    }
-    return c.json({ error: "approval_required", approval: publicApproval(approval) }, 409);
-  }
-  try {
-    const response = applyRoomRunMerge(c.req.param("id"), c.req.param("runId"));
-    return c.json(response, response.ok ? 200 : 409);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "merge_failed" }, 400);
-  }
-});
-app.post("/api/rooms/:id/runs/:runId/reject", (c) => {
-  const run = db.prepare("select * from agent_runs where id = ? and room_id = ?").get(c.req.param("runId"), c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!run) return c.json({ error: "agent_run_not_found" }, 404);
-  db.prepare(`
-    insert into room_run_merges (run_id, room_id, project_id, workspace_path, status, summary, created_at, updated_at)
-    values (?, ?, ?, ?, 'rejected', 'Rejected by user', ?, ?)
-    on conflict(run_id) do update set status = 'rejected', summary = excluded.summary, updated_at = excluded.updated_at
-  `).run(c.req.param("runId"), c.req.param("id"), roomProject(c.req.param("id"))?.id ?? null, run.workspace_path ? String(run.workspace_path) : "", new Date().toISOString(), new Date().toISOString());
-  roomEvent(c.req.param("id"), "audit.operation", { action: "merge-rejected", runId: c.req.param("runId") }, run.agent_id ? String(run.agent_id) : null);
-  const response: RoomRunMergeResponse = { run: agentRunFromRow(run), ok: true };
-  return c.json(response);
-});
-app.get("/api/rooms/:id/tasks", (c) => {
-  const room = db.prepare("select id from rooms where id = ?").get(c.req.param("id"));
-  if (!room) return c.json({ error: "room_not_found" }, 404);
-  if (c.req.query("limit") || c.req.query("cursor")) {
-    const limit = parsePageLimit(c.req.query("limit"), 30);
-    const offset = decodeOffsetCursor(c.req.query("cursor"));
-    const rows = db.prepare("select * from room_tasks where room_id = ? order by priority desc, updated_at desc, id desc limit ? offset ?").all(c.req.param("id"), limit + 1, offset) as Array<Record<string, unknown>>;
-    return c.json(offsetPageFromRows(rows.map(roomTaskFromRow), limit, offset));
-  }
-  const rows = db.prepare("select * from room_tasks where room_id = ? order by priority desc, updated_at desc, id desc limit 100").all(c.req.param("id")) as Array<Record<string, unknown>>;
-  return c.json(rows.map(roomTaskFromRow));
-});
-app.post("/api/rooms/:id/tasks", async (c) => {
-  const room = db.prepare("select id from rooms where id = ?").get(c.req.param("id"));
-  if (!room) return c.json({ error: "room_not_found" }, 404);
-  const body = await c.req.json<CreateRoomTaskRequest>().catch(() => null);
-  if (!body?.title?.trim() || !body.prompt?.trim()) return c.json({ error: "invalid_room_task" }, 400);
-  if (body.assignedAgentId && !db.prepare("select agent_id from room_agents where room_id = ? and agent_id = ?").get(c.req.param("id"), body.assignedAgentId)) {
-    return c.json({ error: "agent_not_in_room" }, 400);
-  }
-  const now = new Date().toISOString();
-  const id = `room-task-${randomUUID()}`;
-  db.prepare(`
-    insert into room_tasks (id, room_id, title, prompt, status, assigned_agent_id, priority, depends_on_task_id, scheduled_at, payload, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    id,
-    c.req.param("id"),
-    body.title.trim(),
-    body.prompt.trim(),
-    body.assignedAgentId ? "assigned" : "queued",
-    body.assignedAgentId ?? null,
-    Number(body.priority ?? 0) || 0,
-    body.dependsOnTaskId ?? null,
-    body.scheduledAt ?? null,
-    JSON.stringify({}),
-    now,
-    now,
-  );
-  roomEvent(c.req.param("id"), "task.created", { taskId: id, title: body.title, scheduledAt: body.scheduledAt ?? null }, body.assignedAgentId ?? null);
-  orchestrateRoom(c.req.param("id"), "task.created");
-  return c.json(roomTaskFromRow(db.prepare("select * from room_tasks where id = ?").get(id) as Record<string, unknown>), 201);
-});
-app.post("/api/rooms/:id/tasks/retry-failed", (c) => {
-  const room = db.prepare("select id from rooms where id = ?").get(c.req.param("id"));
-  if (!room) return c.json({ error: "room_not_found" }, 404);
-  const now = new Date().toISOString();
-  const tasks = db.prepare(`
-    select * from room_tasks
-    where room_id = ? and assigned_agent_id is not null and status in ('failed', 'cancelled')
-    order by priority desc, updated_at desc
-  `).all(c.req.param("id")) as Array<Record<string, unknown>>;
-  for (const task of tasks) {
-    db.prepare("update room_tasks set status = 'assigned', started_at = null, finished_at = null, updated_at = ? where id = ?").run(now, String(task.id));
-    if (task.goal_item_id) {
-      const item = db.prepare("select goal_id from goal_items where id = ?").get(String(task.goal_item_id)) as { goal_id?: string } | undefined;
-      if (item?.goal_id) updateGoalItem(String(item.goal_id), String(task.goal_item_id), { status: "active" }, "system");
-    }
-    roomEvent(c.req.param("id"), "task.retry", { taskId: String(task.id), batch: true }, task.assigned_agent_id ? String(task.assigned_agent_id) : null);
-  }
-  if (tasks.length) orchestrateRoom(c.req.param("id"), "task.retry");
-  return c.json({ ok: true, retried: tasks.length });
-});
-app.patch("/api/rooms/:id/tasks/:taskId", async (c) => {
-  const task = db.prepare("select * from room_tasks where id = ? and room_id = ?").get(c.req.param("taskId"), c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!task) return c.json({ error: "room_task_not_found" }, 404);
-  const body = await c.req.json<UpdateRoomTaskRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_room_task_update" }, 400);
-  if (String(task.status) === "running" && body.status !== "cancelled") return c.json({ error: "room_task_running" }, 409);
-  if (body.assignedAgentId && !db.prepare("select agent_id from room_agents where room_id = ? and agent_id = ?").get(c.req.param("id"), body.assignedAgentId)) {
-    return c.json({ error: "agent_not_in_room" }, 400);
-  }
-  if (body.dependsOnTaskId && !db.prepare("select id from room_tasks where room_id = ? and id = ?").get(c.req.param("id"), body.dependsOnTaskId)) {
-    return c.json({ error: "dependency_not_found" }, 400);
-  }
-  const nextStatus = body.status ?? (body.assignedAgentId !== undefined && body.assignedAgentId ? "assigned" : String(task.status));
-  db.prepare(`
-    update room_tasks
-    set title = ?, prompt = ?, assigned_agent_id = ?, status = ?, priority = ?, depends_on_task_id = ?, updated_at = ?
-    where id = ? and room_id = ?
-  `).run(
-    body.title?.trim() || String(task.title),
-    body.prompt?.trim() || String(task.prompt ?? ""),
-    body.assignedAgentId !== undefined ? body.assignedAgentId || null : task.assigned_agent_id ?? null,
-    nextStatus,
-    Number(body.priority ?? task.priority ?? 0) || 0,
-    body.dependsOnTaskId !== undefined ? body.dependsOnTaskId || null : task.depends_on_task_id ?? null,
-    new Date().toISOString(),
-    c.req.param("taskId"),
-    c.req.param("id"),
-  );
-  if (task.goal_item_id && (nextStatus === "done" || nextStatus === "failed" || nextStatus === "cancelled")) {
-    const item = db.prepare("select goal_id from goal_items where id = ?").get(String(task.goal_item_id)) as { goal_id?: string } | undefined;
-    if (item?.goal_id) {
-      const status: GoalItemStatus = nextStatus === "done" ? "completed" : nextStatus === "cancelled" ? "cancelled" : "failed";
-      updateGoalItem(String(item.goal_id), String(task.goal_item_id), { status }, "system");
-    }
-  }
-  roomEvent(c.req.param("id"), "task.updated", { taskId: c.req.param("taskId"), status: nextStatus }, body.assignedAgentId !== undefined ? body.assignedAgentId : task.assigned_agent_id ? String(task.assigned_agent_id) : null);
-  orchestrateRoom(c.req.param("id"), "task.updated");
-  return c.json(roomTaskFromRow(db.prepare("select * from room_tasks where id = ?").get(c.req.param("taskId")) as Record<string, unknown>));
-});
-app.post("/api/rooms/:id/tasks/:taskId/cancel", (c) => {
-  const task = db.prepare("select * from room_tasks where id = ? and room_id = ?").get(c.req.param("taskId"), c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!task) return c.json({ error: "room_task_not_found" }, 404);
-  const run = db.prepare("select * from agent_runs where task_id = ? and status = 'running'").get(c.req.param("taskId")) as Record<string, unknown> | undefined;
-  if (run?.session_id) {
-    const sessionId = String(run.session_id);
-    const child = codexTaskProcesses.get(sessionId);
-    codexTaskStopRequested.add(sessionId);
-    markTaskRunStopRequested(sessionId);
-    if (child) {
-      child.kill("SIGTERM");
-    } else if (isProcessAlive(run.pid === null || run.pid === undefined ? null : Number(run.pid))) {
-      process.kill(Number(run.pid), "SIGTERM");
-    } else {
-      stopOrphanRoomAgentRun(sessionId);
-    }
-  }
-  const now = new Date().toISOString();
-  db.prepare("update room_tasks set status = 'cancelled', finished_at = ?, updated_at = ? where id = ?").run(now, now, c.req.param("taskId"));
-  if (task.goal_item_id) {
-    const item = db.prepare("select goal_id from goal_items where id = ?").get(String(task.goal_item_id)) as { goal_id?: string } | undefined;
-    if (item?.goal_id) updateGoalItem(String(item.goal_id), String(task.goal_item_id), { status: "cancelled" }, "system");
-  }
-  roomEvent(c.req.param("id"), "task.cancelled", { taskId: c.req.param("taskId") }, task.assigned_agent_id ? String(task.assigned_agent_id) : null);
-  roomEvent(c.req.param("id"), "audit.operation", { action: "task-cancelled", taskId: c.req.param("taskId"), runId: run?.id ?? null }, task.assigned_agent_id ? String(task.assigned_agent_id) : null);
-  return c.json(roomTaskFromRow(db.prepare("select * from room_tasks where id = ?").get(c.req.param("taskId")) as Record<string, unknown>));
-});
-app.post("/api/rooms/:id/tasks/:taskId/retry", (c) => {
-  const task = db.prepare("select * from room_tasks where id = ? and room_id = ?").get(c.req.param("taskId"), c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!task) return c.json({ error: "room_task_not_found" }, 404);
-  if (!task.assigned_agent_id) return c.json({ error: "room_task_unassigned" }, 400);
-  db.prepare("update room_tasks set status = 'assigned', started_at = null, finished_at = null, updated_at = ? where id = ?").run(new Date().toISOString(), c.req.param("taskId"));
-  if (task.goal_item_id) {
-    const item = db.prepare("select goal_id from goal_items where id = ?").get(String(task.goal_item_id)) as { goal_id?: string } | undefined;
-    if (item?.goal_id) updateGoalItem(String(item.goal_id), String(task.goal_item_id), { status: "active" }, "system");
-  }
-  roomEvent(c.req.param("id"), "task.retry", { taskId: c.req.param("taskId") }, String(task.assigned_agent_id));
-  roomEvent(c.req.param("id"), "audit.operation", { action: "task-retry", taskId: c.req.param("taskId") }, String(task.assigned_agent_id));
-  orchestrateRoom(c.req.param("id"), "task.retry");
-  return c.json(roomTaskFromRow(db.prepare("select * from room_tasks where id = ?").get(c.req.param("taskId")) as Record<string, unknown>));
-});
-app.post("/api/rooms/:id/tasks/:taskId/start", (c) => {
-  try {
-    return c.json(startRoomTaskRun(c.req.param("id"), c.req.param("taskId")), 201);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "room_task_start_failed";
-    const status = message === "room_not_found" || message === "room_task_not_found" || message === "agent_not_found" || message === "agent_role_not_found" ? 404
-      : message === "room_task_not_startable" ? 409
-        : 400;
-    return c.json({ error: message }, status);
-  }
-});
-app.delete("/api/rooms/:id/tasks/:taskId", (c) => {
-  const task = db.prepare("select * from room_tasks where id = ? and room_id = ?").get(c.req.param("taskId"), c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!task) return c.json({ error: "room_task_not_found" }, 404);
-  if (String(task.status) === "running") return c.json({ error: "room_task_running" }, 409);
-  db.prepare("delete from room_tasks where id = ?").run(c.req.param("taskId"));
-  db.prepare("delete from agent_runs where task_id = ? and status != 'running'").run(c.req.param("taskId"));
-  roomEvent(c.req.param("id"), "task.deleted", { taskId: c.req.param("taskId"), title: task.title }, task.assigned_agent_id ? String(task.assigned_agent_id) : null);
-  return c.json({ ok: true, id: c.req.param("taskId") });
-});
-app.get("/api/rooms/:id/schedules", (c) => {
-  const room = db.prepare("select id from rooms where id = ?").get(c.req.param("id"));
-  if (!room) return c.json({ error: "room_not_found" }, 404);
-  if (c.req.query("limit") || c.req.query("cursor")) {
-    const limit = parsePageLimit(c.req.query("limit"), 30);
-    const offset = decodeOffsetCursor(c.req.query("cursor"));
-    const rows = db.prepare("select * from room_schedules where room_id = ? order by updated_at desc, id desc limit ? offset ?").all(c.req.param("id"), limit + 1, offset) as Array<Record<string, unknown>>;
-    return c.json(offsetPageFromRows(rows.map(roomScheduleFromRow), limit, offset));
-  }
-  const rows = db.prepare("select * from room_schedules where room_id = ? order by updated_at desc, id desc limit 100").all(c.req.param("id")) as Array<Record<string, unknown>>;
-  return c.json(rows.map(roomScheduleFromRow));
-});
-app.post("/api/rooms/:id/schedules", async (c) => {
-  const room = db.prepare("select id from rooms where id = ?").get(c.req.param("id"));
-  if (!room) return c.json({ error: "room_not_found" }, 404);
-  const body = await c.req.json<CreateRoomScheduleRequest>().catch(() => null);
-  if (!body?.agentId || !body.taskPrompt?.trim()) return c.json({ error: "invalid_room_schedule" }, 400);
-  if (!db.prepare("select agent_id from room_agents where room_id = ? and agent_id = ?").get(c.req.param("id"), body.agentId)) return c.json({ error: "agent_not_in_room" }, 400);
-  const now = new Date().toISOString();
-  const id = `room-schedule-${randomUUID()}`;
-  db.prepare(`
-    insert into room_schedules (id, room_id, agent_id, task_prompt, schedule_type, run_at, status, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, 'active', ?, ?)
-  `).run(id, c.req.param("id"), body.agentId, body.taskPrompt.trim(), body.scheduleType, body.runAt ?? null, now, now);
-  roomEvent(c.req.param("id"), "schedule.created", { scheduleId: id, scheduleType: body.scheduleType, runAt: body.runAt ?? null }, body.agentId);
-  return c.json(roomScheduleFromRow(db.prepare("select * from room_schedules where id = ?").get(id) as Record<string, unknown>), 201);
-});
-app.delete("/api/rooms/:id/schedules/:scheduleId", (c) => {
-  const schedule = db.prepare("select * from room_schedules where id = ? and room_id = ?").get(c.req.param("scheduleId"), c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!schedule) return c.json({ error: "room_schedule_not_found" }, 404);
-  db.prepare("delete from room_schedules where id = ?").run(c.req.param("scheduleId"));
-  roomEvent(c.req.param("id"), "schedule.deleted", { scheduleId: c.req.param("scheduleId") }, String(schedule.agent_id));
-  return c.json({ ok: true, id: c.req.param("scheduleId") });
-});
-
-app.get("/api/providers", (c) => c.json(appData.providers.map(publicProvider)));
-app.post("/api/providers/detect", async (c) => {
-  const body = await c.req.json<CreateProviderRequest>().catch(() => null);
-  if (!body?.defaultModel || !body.kind) return c.json({ error: "invalid_provider_draft" }, 400);
-  const provider: ProviderRecord = {
-    id: "draft",
-    name: body.name?.trim() || "Draft Provider",
-    kind: body.kind,
-    defaultModel: body.defaultModel.trim(),
-    baseUrl: body.baseUrl?.trim() || undefined,
-    apiKey: body.apiKey?.trim() || undefined,
-    capabilities: mergeProviderCapabilities(body.kind, body.capabilities),
-    rpmLimit: sanitizeProviderRpmLimit(body.rpmLimit),
-    rpmLimitEnabled: body.rpmLimitEnabled === true,
-    useProxy: body.kind === "openai-responses" && body.useProxy === true,
-  };
-  return c.json(await detectProviderInterface(provider));
-});
-app.post("/api/providers/models", async (c) => {
-  const body = await c.req.json<CreateProviderRequest>().catch(() => null);
-  if (!body?.kind) return c.json({ error: "invalid_provider_draft" }, 400);
-  const provider: ProviderRecord = {
-    id: "draft",
-    name: body.name || "Draft Provider",
-    kind: body.kind,
-    defaultModel: body.defaultModel || "",
-    baseUrl: body.baseUrl?.trim() || undefined,
-    apiKey: body.apiKey?.trim() || undefined,
-    rpmLimit: sanitizeProviderRpmLimit(body.rpmLimit),
-    rpmLimitEnabled: body.rpmLimitEnabled === true,
-    useProxy: body.kind === "openai-responses" && body.useProxy === true,
-  };
-  return c.json(await discoverProviderModels(provider));
-});
-app.post("/api/providers", async (c) => {
-  const body = await c.req.json<CreateProviderRequest>().catch(() => null);
-  if (!body?.name || !body.defaultModel || !body.kind) return c.json({ error: "invalid_provider" }, 400);
-  if (body.kind === "openai-compatible-chat" && !body.baseUrl?.trim()) return c.json({ error: "base_url_required" }, 400);
-  if (body.kind !== "local" && !body.apiKey?.trim()) return c.json({ error: "api_key_required" }, 400);
-  const provider: ProviderRecord = {
-    id: slugify(body.name),
-    name: body.name,
-    kind: body.kind,
-    defaultModel: body.defaultModel,
-    baseUrl: body.baseUrl?.trim() || undefined,
-    apiKey: body.apiKey?.trim() || undefined,
-    capabilities: mergeProviderCapabilities(body.kind, body.capabilities),
-    rpmLimit: sanitizeProviderRpmLimit(body.rpmLimit),
-    rpmLimitEnabled: body.rpmLimitEnabled === true,
-    useProxy: body.kind === "openai-responses" && body.useProxy === true,
-  };
-  appData.providers.unshift(provider);
-  saveAppData();
-  return c.json(publicProvider(provider), 201);
-});
-app.post("/api/providers/:id/test", async (c) => {
-  const provider = appData.providers.find((item) => item.id === c.req.param("id"));
-  if (!provider) return c.json({ error: "provider_not_found" }, 404);
-  const result = await testProvider(provider);
-  recordProviderHealthCheck(provider.id, "test", result);
-  if (!result.ok) {
-    emitExternalNotification({
-      eventType: "provider_check_failed",
-      severity: result.status === 429 ? "warning" : "error",
-      title: `Provider 测试失败：${provider.name}`,
-      message: [result.status ? `HTTP ${result.status}` : null, result.error].filter(Boolean).join(" · ") || "Provider 连接测试失败。",
-      sourceType: "provider",
-      sourceId: provider.id,
-      metadata: { status: result.status, error: result.error, durationMs: result.durationMs },
-    });
-  }
-  return c.json(result);
-});
-app.post("/api/providers/:id/detect", async (c) => {
-  const provider = appData.providers.find((item) => item.id === c.req.param("id"));
-  if (!provider) return c.json({ error: "provider_not_found" }, 404);
-  const applyDetection = c.req.query("apply") === "1" || c.req.query("apply") === "true";
-  const result = await detectProviderInterface(provider);
-  recordProviderHealthCheck(provider.id, "test", {
-    ok: result.ok,
-    providerId: provider.id,
-    status: result.checks.responses.ok ? result.checks.responses.status : result.checks.chatCompletions.status,
-    durationMs: result.durationMs,
-    error: result.error,
-  });
-  if (result.ok && applyDetection) {
-    provider.kind = result.kind;
-    provider.capabilities = result.capabilities;
-    clearProviderModelCache(provider.id);
-    saveAppData();
-  }
-  return c.json({ provider: publicProvider(provider), detection: result });
-});
-app.get("/api/providers/:id/models", async (c) => {
-  const provider = appData.providers.find((item) => item.id === c.req.param("id"));
-  if (!provider) return c.json({ error: "provider_not_found" }, 404);
-  const forceRefresh = c.req.query("refresh") === "1" || c.req.query("refresh") === "true";
-  const cached = forceRefresh ? null : readProviderModelCache(provider);
-  if (cached) return c.json(cached);
-  const result = await discoverProviderModels(provider);
-  recordProviderHealthCheck(provider.id, "models", result);
-  saveProviderModelCache(provider, result);
-  return c.json(result);
-});
-app.get("/api/providers/:id/health", (c) => {
-  const provider = appData.providers.find((item) => item.id === c.req.param("id"));
-  if (!provider) return c.json({ error: "provider_not_found" }, 404);
-  const limit = parsePageLimit(c.req.query("limit"), 20);
-  const cursor = decodePageCursor(c.req.query("cursor"));
-  const rows = db.prepare(`
-    select id, provider_id, kind, ok, status, duration_ms, error, checked_at
-    from provider_health_checks
-    where provider_id = @providerId
-      ${cursor ? "and (checked_at < @cursorSort or (checked_at = @cursorSort and id < @cursorId))" : ""}
-    order by checked_at desc, id desc
-    limit @limit
-  `).all({ providerId: provider.id, cursorSort: cursor?.sortValue, cursorId: cursor?.id, limit: limit + 1 }) as Array<Record<string, unknown>>;
-  return c.json(pageFromRows(rows.map(providerHealthCheckFromRow), limit, (item) => item.checkedAt));
-});
-app.patch("/api/providers/:id", async (c) => {
-  const provider = appData.providers.find((item) => item.id === c.req.param("id"));
-  if (!provider) return c.json({ error: "provider_not_found" }, 404);
-  const body = await c.req.json<UpdateProviderRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_provider_update" }, 400);
-  if (body.name !== undefined) provider.name = body.name;
-  if (body.kind !== undefined) provider.kind = body.kind;
-  if (body.defaultModel !== undefined) provider.defaultModel = body.defaultModel;
-  if (body.baseUrl !== undefined) provider.baseUrl = body.baseUrl.trim() || undefined;
-  if (body.apiKey !== undefined) provider.apiKey = body.apiKey.trim() || undefined;
-  if (body.capabilities !== undefined || body.kind !== undefined) provider.capabilities = mergeProviderCapabilities(provider.kind, body.capabilities ?? provider.capabilities);
-  if (body.rpmLimit !== undefined) provider.rpmLimit = sanitizeProviderRpmLimit(body.rpmLimit);
-  if (body.rpmLimitEnabled !== undefined) provider.rpmLimitEnabled = body.rpmLimitEnabled === true;
-  if (body.useProxy !== undefined || body.kind !== undefined) provider.useProxy = provider.kind === "openai-responses" && body.useProxy === true;
-  if (body.kind !== undefined || body.defaultModel !== undefined || body.baseUrl !== undefined || body.apiKey !== undefined) clearProviderModelCache(provider.id);
-  saveAppData();
-  return c.json(publicProvider(provider));
-});
-app.delete("/api/providers/:id", (c) => {
-  const index = appData.providers.findIndex((item) => item.id === c.req.param("id"));
-  if (index === -1) return c.json({ error: "provider_not_found" }, 404);
-  const [provider] = appData.providers.splice(index, 1);
-  db.prepare("delete from providers where id = ?").run(provider.id);
-  db.prepare("delete from provider_health_checks where provider_id = ?").run(provider.id);
-  clearProviderModelCache(provider.id);
-  return c.json({ ok: true, id: provider.id });
-});
-
-app.get("/api/extensions/skills", (c) => {
-  const items = listSkills();
-  if (!c.req.query("limit") && !c.req.query("cursor") && !c.req.query("q")) return c.json(items);
-  return c.json(pageExtensions(items, parsePageLimit(c.req.query("limit"), 20), c.req.query("cursor"), c.req.query("q") ?? ""));
-});
-app.post("/api/extensions/skills", async (c) => {
-  const body = await c.req.json<CreateSkillRequest>().catch(() => null);
-  if (!body?.name || !body.description || !body.instructions) return c.json({ error: "invalid_skill" }, 400);
-  try {
-    return c.json(createLocalSkill(body), 201);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "skill_create_failed";
-    return c.json({ error: message }, message === "skill_exists" ? 409 : 400);
-  }
-});
-app.post("/api/extensions/skills/import", async (c) => {
-  const body = await c.req.json<ImportSkillRequest>().catch(() => null);
-  if (!body?.url && !body?.content) return c.json({ error: "skill_import_empty" }, 400);
-  try {
-    return c.json(await importSkill(body), 201);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "skill_import_failed";
-    return c.json({ error: message }, message === "skill_exists" ? 409 : 400);
-  }
-});
-app.put("/api/extensions/skills", async (c) => {
-  const body = await c.req.json<UpdateSkillRequest>().catch(() => null);
-  if (!body?.path || !body.name || !body.description || !body.instructions) return c.json({ error: "invalid_skill" }, 400);
-  try {
-    return c.json(updateLocalSkill(body));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "skill_update_failed";
-    return c.json({ error: message }, message === "skill_not_found" ? 404 : 400);
-  }
-});
-app.delete("/api/extensions/skills", async (c) => {
-  const body = await c.req.json<DeleteSkillRequest>().catch(() => null);
-  if (!body?.path) return c.json({ error: "invalid_skill" }, 400);
-  try {
-    return c.json(deleteLocalSkill(body));
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "skill_delete_failed";
-    return c.json({ error: message }, message === "skill_not_found" ? 404 : 400);
-  }
-});
-app.get("/api/extensions/plugins", (c) => {
-  const items = listPlugins();
-  if (!c.req.query("limit") && !c.req.query("cursor") && !c.req.query("q")) return c.json(items);
-  return c.json(pageExtensions(items, parsePageLimit(c.req.query("limit"), 20), c.req.query("cursor"), c.req.query("q") ?? ""));
-});
-app.post("/api/extensions/plugins", async (c) => {
-  const body = await c.req.json<CreatePluginRequest>().catch(() => null);
-  if (!body?.name) return c.json({ error: "invalid_plugin" }, 400);
-  try {
-    return c.json(createLocalPlugin(body), 201);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "plugin_create_failed";
-    return c.json({ error: message }, message === "plugin_exists" ? 409 : 400);
-  }
-});
-app.get("/api/extensions/mcp", (c) => {
-  const items = listMcpServers();
-  if (!c.req.query("limit") && !c.req.query("cursor") && !c.req.query("q")) return c.json(items);
-  return c.json(pageExtensions(items, parsePageLimit(c.req.query("limit"), 20), c.req.query("cursor"), c.req.query("q") ?? ""));
-});
-app.post("/api/extensions/mcp", async (c) => {
-  const body = await c.req.json<CreateMcpServerRequest>().catch(() => null);
-  if (!body?.name || !body.command) return c.json({ error: "invalid_mcp_server" }, 400);
-  try {
-    return c.json(createMcpServer(body), 201);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "mcp_create_failed" }, 400);
-  }
-});
-app.post("/api/extensions/mcp/import", async (c) => {
-  const body = await c.req.json<ImportMcpServerRequest>().catch(() => null);
-  if (!body?.url && !body?.content) return c.json({ error: "mcp_import_empty" }, 400);
-  try {
-    return c.json(await importMcpServers(body), 201);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "mcp_import_failed" }, 400);
-  }
-});
-app.get("/api/extensions/marketplace", (c) => {
-  return c.json(loadMarketplaceCatalog());
-});
-app.post("/api/extensions/marketplace/import", async (c) => {
-  const body = await c.req.json<ImportMarketplaceCatalogRequest>().catch(() => null);
-  if (!body?.url && !body?.content) return c.json({ error: "marketplace_catalog_empty" }, 400);
-  try {
-    return c.json(saveMarketplaceCatalog(await importMarketplaceCatalog(body)));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "marketplace_catalog_import_failed" }, 400);
-  }
-});
-app.post("/api/extensions/marketplace/install", async (c) => {
-  const body = await c.req.json<InstallMarketplaceItemRequest>().catch(() => null);
-  if (!body?.item) return c.json({ error: "invalid_marketplace_item" }, 400);
-  try {
-    return c.json(await installMarketplaceItem(body), 201);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "marketplace_install_failed";
-    return c.json({ error: message }, message.endsWith("_exists") ? 409 : 400);
-  }
-});
-app.delete("/api/extensions/marketplace", async (c) => {
-  const body = await c.req.json<DeleteMarketplaceItemsRequest>().catch(() => null);
-  if (!body?.ids || !Array.isArray(body.ids)) return c.json({ error: "invalid_marketplace_item_ids" }, 400);
-  return c.json(deleteMarketplaceCatalogItems(body.ids));
-});
-app.delete("/api/extensions/marketplace/all", (c) => {
-  return c.json(clearMarketplaceCatalogItems());
-});
-app.get("/api/extensions/detail", (c) => {
-  try {
-    const type = c.req.query("type") as ExtensionSummary["type"] | undefined;
-    const name = c.req.query("name") ?? "";
-    if (type !== "plugin" && type !== "skill" && type !== "mcp") return c.json({ error: "invalid_extension_type" }, 400);
-    return c.json(readExtensionDetail(type, name, c.req.query("path") ?? undefined));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "extension_detail_failed" }, 400);
-  }
-});
-
-app.get("/api/file-mounts", (c) => {
-  return c.json(Array.from(fileMounts.values()));
-});
-app.post("/api/file-mounts", async (c) => {
-  const body = await c.req.json<CreateFileMountRequest>().catch(() => null);
-  if (!body?.name || !body?.rootPath) return c.json({ error: "invalid_mount" }, 400);
-  const rootPath = normalizeMountPath(body.rootPath);
-  if (!existsSync(rootPath) || !statSync(rootPath).isDirectory()) return c.json({ error: "mount_root_invalid" }, 400);
-  const baseId = slugify(body.name);
-  let id = baseId;
-  let suffix = 2;
-  while (fileMounts.has(id)) id = `${baseId}-${suffix++}`;
-  const mount: FileMountRecord = {
-    id,
-    name: body.name,
-    rootPath,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-  };
-  upsertFileMount(mount);
-  return c.json(mount, 201);
-});
-app.patch("/api/file-mounts/:id", async (c) => {
-  const mount = fileMounts.get(c.req.param("id"));
-  if (!mount) return c.json({ error: "mount_not_found" }, 404);
-  const body = await c.req.json<UpdateFileMountRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_mount_update" }, 400);
-  const nextMount: FileMountRecord = {
-    ...mount,
-    name: body.name ?? mount.name,
-    rootPath: body.rootPath ? normalizeMountPath(body.rootPath) : mount.rootPath,
-    updatedAt: new Date().toISOString(),
-  };
-  if (body.rootPath && (!existsSync(nextMount.rootPath) || !statSync(nextMount.rootPath).isDirectory())) return c.json({ error: "mount_root_invalid" }, 400);
-  upsertFileMount(nextMount);
-  return c.json(nextMount);
-});
-app.delete("/api/file-mounts/:id", (c) => {
-  try {
-    deleteFileMount(c.req.param("id"));
-    return c.json({ ok: true });
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "mount_delete_failed" }, 400);
-  }
-});
-
-app.get("/api/files", (c) => {
-  try {
-    const mount = resolveFileRequestMount(c.req.query("mountId"), c.req.query("rootPath"));
-    const absolutePath = resolveInsideMount(mount, c.req.query("path"));
-    const stat = statSync(absolutePath);
-    if (!stat.isDirectory()) return c.json({ error: "not_a_directory" }, 400);
-    const entries = readdirSync(absolutePath)
-      .filter((name) => name !== ".DS_Store")
-      .map((name) => toFileEntry(join(absolutePath, name), mount.rootPath))
-      .sort((a, b) => a.kind !== b.kind ? a.kind === "directory" ? -1 : 1 : a.name.localeCompare(b.name));
-    const response: FileListResponse = {
-      mountId: mount.id,
-      root: mount.rootPath,
-      path: toRelativePath(absolutePath, mount.rootPath),
-      parentPath: absolutePath === mount.rootPath ? null : toRelativePath(resolve(absolutePath, ".."), mount.rootPath),
-      entries,
-    };
-    return c.json(response);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "file_list_failed" }, 400);
-  }
-});
-app.get("/api/files/content", (c) => {
-  try {
-    const mount = resolveFileRequestMount(c.req.query("mountId"), c.req.query("rootPath"));
-    const absolutePath = resolveInsideMount(mount, c.req.query("path"));
-    const stat = statSync(absolutePath);
-    if (!stat.isFile()) return c.json({ error: "not_a_file" }, 400);
-    if (stat.size > 1024 * 1024) return c.json({ error: "file_too_large" }, 413);
-    const response: FileContentResponse = {
-      path: toRelativePath(absolutePath, mount.rootPath),
-      content: readFileSync(absolutePath, "utf8"),
-      updatedAt: stat.mtime.toISOString(),
-    };
-    return c.json(response);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "file_read_failed" }, 400);
-  }
-});
-app.get("/api/files/archive/templates", (c) => c.json(listArchiveIgnoreTemplates(archiveIgnoreTemplateDir)));
-app.post("/api/files/archive/preview", async (c) => {
-  try {
-    const body = await c.req.json<FileArchiveRequest>().catch(() => null);
-    if (!body?.path) return c.json({ error: "invalid_archive_request" }, 400);
-    const mount = resolveFileRequestMount(body.mountId, body.rootPath);
-    const absolutePath = resolveInsideMount(mount, body.path);
-    const stat = statSync(absolutePath);
-    if (!stat.isDirectory()) return c.json({ error: "not_a_directory" }, 400);
-    return c.json(previewZipArchive(absolutePath, Array.isArray(body.excludes) ? body.excludes : []));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "archive_preview_failed" }, 400);
-  }
-});
-app.post("/api/files/archive", async (c) => {
-  try {
-    const body = await c.req.json<FileArchiveRequest>().catch(() => null);
-    if (!body?.path) return c.json({ error: "invalid_archive_request" }, 400);
-    const mount = resolveFileRequestMount(body.mountId, body.rootPath);
-    const absolutePath = resolveInsideMount(mount, body.path);
-    const stat = statSync(absolutePath);
-    if (!stat.isDirectory()) return c.json({ error: "not_a_directory" }, 400);
-    const safeName = basename(absolutePath).replaceAll(/[^\w.-]+/g, "-") || "archive";
-    const archive = createZipArchive(absolutePath, safeName, Array.isArray(body.excludes) ? body.excludes : []);
-    c.header("content-type", "application/zip");
-    c.header("content-disposition", `attachment; filename="${safeName}.zip"`);
-    return c.body(archive);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "archive_failed" }, 400);
-  }
-});
-app.put("/api/files/content", async (c) => {
-  try {
-    const mount = resolveFileRequestMount(c.req.query("mountId"), c.req.query("rootPath"));
-    const absolutePath = resolveInsideMount(mount, c.req.query("path"));
-    const stat = statSync(absolutePath);
-    if (!stat.isFile()) return c.json({ error: "not_a_file" }, 400);
-    const body = await c.req.json<SaveFileRequest>().catch(() => null);
-    if (typeof body?.content !== "string") return c.json({ error: "invalid_content" }, 400);
-    writeFileSync(absolutePath, body.content, "utf8");
-    const response: FileContentResponse = {
-      path: toRelativePath(absolutePath, mount.rootPath),
-      content: body.content,
-      updatedAt: statSync(absolutePath).mtime.toISOString(),
-    };
-    return c.json(response);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "file_write_failed" }, 400);
-  }
-});
-app.post("/api/files", async (c) => {
-  try {
-    const body = await c.req.json<CreateFileRequest>().catch(() => null);
-    if (!body?.parentPath || !body.name || !body.kind) return c.json({ error: "invalid_create_request" }, 400);
-    const mount = resolveFileRequestMount(c.req.query("mountId"), c.req.query("rootPath"));
-    const cleanName = body.name.trim();
-    if (!cleanName || cleanName.includes("/") || cleanName.includes("\\")) throw new Error("invalid_name");
-    const targetPath = resolveInsideMount(mount, join(body.parentPath, cleanName));
-    if (existsSync(targetPath)) return c.json({ error: "already_exists" }, 409);
-    if (body.kind === "directory") mkdirSync(targetPath);
-    else writeFileSync(targetPath, "", { flag: "wx" });
-    return c.json(toFileEntry(targetPath, mount.rootPath), 201);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "file_create_failed" }, 400);
-  }
-});
-app.patch("/api/files", async (c) => {
-  try {
-    const body = await c.req.json<RenameFileRequest>().catch(() => null);
-    if (!body?.path || !body.newName) return c.json({ error: "invalid_rename_request" }, 400);
-    const mount = resolveFileRequestMount(c.req.query("mountId"), c.req.query("rootPath"));
-    const sourcePath = resolveInsideMount(mount, body.path);
-    const cleanName = body.newName.trim();
-    if (!cleanName || cleanName.includes("/") || cleanName.includes("\\")) throw new Error("invalid_name");
-    const targetPath = resolveInsideMount(mount, join(toRelativePath(dirname(sourcePath), mount.rootPath), cleanName));
-    if (sourcePath === mount.rootPath) return c.json({ error: "cannot_rename_root" }, 400);
-    if (existsSync(targetPath)) return c.json({ error: "already_exists" }, 409);
-    renameSync(sourcePath, targetPath);
-    return c.json(toFileEntry(targetPath, mount.rootPath));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "file_rename_failed" }, 400);
-  }
-});
-app.delete("/api/files", (c) => {
-  try {
-    const mount = resolveFileRequestMount(c.req.query("mountId"), c.req.query("rootPath"));
-    const targetPath = resolveInsideMount(mount, c.req.query("path"));
-    if (targetPath === mount.rootPath) return c.json({ error: "cannot_delete_root" }, 400);
-    rmSync(targetPath, { recursive: true });
-    return c.json({ ok: true, path: basename(targetPath) });
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "file_delete_failed" }, 400);
-  }
-});
-
-app.get("/api/terminal/sessions", (c) => c.json(listTerminalSessionSummaries()));
-app.get("/api/terminal/defaults", (c) => {
-  const response: TerminalDefaultsResponse = { defaultCwd: terminalDefaultCwd };
-  return c.json(response);
-});
-app.post("/api/terminal/sessions", async (c) => {
-  try {
-    const body = await c.req.json<CreateTerminalSessionRequest>().catch(() => ({}));
-    const session = createTerminalSession(body);
-    return c.json(terminalSummary(session), 201);
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "terminal_session_create_failed" }, 400);
-  }
-});
-app.patch("/api/terminal/sessions/:id", async (c) => {
-  const body = await c.req.json<UpdateTerminalSessionRequest>().catch(() => null);
-  if (!body) return c.json({ error: "invalid_terminal_update" }, 400);
-  const nextName = body.name?.trim();
-  if (!nextName) return c.json({ error: "terminal_name_required" }, 400);
-  const runtime = terminalSessions.get(c.req.param("id"));
-  if (runtime) {
-    runtime.name = nextName;
-    if (!runtime.ephemeral) upsertTerminalSession(terminalSummary(runtime));
-    return c.json(terminalSummary(runtime));
-  }
-  const row = db.prepare("select id, name, cwd, mode, status, created_at from terminal_sessions where id = ?").get(c.req.param("id")) as Record<string, unknown> | undefined;
-  if (!row) return c.json({ error: "terminal_session_not_found" }, 404);
-  const session = terminalSessionFromRow(row);
-  session.name = nextName;
-  upsertTerminalSession(session);
-  return c.json(session);
-});
-app.delete("/api/terminal/sessions/:id", (c) => {
-  const session = terminalSessions.get(c.req.param("id"));
-  if (!session) {
-    deleteTerminalSessionRecord(c.req.param("id"));
-    return c.json({ ok: true });
-  }
-  deletedTerminalSessionIds.add(session.id);
-  session.adapter.kill();
-  terminalSessions.delete(session.id);
-  deleteTerminalSessionRecord(session.id);
-  for (const client of session.clients) client.close(1000, "session_deleted");
-  return c.json({ ok: true });
-});
-app.post("/api/terminal/exec", async (c) => {
-  try {
-    const body = await c.req.json<TerminalCommandRequest>().catch(() => null);
-    if (!body?.command?.trim()) return c.json({ error: "command_required" }, 400);
-    const cwd = resolveTerminalCwd(body.cwd);
-    if (!statSync(cwd).isDirectory()) return c.json({ error: "cwd_not_directory" }, 400);
-    const session = body.sessionId ? appData.sessions.find((item) => item.id === body.sessionId) : null;
-    if (session) return c.json(await runLoggedShellCommand(session, body.command, cwd, { source: "terminal-exec" }));
-    return c.json(await runShellCommand(body.command, cwd));
-  } catch (error) {
-    return c.json({ error: error instanceof Error ? error.message : "command_failed" }, 400);
-  }
-});
+registerTerminalRoutes(app, terminalRouteDeps);
 
 const apiServer = serve({ fetch: app.fetch, hostname: host, port: apiPort });
 const wsServer = startTerminalWebSocketServer();

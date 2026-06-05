@@ -66,6 +66,11 @@ function AppDialog({ dialog, onClose, t }: { dialog: DialogState; onClose: (valu
     window.setTimeout(() => inputRef.current?.focus(), 0);
   }, []);
 
+  useEffect(() => {
+    setValue(dialog.defaultValue ?? "");
+    setChecked(Boolean(dialog.checkboxDefaultChecked));
+  }, [dialog]);
+
   function submit(event: React.FormEvent) {
     event.preventDefault();
     if (dialog.kind === "confirm-checkbox") {
