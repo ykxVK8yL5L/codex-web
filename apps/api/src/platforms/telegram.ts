@@ -36,6 +36,7 @@ type TelegramUpdate = {
 type TelegramPlatformDeps = {
   db: Database.Database;
   sessions: SessionSummary[];
+  sessionVisibleInChatTools?: (session: SessionSummary) => boolean;
   providers: Array<{ id: string; defaultModel?: string | null }>;
   listNotificationAccounts: (exposeSecrets?: boolean) => NotificationAccountSummary[];
   dispatchMessageToSession: DispatchMessageToSession;
@@ -142,6 +143,7 @@ function telegramUi(account: NotificationAccountRecord) {
     roomsCommand: en ? "/rooms - list rooms and bind a room session" : "/rooms - 列出 Room 并绑定 Room 会话",
     filesCommand: en ? "/files - browse bound or system files" : "/files - 浏览绑定或系统文件",
     terminalCommand: en ? "/terminal <command> - run in bound or selected workspace" : "/terminal <命令> - 在绑定或选定的工作区运行终端命令",
+    whoamiCommand: en ? "/whoami - show your Telegram user ID and this chat ID" : "/whoami - 查看你的 Telegram 用户 ID 和当前聊天 ID",
     bindCommand: en ? "/bind - pick a session to bind this chat to, or /bind <index, title, or sessionId>" : "/bind - 选择会话绑定当前聊天，或 /bind <序号、标题、sessionId>",
     unbindCommand: en ? "/unbind - clear the bound session" : "/unbind - 清除绑定的会话",
     sendCommand: en ? "/send <index, title, or sessionId> | <message> - send to a session" : "/send <序号、标题或 sessionId> | <消息> - 向会话发送消息",
@@ -151,6 +153,9 @@ function telegramUi(account: NotificationAccountRecord) {
     stderr: "stderr",
     exitCode: en ? "Exit code" : "退出码",
     unknown: en ? "unknown" : "未知",
+    currentUserId: en ? "Current user ID:" : "当前用户 ID：",
+    currentChatId: en ? "Current chat ID:" : "当前聊天 ID：",
+    privateUserIdHint: en ? "Send /whoami in a private chat with this bot to get your user ID." : "请私聊机器人发送 /whoami 获取你的用户 ID。",
   } as const;
 }
 
@@ -202,7 +207,16 @@ function telegramDispatchModeLabel(account: NotificationAccountRecord, mode: str
   return ui.sentMode[mode as keyof typeof ui.sentMode] ?? mode;
 }
 
-function telegramHelpText(account: NotificationAccountRecord) {
+function telegramIdentityText(account: NotificationAccountRecord, userId: string, chatId: string, isPrivateChat: boolean) {
+  const ui = telegramUi(account);
+  return [
+    ...(isPrivateChat && userId ? [`${ui.currentUserId} ${userId}`] : []),
+    `${ui.currentChatId} ${chatId}`,
+    ...(!isPrivateChat ? [ui.privateUserIdHint] : []),
+  ].join("\n");
+}
+
+function telegramHelpText(account: NotificationAccountRecord, userId?: string, chatId?: string, isPrivateChat = false) {
   const ui = telegramUi(account);
   return [
     ui.botTitle,
@@ -212,6 +226,7 @@ function telegramHelpText(account: NotificationAccountRecord) {
     ui.roomsCommand,
     ui.filesCommand,
     ui.terminalCommand,
+    ui.whoamiCommand,
     ui.bindCommand,
     ui.unbindCommand,
     ui.sendCommand,
@@ -221,6 +236,7 @@ function telegramHelpText(account: NotificationAccountRecord) {
     ui.replyRuleBound,
     ui.replyRuleSend,
     ui.replyBehaviorHint,
+    ...(chatId ? ["", telegramIdentityText(account, userId ?? "", chatId, isPrivateChat)] : []),
   ].join("\n");
 }
 
@@ -254,6 +270,7 @@ export function createTelegramPlatform(deps: TelegramPlatformDeps) {
   const {
     db,
     sessions,
+    sessionVisibleInChatTools = () => true,
     providers,
     listNotificationAccounts,
     dispatchMessageToSession,
@@ -288,6 +305,10 @@ export function createTelegramPlatform(deps: TelegramPlatformDeps) {
 
   type TelegramAccountConfig = Record<string, unknown>;
 
+  function visibleChatSessions() {
+    return sessions.filter(sessionVisibleInChatTools);
+  }
+
   function telegramUpdateChatId(update: TelegramUpdate) {
     const id = update.message?.chat?.id ?? update.callback_query?.message?.chat?.id;
     return id === undefined ? "" : String(id);
@@ -296,6 +317,11 @@ export function createTelegramPlatform(deps: TelegramPlatformDeps) {
   function telegramUpdateUserId(update: TelegramUpdate) {
     const id = update.message?.from?.id ?? update.callback_query?.from?.id;
     return id === undefined ? "" : String(id);
+  }
+
+  function telegramUpdateIsPrivateChat(update: TelegramUpdate) {
+    const type = String(update.message?.chat?.type ?? update.callback_query?.message?.chat?.type ?? "").trim().toLowerCase();
+    return type === "private";
   }
 
   function telegramInboundAllowed(account: NotificationAccountRecord, update: TelegramUpdate) {
@@ -412,7 +438,7 @@ export function createTelegramPlatform(deps: TelegramPlatformDeps) {
     const roots: Array<{ label: string; root: string }> = [];
     if (chatSession?.workspacePath) roots.push({ label: telegramSessionLabel(account, chatSession), root: chatSession.workspacePath });
     if (!chatSession) roots.push({ label: ui.systemWorkspace, root: workspaceRoot });
-    for (const session of telegramSessionChoices(sessions, 8)) {
+    for (const session of telegramSessionChoices(visibleChatSessions(), 8)) {
       if (chatSession?.id === session.id || !session.workspacePath) continue;
       roots.push({ label: telegramSessionLabel(account, session), root: session.workspacePath });
     }
@@ -617,7 +643,7 @@ export function createTelegramPlatform(deps: TelegramPlatformDeps) {
 
   async function sendTelegramSessionPicker(account: NotificationAccountRecord, chatId: string, message: string) {
     const ui = telegramUi(account);
-    const choices = telegramSessionChoices(sessions);
+    const choices = telegramSessionChoices(visibleChatSessions());
     if (!choices.length) {
       await sendTelegramText(account, chatId, ui.noAvailableSessions);
       return;
@@ -907,7 +933,7 @@ export function createTelegramPlatform(deps: TelegramPlatformDeps) {
 
   async function sendTelegramBindPicker(account: NotificationAccountRecord, chatId: string) {
     const ui = telegramUi(account);
-    const choices = telegramSessionChoices(sessions);
+    const choices = telegramSessionChoices(visibleChatSessions());
     if (!choices.length) {
       await sendTelegramText(account, chatId, ui.noAvailableSessions);
       return;
@@ -968,7 +994,7 @@ export function createTelegramPlatform(deps: TelegramPlatformDeps) {
   function resolveTelegramTargetSession(raw: string) {
     const value = raw.trim();
     if (!value) return null;
-    const choices = telegramSessionChoices(sessions, 12);
+    const choices = telegramSessionChoices(visibleChatSessions(), 12);
     const numericIndex = Number(value);
     if (Number.isInteger(numericIndex) && numericIndex >= 1 && choices[numericIndex - 1]) return choices[numericIndex - 1];
     return sessions.find((session) => session.id === value)
@@ -1189,11 +1215,15 @@ export function createTelegramPlatform(deps: TelegramPlatformDeps) {
     const command = rawCommand.replace(/@[^@\s]+$/, "");
     const rest = restParts.join(" ").trim();
     if (command === "/start" || command === "/help") {
-      await sendTelegramText(account, chatId, telegramHelpText(account));
+      await sendTelegramText(account, chatId, telegramHelpText(account, telegramUpdateUserId(update), chatId, telegramUpdateIsPrivateChat(update)));
+      return;
+    }
+    if (command === "/whoami") {
+      await sendTelegramText(account, chatId, telegramIdentityText(account, telegramUpdateUserId(update), chatId, telegramUpdateIsPrivateChat(update)));
       return;
     }
     if (command === "/sessions") {
-      await sendTelegramText(account, chatId, telegramGroupedSessionText(account, sessions, 12));
+      await sendTelegramText(account, chatId, telegramGroupedSessionText(account, visibleChatSessions(), 12));
       return;
     }
     if (command === "/agents") {
@@ -1337,9 +1367,9 @@ export function createTelegramPlatform(deps: TelegramPlatformDeps) {
     forwardAssistantMessageToTelegram,
     telegramHelpText,
     resolveTelegramTargetSession,
-    telegramSessionChoices: (limit?: number) => telegramSessionChoices(sessions, limit),
+    telegramSessionChoices: (limit?: number) => telegramSessionChoices(visibleChatSessions(), limit),
     telegramSessionLabel,
-    telegramGroupedSessionText: (limit?: number) => telegramGroupedSessionText(sessions, limit),
+    telegramGroupedSessionText: (limit?: number) => telegramGroupedSessionText(visibleChatSessions(), limit),
     telegramRecentSessionsText,
     telegramAgentChoices,
     telegramAgentLabel,

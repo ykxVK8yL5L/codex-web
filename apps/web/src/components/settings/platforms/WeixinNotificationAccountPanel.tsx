@@ -28,6 +28,7 @@ export type WeixinNotificationAccountForm = {
   weixinBaseUrl: string;
   weixinAccountId: string;
   weixinUserId: string;
+  weixinCreateRecipient: boolean;
   weixinInboundEnabled: boolean;
   weixinAllowedChatIds: string;
   weixinAllowedUserIds: string;
@@ -42,6 +43,7 @@ type Props = {
   sessionToken: string;
   t: TFunction;
   loadNotifications: () => Promise<void>;
+  showCreateRecipient?: boolean;
 };
 
 export function WeixinNotificationAccountPanel({
@@ -51,6 +53,7 @@ export function WeixinNotificationAccountPanel({
   sessionToken,
   t,
   loadNotifications,
+  showCreateRecipient = false,
 }: Props) {
   const pollingRef = useRef<number | null>(null);
   const [draftQrKey, setDraftQrKey] = useState("");
@@ -226,6 +229,12 @@ export function WeixinNotificationAccountPanel({
             <span>{t("settings.notificationWeixinDefaultSessionId")}</span>
             <input name="notification-weixin-default-session-id" className="search-input" value={form.weixinDefaultSessionId} onChange={(event) => setForm((current: any) => ({ ...current, weixinDefaultSessionId: event.target.value }))} placeholder="task-..." />
           </label>
+          {showCreateRecipient && (
+            <label className="checkbox-row">
+              <input name="notification-weixin-create-recipient" type="checkbox" checked={form.weixinCreateRecipient} onChange={(event) => setForm((current: any) => ({ ...current, weixinCreateRecipient: event.target.checked }))} />
+              <span>{t("settings.notificationWeixinCreateRecipient")}</span>
+            </label>
+          )}
           <label>
             <span>{t("settings.notificationWeixinTestChatId")}</span>
             <input name="notification-weixin-test-chat-id" className="search-input" value={form.weixinTestChatId} onChange={(event) => setForm((current: any) => ({ ...current, weixinTestChatId: event.target.value }))} />

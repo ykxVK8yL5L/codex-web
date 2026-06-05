@@ -10,7 +10,11 @@ import { fileURLToPath } from "node:url";
 import { spawn as spawnPty } from "node-pty";
 import { generateSecret, generateURI } from "otplib";
 import { WebSocketServer, WebSocket } from "ws";
+import { createDingtalkPlatform } from "./platforms/dingtalk.js";
 import { createEmailPlatform } from "./platforms/email.js";
+import { createFeishuPlatform } from "./platforms/feishu.js";
+import { createQQPlatform } from "./platforms/qq.js";
+import { createWeComPlatform } from "./platforms/wecom.js";
 import { createTelegramPlatform } from "./platforms/telegram.js";
 import { createWeixinPlatform } from "./platforms/weixin.js";
 import { platformOverview } from "./platforms.js";
@@ -135,7 +139,9 @@ import type {
   NotificationRuleSummary,
   NotificationRuleTarget,
   NotificationSeverity,
+  NotificationTestSettings,
   TestNotificationAccountRequest,
+  UpdateNotificationTestSettingsRequest,
   PageResponse,
   PermissionProfileId,
   PlatformSettingsResponse,
@@ -365,6 +371,7 @@ let previewAccessSettings = runtimeSettingsStore.previewAccess.load();
 let sessionCompactionSettings = runtimeSettingsStore.sessionCompaction.load();
 let rateLimitSettings = rateLimitStore.load();
 let systemBackupSettings = loadSystemBackupSettings();
+let notificationTestSettings: NotificationTestSettings;
 const appData = loadAppData();
 const emailPlatform = createEmailPlatform({
   db,
@@ -376,6 +383,7 @@ const emailPlatform = createEmailPlatform({
 const telegramPlatform = createTelegramPlatform({
   db,
   sessions: appData.sessions,
+  sessionVisibleInChatTools,
   providers: appData.providers,
   listNotificationAccounts,
   dispatchMessageToSession,
@@ -391,6 +399,7 @@ const telegramPlatform = createTelegramPlatform({
   agentFromRow,
   roomFromRow,
 });
+  const dingtalkPlatform = createDingtalkPlatform();
 const {
   start: startEmailPlatform,
   shutdown: shutdownEmailPlatform,
@@ -411,7 +420,7 @@ const {
   activateTelegramReplyTargetFromQueue,
   clearTelegramActiveReplyTargets,
 } = telegramPlatform;
-const weixinPlatform = createWeixinPlatform({
+  const feishuPlatform = createFeishuPlatform({
   db,
   sessions: appData.sessions,
   listNotificationAccounts,
@@ -420,10 +429,40 @@ const weixinPlatform = createWeixinPlatform({
   telegramSessionChoices,
   telegramSessionLabel,
   telegramGroupedSessionText,
+  });
+  const wecomPlatform = createWeComPlatform({
+  db,
+  sessions: appData.sessions,
+  sessionVisibleInChatTools,
+  listNotificationAccounts,
+  dispatchMessageToSession,
+  resolveTelegramTargetSession,
+  telegramSessionChoices,
+  telegramSessionLabel,
+  telegramGroupedSessionText: (_account: NotificationAccountSummary, _sessions: SessionSummary[], limit?: number) => telegramPlatform.telegramGroupedSessionText(limit ?? 12),
 });
-startEmailPlatform();
-weixinPlatform.start();
-startTelegramPlatform();
+const qqPlatform = createQQPlatform({
+  db,
+  sessions: appData.sessions,
+  sessionVisibleInChatTools,
+  listNotificationAccounts,
+  dispatchMessageToSession,
+  resolveTelegramTargetSession,
+  telegramSessionChoices,
+  telegramSessionLabel,
+  telegramGroupedSessionText: (_account: NotificationAccountSummary, _sessions: SessionSummary[], limit?: number) => telegramPlatform.telegramGroupedSessionText(limit ?? 12),
+});
+const weixinPlatform = createWeixinPlatform({
+  db,
+  sessions: appData.sessions,
+  sessionVisibleInChatTools,
+  listNotificationAccounts,
+  dispatchMessageToSession,
+  resolveTelegramTargetSession,
+  telegramSessionChoices,
+  telegramSessionLabel,
+  telegramGroupedSessionText,
+});
 pruneCodexSessionProjectTrustEntries();
 let environmentOverview = buildEnvironmentOverview();
 migrateRoomAgentSessionDataRoots();
@@ -754,6 +793,27 @@ function openDatabase() {
       subject text,
       inbound_message_id text,
       last_message_id text,
+      updated_at text not null,
+      primary key (account_id, chat_id)
+    );
+    create table if not exists feishu_chat_routes (
+      account_id text not null,
+      chat_id text not null,
+      session_id text not null,
+      updated_at text not null,
+      primary key (account_id, chat_id)
+    );
+    create table if not exists wecom_chat_routes (
+      account_id text not null,
+      chat_id text not null,
+      session_id text not null,
+      updated_at text not null,
+      primary key (account_id, chat_id)
+    );
+    create table if not exists qq_chat_routes (
+      account_id text not null,
+      chat_id text not null,
+      session_id text not null,
       updated_at text not null,
       primary key (account_id, chat_id)
     );
@@ -3521,6 +3581,26 @@ function builtinWebhookChannel(
   };
 }
 
+function builtinNotificationChannel(
+  id: string,
+  kind: NotificationChannelKind,
+  adapter: NotificationChannelAdapter,
+  name: string,
+  description: string,
+  accountFields: string[],
+): NotificationChannelDefinition {
+  return {
+    id,
+    kind,
+    adapter,
+    authType: "none",
+    name,
+    description,
+    builtin: true,
+    accountFields,
+  };
+}
+
 const notificationChannels: NotificationChannelDefinition[] = [
   builtinWebhookChannel(
     "webhook",
@@ -3569,8 +3649,8 @@ const notificationChannels: NotificationChannelDefinition[] = [
   ),
   builtinWebhookChannel(
     "wecom",
-    "WeCom Bot",
-    "Send notifications to a WeCom robot webhook.",
+    "WeCom AI Bot",
+    "Send notifications to a WeCom AI Bot webhook.",
     JSON.stringify({
       msgtype: "text",
       text: {
@@ -3589,18 +3669,22 @@ const notificationChannels: NotificationChannelDefinition[] = [
       },
     }),
   ),
-  builtinWebhookChannel(
-    "qq",
-    "QQ Bot",
-    "Send notifications to a QQ-compatible webhook bridge.",
-    JSON.stringify({
-      content: "{{title}}\n\n{{message}}",
-    }),
-  ),
+  builtinNotificationChannel("wecom-bot", "wecom", "wecom", "WeCom AI Bot", "Send WeCom AI Bot messages through an AI Bot gateway.", ["botId", "secret", "websocketUrl", "dmPolicy", "allowFrom", "groupPolicy", "groupAllowFrom", "defaultSessionId", "testChatId", "language"]),
+  builtinNotificationChannel("qq-bot", "qq", "qq", "QQ Bot", "Send QQ Bot notifications through an app ID, client secret, and target ID.", ["appId", "clientSecret", "targetType", "targetId"]),
   { id: "email", kind: "email", adapter: "email", authType: "none", name: "Email SMTP", description: "Send email through an SMTP sender account.", builtin: true, accountFields: ["host", "port", "username", "password", "fromEmail"] },
   { id: "telegram", kind: "telegram", adapter: "telegram", authType: "none", name: "Telegram Bot", description: "Send Telegram messages through a bot token.", builtin: true, accountFields: ["botToken", "proxyUrl"] },
   { id: "weixin", kind: "weixin", adapter: "weixin", authType: "none", name: "Weixin Bot", description: "Send personal Weixin messages through iLink Bot.", builtin: true, accountFields: ["botToken", "baseUrl"] },
+  builtinNotificationChannel("dingtalk", "dingtalk", "dingtalk", "DingTalk Bot", "Send DingTalk robot messages through a bot token and secret.", ["botToken", "botSecret", "baseUrl"]),
+  builtinNotificationChannel("feishu-bot", "feishu", "feishu", "Feishu Bot", "Send Feishu messages through an app ID and app secret.", ["appId", "appSecret", "domain", "testChatId"]),
 ];
+
+startEmailPlatform();
+feishuPlatform.start();
+wecomPlatform.start();
+qqPlatform.start();
+weixinPlatform.start();
+startTelegramPlatform();
+
 const notificationSeverityRank: Record<NotificationSeverity, number> = { info: 0, success: 1, warning: 2, error: 3 };
 const notificationEventTypes: NotificationEventType[] = ["task_completed", "task_failed", "task_interrupted", "needs_approval", "task_health_issue", "provider_check_failed", "backup_failed", "restore_failed", "auth_login"];
 
@@ -3656,7 +3740,7 @@ function parseJsonValue<T>(value: unknown, fallback: T): T {
 
 function publicNotificationConfig(kind: NotificationAccountSummary["channelKind"], config: Record<string, unknown>) {
   const copy: Record<string, unknown> = { ...config };
-  for (const key of ["password", "imapPassword", "deviceKey", "token", "secret", "botToken", "corpSecret", "accessToken", "bearerToken"]) {
+  for (const key of ["password", "imapPassword", "deviceKey", "token", "secret", "botToken", "botSecret", "corpSecret", "accessToken", "bearerToken", "appSecret", "clientSecret", "encryptKey", "verificationToken"]) {
     if (copy[key]) copy[key] = "********";
   }
   if (kind === "webhook" && copy.headers && typeof copy.headers === "object") {
@@ -3707,7 +3791,7 @@ function notificationAccountFromRow(row: Record<string, unknown>, exposeSecrets 
 }
 
 function notificationRecipientFromRow(row: Record<string, unknown>, exposeSecrets = false): NotificationRecipientSummary {
-  const kind = ["email", "webhook", "bark", "telegram", "weixin"].includes(String(row.kind)) ? String(row.kind) as NotificationRecipientSummary["kind"] : "webhook";
+  const kind = ["email", "webhook", "bark", "telegram", "weixin", "wecom", "dingtalk", "feishu", "qq"].includes(String(row.kind)) ? String(row.kind) as NotificationRecipientSummary["kind"] : "webhook";
   const config = parseJsonValue<Record<string, unknown>>(row.config, {});
   return {
     id: String(row.id),
@@ -3716,7 +3800,7 @@ function notificationRecipientFromRow(row: Record<string, unknown>, exposeSecret
     enabled: Boolean(row.enabled),
     senderAccountId: row.sender_account_id ? String(row.sender_account_id) : null,
     channelId: row.channel_id ? String(row.channel_id) : null,
-    config: exposeSecrets ? config : publicNotificationConfig(kind === "email" ? "email" : kind === "bark" ? "bark" : kind === "telegram" ? "telegram" : kind === "weixin" ? "weixin" : "webhook", config),
+    config: exposeSecrets ? config : publicNotificationConfig(kind === "email" ? "email" : kind === "bark" ? "bark" : kind === "telegram" ? "telegram" : kind === "weixin" ? "weixin" : kind === "wecom" ? "wecom" : kind === "dingtalk" ? "dingtalk" : kind === "feishu" ? "feishu" : kind === "qq" ? "qq" : "webhook", config),
     permissions: sanitizeNotificationPermissions(parseJsonValue<NotificationPermissionPolicy>(row.permissions, {})),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
@@ -3757,9 +3841,10 @@ function notificationDeliveryFromRow(row: Record<string, unknown>): Notification
 }
 
 function notificationEphemeralRuleFromRow(row: Record<string, unknown>): NotificationEphemeralRuleSummary {
+  const scopeType = String(row.scope_type);
   return {
     id: String(row.id),
-    scopeType: String(row.scope_type) as NotificationEphemeralRuleSummary["scopeType"],
+    scopeType: scopeType === "task" || scopeType === "room_task" || scopeType === "automation" ? scopeType : "session",
     scopeId: String(row.scope_id),
     eventTypes: parseJsonValue<NotificationEventType[]>(row.event_types, []).filter((type) => notificationEventTypes.includes(type)),
     targets: sanitizeNotificationTargets(parseJsonValue<NotificationRuleTarget[]>(row.targets, [])),
@@ -3849,8 +3934,70 @@ function listNotificationAccounts(exposeSecrets = false) {
   return (db.prepare("select * from notification_accounts order by updated_at desc, id desc").all() as Array<Record<string, unknown>>).map((row) => notificationAccountFromRow(row, exposeSecrets));
 }
 
-function listNotificationRecipients(exposeSecrets = false) {
+function readNotificationRecipients(exposeSecrets = false) {
   return (db.prepare("select * from notification_recipients order by updated_at desc, id desc").all() as Array<Record<string, unknown>>).map((row) => notificationRecipientFromRow(row, exposeSecrets));
+}
+
+function defaultRecipientConfigForAccount(account: NotificationAccountSummary) {
+  const config = account.config as Record<string, unknown>;
+  if (account.channelKind === "email") {
+    const email = String(config.fromEmail ?? "").trim();
+    return email ? { email } : null;
+  }
+  if (account.channelKind === "telegram") {
+    const chatId = String(config.testChatId ?? "").trim();
+    return chatId ? { chatId } : null;
+  }
+  if (account.channelKind === "weixin") {
+    const chatId = String(config.testChatId ?? config.userId ?? config.accountId ?? "").trim();
+    return chatId ? { chatId } : null;
+  }
+  if (account.channelKind === "wecom") {
+    const chatId = String(config.testChatId ?? "").trim();
+    return chatId ? { chatId } : null;
+  }
+  if (account.channelKind === "qq") {
+    const chatId = String(config.testChatId ?? config.testTargetId ?? config.targetId ?? config.openId ?? "").trim();
+    return chatId ? { chatId } : null;
+  }
+  return null;
+}
+
+function syncDefaultNotificationRecipients() {
+  const existing = readNotificationRecipients(true);
+  const existingKeys = new Set(existing.map((recipient) => `${recipient.kind}:${recipient.senderAccountId ?? ""}`));
+  const accounts = listNotificationAccounts(true).filter((account) => account.enabled && ["email", "telegram", "weixin", "wecom", "qq"].includes(account.channelKind));
+  const now = new Date().toISOString();
+  let changed = false;
+  for (const account of accounts) {
+    const key = `${account.channelKind}:${account.id}`;
+    if (existingKeys.has(key)) continue;
+    const config = defaultRecipientConfigForAccount(account);
+    if (!config) continue;
+    const language = notificationLanguageFromConfig(account.config as Record<string, unknown> | null);
+    const recipientSuffix = notificationLocaleText(language, "接收者", "recipient");
+    const id = `notification-recipient-${randomUUID()}`;
+    db.prepare(`
+      insert into notification_recipients (id, name, kind, enabled, sender_account_id, channel_id, config, permissions, created_at, updated_at)
+      values (?, ?, ?, 1, ?, null, ?, ?, ?, ?)
+    `).run(
+      id,
+      `${account.name} ${recipientSuffix}`,
+      account.channelKind,
+      account.id,
+      JSON.stringify(config),
+      JSON.stringify({}),
+      now,
+      now,
+    );
+    changed = true;
+  }
+  return changed;
+}
+
+function listNotificationRecipients(exposeSecrets = false) {
+  syncDefaultNotificationRecipients();
+  return readNotificationRecipients(exposeSecrets);
 }
 
 function listAllNotificationRules() {
@@ -3884,13 +4031,13 @@ function listNotificationEphemeralRules(limit = 50, cursorValue?: string | null)
 }
 
 function createNotificationEphemeralRule(input: {
-  scopeType?: "session" | "task" | "room_task";
+  scopeType?: "session" | "task" | "room_task" | "automation";
   scopeId?: string;
   eventTypes?: NotificationEventType[];
   targets?: NotificationRuleTarget[];
   expireMode?: "after_trigger" | "session_end" | "manual";
 }) {
-  const scopeType = input.scopeType === "task" || input.scopeType === "room_task" ? input.scopeType : "session";
+  const scopeType = input.scopeType === "task" || input.scopeType === "room_task" || input.scopeType === "automation" ? input.scopeType : "session";
   const scopeId = input.scopeId?.trim();
   const eventTypes = (input.eventTypes ?? []).filter((type) => notificationEventTypes.includes(type));
   const targets = sanitizeNotificationTargets(input.targets ?? []);
@@ -3987,6 +4134,54 @@ function sanitizeNotificationConfig(kind: NotificationAccountSummary["channelKin
       testChatId: String(config.testChatId ?? previous?.testChatId ?? "").trim(),
     };
   }
+  if (kind === "feishu") {
+    const appSecret = String(config.appSecret ?? "").trim();
+    return {
+      appId: String(config.appId ?? previous?.appId ?? "").trim(),
+      appSecret: appSecret && appSecret !== "********" ? appSecret : String(previous?.appSecret ?? ""),
+      domain: String(config.domain ?? previous?.domain ?? "feishu").trim() || "feishu",
+      connectionMode: String(config.connectionMode ?? previous?.connectionMode ?? "websocket").trim() || "websocket",
+      language: String(config.language ?? previous?.language ?? "zh-CN").trim() === "en-US" ? "en-US" : "zh-CN",
+      testChatId: String(config.testChatId ?? previous?.testChatId ?? "").trim(),
+      encryptKey: String(config.encryptKey ?? previous?.encryptKey ?? "").trim(),
+      verificationToken: String(config.verificationToken ?? previous?.verificationToken ?? "").trim(),
+      defaultSessionId: String(config.defaultSessionId ?? previous?.defaultSessionId ?? "").trim(),
+      allowedChatIds: list(config.allowedChatIds ?? previous?.allowedChatIds),
+      allowedUserIds: list(config.allowedUserIds ?? previous?.allowedUserIds),
+    };
+  }
+  if (kind === "wecom") {
+    const secret = String(config.secret ?? config.botSecret ?? "").trim();
+    return {
+      botId: String(config.botId ?? previous?.botId ?? "").trim(),
+      secret: secret && secret !== "********" ? secret : String(previous?.secret ?? previous?.botSecret ?? ""),
+      websocketUrl: String(config.websocketUrl ?? config.websocket_url ?? previous?.websocketUrl ?? previous?.websocket_url ?? "wss://openws.work.weixin.qq.com").trim() || "wss://openws.work.weixin.qq.com",
+      dmPolicy: String(config.dmPolicy ?? previous?.dmPolicy ?? "open").trim().toLowerCase() || "open",
+      allowFrom: list(config.allowFrom ?? config.allow_from ?? previous?.allowFrom ?? previous?.allow_from),
+      groupPolicy: String(config.groupPolicy ?? previous?.groupPolicy ?? "open").trim().toLowerCase() || "open",
+      groupAllowFrom: list(config.groupAllowFrom ?? config.group_allow_from ?? previous?.groupAllowFrom ?? previous?.group_allow_from),
+      inboundEnabled: config.inboundEnabled === true,
+      defaultSessionId: String(config.defaultSessionId ?? previous?.defaultSessionId ?? "").trim(),
+      testChatId: String(config.testChatId ?? previous?.testChatId ?? "").trim(),
+      language: String(config.language ?? previous?.language ?? "zh-CN").trim() === "en-US" ? "en-US" : "zh-CN",
+    };
+  }
+  if (kind === "qq") {
+    const clientSecret = String(config.clientSecret ?? config.appSecret ?? "").trim();
+    return {
+      appId: String(config.appId ?? previous?.appId ?? "").trim(),
+      clientSecret: clientSecret && clientSecret !== "********" ? clientSecret : String(previous?.clientSecret ?? previous?.appSecret ?? ""),
+      targetType: String(config.targetType ?? previous?.targetType ?? "user").trim().toLowerCase() || "user",
+      targetId: String(config.targetId ?? config.openId ?? previous?.targetId ?? previous?.openId ?? "").trim(),
+      testTargetId: String(config.testTargetId ?? config.testChatId ?? previous?.testTargetId ?? previous?.testChatId ?? previous?.targetId ?? previous?.openId ?? "").trim(),
+      language: String(config.language ?? previous?.language ?? "zh-CN").trim() === "en-US" ? "en-US" : "zh-CN",
+      inboundEnabled: config.inboundEnabled === true,
+      allowedChatIds: list(config.allowedChatIds ?? previous?.allowedChatIds),
+      allowedUserIds: list(config.allowedUserIds ?? previous?.allowedUserIds),
+      defaultSessionId: String(config.defaultSessionId ?? previous?.defaultSessionId ?? "").trim(),
+      testChatId: String(config.testChatId ?? previous?.testChatId ?? "").trim(),
+    };
+  }
   if (kind === "bark") {
     const deviceKey = String(config.deviceKey ?? "").trim();
     return {
@@ -3998,7 +4193,7 @@ function sanitizeNotificationConfig(kind: NotificationAccountSummary["channelKin
       url: String(config.url ?? previous?.url ?? "").trim(),
     };
   }
-  if (["webhook", "weixin", "wecom", "feishu", "qq"].includes(kind)) {
+  if (["webhook", "weixin", "feishu"].includes(kind)) {
     return {
       url: String(config.url ?? previous?.url ?? "").trim(),
       method: String(config.method ?? previous?.method ?? "POST").trim().toUpperCase() || "POST",
@@ -4024,6 +4219,54 @@ function sanitizeNotificationTargets(targets?: NotificationRuleTarget[]) {
       emailTo: Array.isArray(target.emailTo) ? target.emailTo.map((item) => String(item).trim()).filter(Boolean) : undefined,
     }))
     .filter((target) => target.accountId || target.recipientId);
+}
+
+function cleanupNotificationTargetsForDeletedReferences(input: { accountIds?: string[]; recipientIds?: string[] }) {
+  const accountIds = new Set((input.accountIds ?? []).map((item) => item.trim()).filter(Boolean));
+  const recipientIds = new Set((input.recipientIds ?? []).map((item) => item.trim()).filter(Boolean));
+  if (!accountIds.size && !recipientIds.size) return;
+
+  const cleanTargets = (rawTargets: unknown) => {
+    const mapped: Array<NotificationRuleTarget | null> = sanitizeNotificationTargets(parseJsonValue<NotificationRuleTarget[]>(rawTargets, []))
+    .map((target): NotificationRuleTarget | null => {
+      if (target.accountId && accountIds.has(target.accountId)) return null;
+      if (target.recipientId && recipientIds.has(target.recipientId)) return null;
+      const next = { ...target };
+      if (next.senderAccountId && accountIds.has(next.senderAccountId)) delete next.senderAccountId;
+      return next;
+    });
+    return mapped.filter((target): target is NotificationRuleTarget => Boolean(target));
+  };
+
+  const rules = db.prepare("select id, targets from notification_rules").all() as Array<{ id?: string; targets?: unknown }>;
+  for (const rule of rules) {
+    const targets = cleanTargets(rule.targets);
+    if (!targets.length) db.prepare("delete from notification_rules where id = ?").run(String(rule.id));
+    else db.prepare("update notification_rules set targets = ?, updated_at = ? where id = ?").run(JSON.stringify(targets), new Date().toISOString(), String(rule.id));
+  }
+
+  const ephemeralRules = db.prepare("select id, targets from notification_ephemeral_rules").all() as Array<{ id?: string; targets?: unknown }>;
+  for (const rule of ephemeralRules) {
+    const targets = cleanTargets(rule.targets);
+    if (!targets.length) db.prepare("delete from notification_ephemeral_rules where id = ?").run(String(rule.id));
+    else db.prepare("update notification_ephemeral_rules set targets = ? where id = ?").run(JSON.stringify(targets), String(rule.id));
+  }
+}
+
+function deleteNotificationAccount(accountId: string, options: { deleteLinkedRecipients?: boolean } = {}) {
+  const linkedRecipients = (db.prepare("select id from notification_recipients where sender_account_id = ?").all(accountId) as Array<{ id?: string }>)
+    .map((row) => String(row.id ?? "").trim())
+    .filter(Boolean);
+  const result = db.prepare("delete from notification_accounts where id = ?").run(accountId);
+  if (!result.changes) return { deleted: false, linkedRecipientIds: [] as string[] };
+  if (options.deleteLinkedRecipients) {
+    db.prepare("delete from notification_recipients where sender_account_id = ?").run(accountId);
+    cleanupNotificationTargetsForDeletedReferences({ accountIds: [accountId], recipientIds: linkedRecipients });
+    return { deleted: true, linkedRecipientIds: linkedRecipients };
+  }
+  db.prepare("update notification_recipients set sender_account_id = null, updated_at = ? where sender_account_id = ?").run(new Date().toISOString(), accountId);
+  cleanupNotificationTargetsForDeletedReferences({ accountIds: [accountId] });
+  return { deleted: true, linkedRecipientIds: linkedRecipients };
 }
 
 function renderNotificationTemplate(template: string, event: NotificationEventInput, extra: Record<string, unknown> = {}) {
@@ -4142,6 +4385,10 @@ async function sendNotificationToAccount(account: NotificationAccountRecord, eve
     return { responseStatus: response.status };
   }
   if (account.channelKind === "weixin") return weixinPlatform.sendNotification(account, event, target);
+  if (account.channelKind === "wecom") return wecomPlatform.sendNotification(account, event, target);
+  if (account.channelKind === "dingtalk") return dingtalkPlatform.sendNotification(account, event);
+  if (account.channelKind === "feishu") return feishuPlatform.sendNotification(account, event, target);
+  if (account.channelKind === "qq") return qqPlatform.sendNotification(account, event, target);
   if (account.channelKind === "bark") return sendWebhookNotification(getNotificationChannel("bark"), config, event);
   return sendWebhookNotification(customChannel, config, event);
 }
@@ -4272,6 +4519,34 @@ function chooseWeixinNotificationSender(recipient: NotificationRecipientSummary,
     ?? (weixinSenders.length === 1 ? weixinSenders[0] : null);
 }
 
+function chooseWeComNotificationSender(recipient: NotificationRecipientSummary, target?: NotificationRuleTarget) {
+  const wecomSenders = listNotificationAccounts(true).filter((account) => account.enabled && account.channelKind === "wecom");
+  return (target?.senderAccountId ? wecomSenders.find((account) => account.id === target.senderAccountId) : null)
+    ?? (recipient.senderAccountId ? wecomSenders.find((account) => account.id === recipient.senderAccountId) : null)
+    ?? (wecomSenders.length === 1 ? wecomSenders[0] : null);
+}
+
+function chooseDingtalkNotificationSender(recipient: NotificationRecipientSummary, target?: NotificationRuleTarget) {
+  const dingtalkSenders = listNotificationAccounts(true).filter((account) => account.enabled && account.channelKind === "dingtalk");
+  return (target?.senderAccountId ? dingtalkSenders.find((account) => account.id === target.senderAccountId) : null)
+    ?? (recipient.senderAccountId ? dingtalkSenders.find((account) => account.id === recipient.senderAccountId) : null)
+    ?? (dingtalkSenders.length === 1 ? dingtalkSenders[0] : null);
+}
+
+function chooseFeishuNotificationSender(recipient: NotificationRecipientSummary, target?: NotificationRuleTarget) {
+  const feishuSenders = listNotificationAccounts(true).filter((account) => account.enabled && account.channelKind === "feishu");
+  return (target?.senderAccountId ? feishuSenders.find((account) => account.id === target.senderAccountId) : null)
+    ?? (recipient.senderAccountId ? feishuSenders.find((account) => account.id === recipient.senderAccountId) : null)
+    ?? (feishuSenders.length === 1 ? feishuSenders[0] : null);
+}
+
+function chooseQQNotificationSender(recipient: NotificationRecipientSummary, target?: NotificationRuleTarget) {
+  const qqSenders = listNotificationAccounts(true).filter((account) => account.enabled && account.channelKind === "qq");
+  return (target?.senderAccountId ? qqSenders.find((account) => account.id === target.senderAccountId) : null)
+    ?? (recipient.senderAccountId ? qqSenders.find((account) => account.id === recipient.senderAccountId) : null)
+    ?? (qqSenders.length === 1 ? qqSenders[0] : null);
+}
+
 async function deliverNotificationToRecipient(recipient: NotificationRecipientSummary, event: NotificationEventInput, ruleId: string | null, target?: NotificationRuleTarget) {
   if (recipient.kind === "email") {
     const sender = chooseEmailNotificationSender(recipient, target);
@@ -4286,6 +4561,26 @@ async function deliverNotificationToRecipient(recipient: NotificationRecipientSu
   if (recipient.kind === "weixin") {
     const sender = chooseWeixinNotificationSender(recipient, target);
     if (!sender) throw new Error("weixin_sender_required");
+    return deliverNotification(sender, event, ruleId, { recipientId: recipient.id, accountId: sender.id, chatId: String(recipient.config.chatId ?? "") }, recipient);
+  }
+  if (recipient.kind === "wecom") {
+    const sender = chooseWeComNotificationSender(recipient, target);
+    if (!sender) throw new Error("wecom_sender_required");
+    return deliverNotification(sender, event, ruleId, { recipientId: recipient.id, accountId: sender.id, chatId: String(recipient.config.chatId ?? "") }, recipient);
+  }
+  if (recipient.kind === "dingtalk") {
+    const sender = chooseDingtalkNotificationSender(recipient, target);
+    if (!sender) throw new Error("dingtalk_sender_required");
+    return deliverNotification(sender, event, ruleId, { recipientId: recipient.id, accountId: sender.id }, recipient);
+  }
+  if (recipient.kind === "qq") {
+    const sender = chooseQQNotificationSender(recipient, target);
+    if (!sender) throw new Error("qq_sender_required");
+    return deliverNotification(sender, event, ruleId, { recipientId: recipient.id, accountId: sender.id, chatId: String(recipient.config.chatId ?? "") }, recipient);
+  }
+  if (recipient.kind === "feishu") {
+    const sender = chooseFeishuNotificationSender(recipient, target);
+    if (!sender) throw new Error("feishu_sender_required");
     return deliverNotification(sender, event, ruleId, { recipientId: recipient.id, accountId: sender.id, chatId: String(recipient.config.chatId ?? "") }, recipient);
   }
   const account: NotificationAccountRecord = {
@@ -4344,13 +4639,14 @@ function registerEphemeralNotificationsFromPrompt(session: SessionSummary, promp
 }
 
 function notificationScopesForEvent(event: NotificationEventInput) {
-  const scopes: Array<{ scopeType: "session" | "task" | "room_task"; scopeId: string }> = [];
+  const scopes: Array<{ scopeType: "session" | "task" | "room_task" | "automation"; scopeId: string }> = [];
   if (event.sourceType === "session" && event.sourceId) scopes.push({ scopeType: "session", scopeId: event.sourceId });
+  if (event.sourceType === "automation" && event.sourceId) scopes.push({ scopeType: "automation", scopeId: event.sourceId });
   const metadataScopes = Array.isArray(event.metadata?.notificationScopes) ? event.metadata.notificationScopes : [];
   for (const item of metadataScopes) {
     if (!item || typeof item !== "object") continue;
     const record = item as Record<string, unknown>;
-    const scopeType = record.scopeType === "session" || record.scopeType === "task" || record.scopeType === "room_task" ? record.scopeType : null;
+    const scopeType = record.scopeType === "session" || record.scopeType === "task" || record.scopeType === "room_task" || record.scopeType === "automation" ? record.scopeType : null;
     const scopeId = typeof record.scopeId === "string" && record.scopeId.trim() ? record.scopeId.trim() : "";
     if (scopeType && scopeId) scopes.push({ scopeType, scopeId });
   }
@@ -4580,6 +4876,24 @@ function automationIdForSession(sessionId: string) {
   return row?.id ?? null;
 }
 
+function sessionHasExistingAutomationOwner(sessionId: string) {
+  if (appData.automations.some((automation) => automation.sessionId === sessionId)) return true;
+  const row = db.prepare(`
+    select automation_runs.automation_id
+    from automation_runs
+    inner join automations on automations.id = automation_runs.automation_id
+    where automation_runs.session_id = ?
+    limit 1
+  `).get(sessionId) as { automation_id?: string } | undefined;
+  return Boolean(row?.automation_id);
+}
+
+function sessionVisibleInChatTools(session: SessionSummary) {
+  if (session.conversationType === "agent" && session.roomId) return false;
+  if (session.conversationType === "automation" && sessionHasExistingAutomationOwner(session.id)) return false;
+  return true;
+}
+
 function ensureAutomationSession(automation: AutomationSummary) {
   const project = automation.projectId ? appData.projects.find((item) => item.id === automation.projectId) : null;
   const provider = automation.providerId
@@ -4642,33 +4956,117 @@ function skipAutomationRun(automation: AutomationSummary) {
   return { session, runStatus: "skipped" as const };
 }
 
-function emitAutomationCommandNotification(automation: AutomationSummary, session: SessionSummary, result: { exitCode: number | null; timedOut?: boolean; stopped?: boolean; command?: string; cwd?: string }) {
+function notificationSnippet(value: string, maxLength = 1800) {
+  const cleaned = value
+    .replace(/\u001b\[[0-9;]*m/g, "")
+    .replace(/\r/g, "")
+    .trim();
+  if (!cleaned) return "";
+  if (cleaned.length <= maxLength) return cleaned;
+  return `${cleaned.slice(0, Math.floor(maxLength / 2)).trimEnd()}\n...\n${cleaned.slice(-Math.floor(maxLength / 2)).trimStart()}`;
+}
+
+function notificationDurationLabel(durationMs?: number | null) {
+  if (!durationMs || !Number.isFinite(durationMs) || durationMs < 0) return "";
+  if (durationMs < 1000) return `${Math.round(durationMs)}ms`;
+  if (durationMs < 60_000) return `${(durationMs / 1000).toFixed(1)}s`;
+  const minutes = Math.floor(durationMs / 60_000);
+  const seconds = Math.round((durationMs % 60_000) / 1000);
+  return `${minutes}m ${seconds}s`;
+}
+
+function automationStatusLabel(input: { exitCode: number | null; stopped?: boolean; timedOut?: boolean }) {
+  if (input.stopped) return "已停止";
+  if (input.timedOut) return "超时";
+  return input.exitCode === 0 ? "成功" : "失败";
+}
+
+function buildAutomationNotificationMessage(input: {
+  automation: AutomationSummary;
+  session: SessionSummary;
+  exitCode: number | null;
+  stopped?: boolean;
+  timedOut?: boolean;
+  durationMs?: number | null;
+  command?: string | null;
+  cwd?: string | null;
+  stdout?: string | null;
+  stderr?: string | null;
+  assistantResult?: string | null;
+  errorSummary?: string | null;
+}) {
+  const duration = notificationDurationLabel(input.durationMs);
+  const lines = [
+    `自动化：${input.automation.name}`,
+    `类型：${input.automation.actionType === "command" ? "系统命令" : "Agent"}`,
+    `状态：${automationStatusLabel(input)}`,
+    `退出码：${input.exitCode ?? "null"}`,
+    duration ? `耗时：${duration}` : "",
+    input.cwd || input.session.workspacePath ? `工作目录：${input.cwd ?? input.session.workspacePath}` : "",
+    `会话：${input.session.title}`,
+    `会话 ID：${input.session.id}`,
+  ].filter(Boolean);
+
+  if (input.command) {
+    lines.push("", "命令：", notificationSnippet(input.command, 800));
+  }
+
+  const stdout = notificationSnippet(input.stdout ?? "", 1600);
+  const stderr = notificationSnippet(input.stderr ?? "", 1600);
+  const assistantResult = notificationSnippet(input.assistantResult ?? "", 2200);
+  const errorSummary = notificationSnippet(input.errorSummary ?? "", 1800);
+
+  if (assistantResult) lines.push("", "执行结果：", assistantResult);
+  if (stdout) lines.push("", "stdout：", stdout);
+  if (stderr) lines.push("", "stderr：", stderr);
+  if (!assistantResult && !stdout && !stderr && errorSummary) lines.push("", "错误摘要：", errorSummary);
+  if (!assistantResult && !stdout && !stderr && !errorSummary) lines.push("", "执行结果：", "没有捕获到可展示的输出。");
+  return lines.join("\n");
+}
+
+function automationForSession(sessionId: string) {
+  const automationId = automationIdForSession(sessionId);
+  return automationId ? appData.automations.find((item) => item.id === automationId) ?? null : null;
+}
+
+function emitAutomationCommandNotification(automation: AutomationSummary, session: SessionSummary, result: { exitCode: number | null; timedOut?: boolean; stopped?: boolean; command?: string; cwd?: string; stdout?: string; stderr?: string; durationMs?: number }) {
   const stopped = Boolean(result.stopped);
   const success = result.exitCode === 0 && !result.timedOut && !stopped;
+  const message = buildAutomationNotificationMessage({
+    automation,
+    session,
+    exitCode: result.exitCode,
+    stopped,
+    timedOut: Boolean(result.timedOut),
+    durationMs: result.durationMs,
+    command: result.command ?? automation.command ?? null,
+    cwd: result.cwd ?? session.workspacePath ?? null,
+    stdout: result.stdout ?? null,
+    stderr: result.stderr ?? null,
+  });
   emitExternalNotification({
     eventType: stopped ? "task_interrupted" : success ? "task_completed" : "task_failed",
     severity: stopped ? "warning" : success ? "success" : "error",
     title: success ? `自动化完成：${automation.name}` : `自动化异常：${automation.name}`,
-    message: stopped
-      ? "系统命令自动化已被停止。"
-      : result.timedOut
-        ? `系统命令自动化超时，退出码：${result.exitCode ?? "null"}`
-        : `系统命令自动化退出码：${result.exitCode ?? "null"}`,
+    message,
     sourceType: "session",
     sourceId: session.id,
-    metadata: {
-      automationId: automation.id,
-      automationName: automation.name,
-      actionType: automation.actionType ?? "agent",
-      command: result.command ?? automation.command ?? null,
+      metadata: {
+        automationId: automation.id,
+        automationName: automation.name,
+        actionType: automation.actionType ?? "agent",
+        command: result.command ?? automation.command ?? null,
       cwd: result.cwd ?? session.workspacePath ?? null,
       exitCode: result.exitCode,
       timedOut: Boolean(result.timedOut),
-      stopped,
-      workspacePath: session.workspacePath,
-      notificationScopes: [{ scopeType: "session", scopeId: session.id }],
-    },
-  });
+        stopped,
+        workspacePath: session.workspacePath,
+        notificationScopes: [
+          { scopeType: "session", scopeId: session.id },
+          { scopeType: "automation", scopeId: automation.id },
+        ],
+      },
+    });
 }
 
 function consecutiveAutomationFailures(automationId: string) {
@@ -4899,6 +5297,9 @@ function appendSessionMessage(sessionId: string, role: SessionMessage["role"], c
     appendUrlCardsForMessage(session, message.id, content);
     forwardAssistantMessageToEmail(session, message);
     forwardAssistantMessageToTelegram(session, message);
+    feishuPlatform.forwardAssistantMessageToFeishu(session, message);
+    wecomPlatform.forwardAssistantMessageToWeCom(session, message);
+    qqPlatform.forwardAssistantMessageToQQ(session, message);
     weixinPlatform.forwardAssistantMessageToWeixin(session, message);
   }
   return message;
@@ -6927,6 +7328,36 @@ function saveJsonSetting(key: string, value: unknown) {
     on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at
   `).run(key, JSON.stringify(value), updatedAt);
 }
+
+const defaultNotificationTestSettings: NotificationTestSettings = {
+  titleZh: "Codex Web 测试通知",
+  titleEn: "Codex Web test notification",
+  messageZh: "这是一条来自 Codex Web 的测试通知。",
+  messageEn: "This is a test notification from Codex Web.",
+  includeHelp: true,
+  updatedAt: new Date().toISOString(),
+};
+
+function sanitizeNotificationTestSettings(input?: Partial<NotificationTestSettings> | null): NotificationTestSettings {
+  return {
+    titleZh: String(input?.titleZh ?? defaultNotificationTestSettings.titleZh).trim() || defaultNotificationTestSettings.titleZh,
+    titleEn: String(input?.titleEn ?? defaultNotificationTestSettings.titleEn).trim() || defaultNotificationTestSettings.titleEn,
+    messageZh: String(input?.messageZh ?? defaultNotificationTestSettings.messageZh).trim() || defaultNotificationTestSettings.messageZh,
+    messageEn: String(input?.messageEn ?? defaultNotificationTestSettings.messageEn).trim() || defaultNotificationTestSettings.messageEn,
+    includeHelp: input?.includeHelp !== false,
+    updatedAt: String(input?.updatedAt ?? new Date().toISOString()),
+  };
+}
+
+function loadNotificationTestSettings() {
+  return sanitizeNotificationTestSettings(loadJsonSetting<NotificationTestSettings>("notification_test_settings", defaultNotificationTestSettings));
+}
+
+function saveNotificationTestSettings(settings: NotificationTestSettings) {
+  saveJsonSetting("notification_test_settings", settings);
+}
+
+notificationTestSettings = loadNotificationTestSettings();
 
 function decodeTomlQuotedKey(value: string) {
   try {
@@ -10966,6 +11397,50 @@ function listRooms(status?: string, limit = 50, cursorValue?: string | null) {
   return pageFromRows(rows.map(roomFromRow), limit, (item) => item.updatedAt);
 }
 
+function createPipeTerminalAdapter(cwd: string, shellPath: string, warning: string | null) {
+  const child = spawnProcess(shellPath, ["-i"], { cwd, env: managedChildEnv() });
+  return {
+    mode: "pipe" as const,
+    warning,
+    adapter: {
+      write: (data: string) => child.stdin?.write(data.replaceAll("\r", "\n")),
+      resize: () => undefined,
+      kill: () => child.kill(),
+      onData: (callback: (value: string) => void) => {
+        child.stdout?.on("data", (chunk: Buffer) => callback(chunk.toString("utf8")));
+        child.stderr?.on("data", (chunk: Buffer) => callback(chunk.toString("utf8")));
+      },
+      onExit: (callback: (exitCode: number | null) => void) => {
+        child.on("error", () => callback(1));
+        child.on("close", (exitCode) => callback(exitCode));
+      },
+    },
+  };
+}
+
+function createScriptTerminalAdapter(cwd: string, shellPath: string) {
+  const child = spawnProcess("script", ["-q", "/dev/null", shellPath, "-l"], { cwd, env: managedChildEnv() });
+  return {
+    mode: "pty" as const,
+    warning: null,
+    adapter: {
+      write: (data: string) => child.stdin?.write(data),
+      resize: (cols: number, rows: number) => {
+        child.stdin?.write(`stty rows ${rows} cols ${cols}\n`);
+      },
+      kill: () => child.kill(),
+      onData: (callback: (value: string) => void) => {
+        child.stdout?.on("data", (chunk: Buffer) => callback(chunk.toString("utf8")));
+        child.stderr?.on("data", (chunk: Buffer) => callback(chunk.toString("utf8")));
+      },
+      onExit: (callback: (exitCode: number | null) => void) => {
+        child.on("error", () => callback(1));
+        child.on("close", (exitCode) => callback(exitCode));
+      },
+    },
+  };
+}
+
 function createTerminalAdapter(cwd: string): { adapter: TerminalAdapter; mode: "pty" | "pipe"; warning: string | null } {
   const shellPath = resolveShellPath();
   try {
@@ -10982,24 +11457,17 @@ function createTerminalAdapter(cwd: string): { adapter: TerminalAdapter; mode: "
       },
     };
   } catch (error) {
-    const child = spawnProcess(shellPath, ["-i"], { cwd, env: managedChildEnv() });
-    return {
-      mode: "pipe",
-      warning: error instanceof Error ? `PTY fallback: ${error.message}` : "PTY fallback active",
-      adapter: {
-        write: (data) => child.stdin?.write(data.replaceAll("\r", "\n")),
-        resize: () => undefined,
-        kill: () => child.kill(),
-        onData: (callback) => {
-          child.stdout?.on("data", (chunk: Buffer) => callback(chunk.toString("utf8")));
-          child.stderr?.on("data", (chunk: Buffer) => callback(chunk.toString("utf8")));
-        },
-        onExit: (callback) => {
-          child.on("error", () => callback(1));
-          child.on("close", (exitCode) => callback(exitCode));
-        },
-      },
-    };
+    try {
+      return createScriptTerminalAdapter(cwd, shellPath);
+    } catch (scriptError) {
+      return createPipeTerminalAdapter(
+        cwd,
+        shellPath,
+        error instanceof Error
+          ? `PTY fallback: ${error.message}${scriptError instanceof Error ? `; script fallback failed: ${scriptError.message}` : ""}`
+          : "PTY fallback active",
+      );
+    }
   }
 }
 
@@ -12174,6 +12642,8 @@ function finalizeCodexRunnerTask(session: SessionSummary, exitCode: number | nul
   flushCodexTaskLog(session);
   backfillSessionFromTaskLog(session);
   clearTelegramActiveReplyTargets(session.id);
+  feishuPlatform.clearActiveReplyTargets(session.id);
+  wecomPlatform.clearActiveReplyTargets(session.id);
   weixinPlatform.clearActiveReplyTargets(session.id);
   codexTaskProcesses.delete(session.id);
   codexTaskStdoutBuffers.delete(session.id);
@@ -12201,19 +12671,36 @@ function finalizeCodexRunnerTask(session: SessionSummary, exitCode: number | nul
     { scopeType: "session", scopeId: session.id },
     running?.id ? { scopeType: "task", scopeId: String(running.id) } : null,
     agentRun?.task_id ? { scopeType: "room_task", scopeId: String(agentRun.task_id) } : null,
-  ].filter((scope): scope is { scopeType: "session" | "task" | "room_task"; scopeId: string } => Boolean(scope));
+    session.conversationType === "automation" ? { scopeType: "automation", scopeId: automationIdForSession(session.id) ?? session.id } : null,
+  ].filter((scope): scope is { scopeType: "session" | "task" | "room_task" | "automation"; scopeId: string } => Boolean(scope));
   const latestAssistant = allSessionMessages(session.id).filter((message) => message.role === "assistant").at(-1)?.content ?? "";
   const isRoomTaskNotification = Boolean(agentRun?.room_id && agentRun?.task_id);
   const shouldEmitTaskNotification = !isRoomTaskNotification || roomTaskShouldNotifyUser(String(agentRun?.room_id ?? ""), String(agentRun?.task_id ?? ""), latestAssistant);
   if (shouldEmitTaskNotification) {
+    const automation = session.conversationType === "automation" ? automationForSession(session.id) : null;
+    const errorSummary = exitCode === 0 && !wasStopped ? "" : readTaskErrorSummary(session.id);
+    const notificationMessage = automation
+      ? buildAutomationNotificationMessage({
+        automation,
+        session,
+        exitCode,
+        stopped: wasStopped,
+        assistantResult: latestAssistant,
+        errorSummary,
+      })
+      : wasStopped ? "任务已被停止。" : `Codex 退出码：${exitCode ?? "null"}`;
     emitExternalNotification({
       eventType: wasStopped ? "task_interrupted" : exitCode === 0 ? "task_completed" : "task_failed",
       severity: wasStopped ? "warning" : exitCode === 0 ? "success" : "error",
-      title: exitCode === 0 && !wasStopped ? `任务完成：${session.title}` : `任务异常：${session.title}`,
-      message: wasStopped ? "任务已被停止。" : `Codex 退出码：${exitCode ?? "null"}`,
+      title: automation
+        ? exitCode === 0 && !wasStopped ? `自动化完成：${automation.name}` : `自动化异常：${automation.name}`
+        : exitCode === 0 && !wasStopped ? `任务完成：${session.title}` : `任务异常：${session.title}`,
+      message: notificationMessage,
       sourceType: "session",
       sourceId: session.id,
       metadata: {
+        automationId: automation?.id ?? null,
+        automationName: automation?.name ?? null,
         exitCode,
         status: session.status,
         workspacePath: session.workspacePath,
@@ -12367,6 +12854,8 @@ function runQueuedMessageIfIdle(session: SessionSummary) {
   const item = popNextQueuedMessage(session.id);
   if (!item) return false;
   activateTelegramReplyTargetFromQueue(session.id, item.id);
+  feishuPlatform.activateReplyTargetFromQueue(session.id, item.id);
+  wecomPlatform.activateReplyTargetFromQueue(session.id, item.id);
   weixinPlatform.activateReplyTargetFromQueue(session.id, item.id);
   restoreCodexSessionIdFromLog(session);
   const providerId = item.providerId ?? session.providerId ?? null;
@@ -13527,6 +14016,20 @@ app.patch("/api/settings/rate-limit", async (c) => {
   return c.json(next);
 });
 
+app.get("/api/settings/notification-test", (c) => c.json(notificationTestSettings));
+
+app.patch("/api/settings/notification-test", async (c) => {
+  const body = await c.req.json<UpdateNotificationTestSettingsRequest>().catch(() => null);
+  const next = sanitizeNotificationTestSettings({
+    ...notificationTestSettings,
+    ...(body ?? {}),
+    updatedAt: new Date().toISOString(),
+  });
+  notificationTestSettings = next;
+  saveNotificationTestSettings(next);
+  return c.json(next);
+});
+
 app.get("/api/settings/environment", (c) => {
   environmentOverview = buildEnvironmentOverview();
   saveEnvironmentOverview(environmentOverview);
@@ -14351,6 +14854,9 @@ app.post("/api/notifications/accounts", async (c) => {
   `).run(id, body.name.trim(), selectedChannel?.id ?? null, channelKind, body.enabled === false ? 0 : 1, JSON.stringify(config), JSON.stringify(sanitizeNotificationPermissions(body.permissions)), now, now);
   const account = notificationAccountFromRow(db.prepare("select * from notification_accounts where id = ?").get(id) as Record<string, unknown>, true);
   void syncTelegramBotCommands(account).catch((error) => console.warn("telegram command menu sync failed", account.id, error));
+  void Promise.resolve(feishuPlatform.syncConnections()).catch((error: unknown) => console.warn("feishu sync failed", error));
+  void Promise.resolve(wecomPlatform.syncConnections()).catch((error: unknown) => console.warn("wecom sync failed", error));
+  void Promise.resolve(qqPlatform.syncConnections()).catch((error: unknown) => console.warn("qq sync failed", error));
   return c.json(notificationAccountFromRow(db.prepare("select * from notification_accounts where id = ?").get(id) as Record<string, unknown>), 201);
 });
 
@@ -14379,6 +14885,9 @@ app.patch("/api/notifications/accounts/:id", async (c) => {
   );
   const account = notificationAccountFromRow(db.prepare("select * from notification_accounts where id = ?").get(c.req.param("id")) as Record<string, unknown>, true);
   void syncTelegramBotCommands(account).catch((error) => console.warn("telegram command menu sync failed", account.id, error));
+  void Promise.resolve(feishuPlatform.syncConnections()).catch((error: unknown) => console.warn("feishu sync failed", error));
+  void Promise.resolve(wecomPlatform.syncConnections()).catch((error: unknown) => console.warn("wecom sync failed", error));
+  void Promise.resolve(qqPlatform.syncConnections()).catch((error: unknown) => console.warn("qq sync failed", error));
   return c.json(notificationAccountFromRow(db.prepare("select * from notification_accounts where id = ?").get(c.req.param("id")) as Record<string, unknown>));
 });
 
@@ -14433,9 +14942,13 @@ app.get("/api/notifications/weixin/qr/status", async (c) => {
 });
 
 app.delete("/api/notifications/accounts/:id", (c) => {
-  const result = db.prepare("delete from notification_accounts where id = ?").run(c.req.param("id"));
-  if (!result.changes) return c.json({ error: "notification_account_not_found" }, 404);
-  return c.json({ ok: true });
+  const deleteLinkedRecipients = c.req.query("deleteLinkedRecipients") === "true";
+  const result = deleteNotificationAccount(c.req.param("id"), { deleteLinkedRecipients });
+  if (!result.deleted) return c.json({ error: "notification_account_not_found" }, 404);
+  void Promise.resolve(feishuPlatform.syncConnections()).catch((error: unknown) => console.warn("feishu sync failed", error));
+  void Promise.resolve(wecomPlatform.syncConnections()).catch((error: unknown) => console.warn("wecom sync failed", error));
+  void Promise.resolve(qqPlatform.syncConnections()).catch((error: unknown) => console.warn("qq sync failed", error));
+  return c.json({ ok: true, deletedRecipientIds: deleteLinkedRecipients ? result.linkedRecipientIds : [] });
 });
 
 app.post("/api/notifications/accounts/:id/test", async (c) => {
@@ -14451,19 +14964,52 @@ app.post("/api/notifications/accounts/:id/test", async (c) => {
       ? config.testEmailTo.map((item) => String(item).trim()).filter(Boolean)
       : String(config.testEmailTo ?? "").split(",").map((item) => item.trim()).filter(Boolean);
   const chatId = String(body?.chatId ?? config.testChatId ?? "").trim() || undefined;
+  if (account.channelKind === "wecom" && !chatId) {
+    void Promise.resolve(wecomPlatform.syncConnections()).catch((error: unknown) => console.warn("wecom sync failed", error));
+    let status = wecomPlatform.connectionStatus(account);
+    const deadline = Date.now() + 3_000;
+    while (!status.ok && status.status === "subscribing" && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      status = wecomPlatform.connectionStatus(account);
+    }
+    db.prepare("update notification_accounts set last_test_status = ?, last_error = ?, updated_at = ? where id = ?")
+      .run(status.ok ? "sent" : "failed", status.error, new Date().toISOString(), account.id);
+    return c.json({
+      ok: status.ok,
+      status: status.status,
+      error: status.error,
+      account: notificationAccountFromRow(db.prepare("select * from notification_accounts where id = ?").get(account.id) as Record<string, unknown>),
+    }, status.ok ? 200 : 400);
+  }
+  const helpText = account.channelKind === "telegram"
+    ? telegramPlatform.telegramHelpText(account)
+    : account.channelKind === "weixin"
+      ? weixinPlatform.weixinHelpText(account)
+      : account.channelKind === "wecom"
+        ? wecomPlatform.wecomHelpText(account)
+      : account.channelKind === "dingtalk"
+        ? dingtalkPlatform.dingtalkHelpText(account)
+        : account.channelKind === "feishu"
+          ? feishuPlatform.feishuHelpText(account)
+          : account.channelKind === "qq"
+            ? qqPlatform.qqHelpText(account)
+            : "";
+  const customTitle = String(body?.title ?? "").trim();
+  const customMessage = String(body?.message ?? "").trim();
+  const includeHelp = body?.includeHelp !== false;
+  const title = customTitle || notificationLocaleText(language, notificationTestSettings.titleZh, notificationTestSettings.titleEn);
+  const message = customMessage
+    ? [customMessage, includeHelp ? helpText : ""].filter(Boolean).join("\n\n")
+    : [
+      notificationLocaleText(language, notificationTestSettings.messageZh, notificationTestSettings.messageEn),
+      "",
+      notificationTestSettings.includeHelp ? helpText : "",
+    ].filter((item, index) => index === 1 || Boolean(item)).join("\n");
   const ok = await deliverNotification(account, {
     eventType: "task_completed",
     severity: "info",
-    title: notificationLocaleText(language, "Codex Web 测试通知", "Codex Web test notification"),
-    message: [
-      notificationLocaleText(language, "这是一条来自 Codex Web 的测试通知。", "This is a test notification from Codex Web."),
-      "",
-      account.channelKind === "telegram"
-        ? telegramPlatform.telegramHelpText(account)
-        : account.channelKind === "weixin"
-          ? weixinPlatform.weixinHelpText(account)
-          : "",
-    ].join("\n"),
+    title,
+    message,
     sourceType: "notification-account",
     sourceId: account.id,
   }, null, { accountId: account.id, emailTo, chatId });
@@ -14476,7 +15022,7 @@ app.get("/api/notifications/recipients", (c) => c.json(listNotificationRecipient
 
 app.post("/api/notifications/recipients", async (c) => {
   const body = await c.req.json<UpsertNotificationRecipientRequest>().catch(() => null);
-  const kind = body?.kind && ["email", "webhook", "bark", "telegram", "weixin"].includes(body.kind) ? body.kind : null;
+  const kind = body?.kind && ["email", "webhook", "bark", "telegram", "weixin", "wecom", "dingtalk", "feishu", "qq"].includes(body.kind) ? body.kind : null;
   if (!body?.name?.trim() || !kind) return c.json({ error: "invalid_notification_recipient" }, 400);
   const now = new Date().toISOString();
   const id = `notification-recipient-${randomUUID()}`;
@@ -14527,6 +15073,14 @@ app.post("/api/notifications/recipients/:id/test", async (c) => {
           ? telegramPlatform.telegramHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
           : recipient.kind === "weixin"
             ? weixinPlatform.weixinHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
+            : recipient.kind === "wecom"
+              ? wecomPlatform.wecomHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
+              : recipient.kind === "dingtalk"
+                ? dingtalkPlatform.dingtalkHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
+              : recipient.kind === "qq"
+                ? qqPlatform.qqHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
+                : recipient.kind === "feishu"
+                  ? feishuPlatform.feishuHelpText({ config: { language: "en-US" } } as unknown as NotificationAccountSummary)
             : "",
       ].join("\n"),
       sourceType: "notification-recipient",
@@ -14540,7 +15094,7 @@ app.post("/api/notifications/recipients/:id/test", async (c) => {
 
 app.post("/api/notifications/ephemeral-rules", async (c) => {
   const body = await c.req.json<{
-    scopeType?: "session" | "task" | "room_task";
+    scopeType?: "session" | "task" | "room_task" | "automation";
     scopeId?: string;
     eventTypes?: NotificationEventType[];
     targets?: NotificationRuleTarget[];
@@ -14558,8 +15112,10 @@ app.delete("/api/notifications/ephemeral-rules/:id", (c) => {
 });
 
 app.delete("/api/notifications/recipients/:id", (c) => {
-  const result = db.prepare("delete from notification_recipients where id = ?").run(c.req.param("id"));
+  const recipientId = c.req.param("id");
+  const result = db.prepare("delete from notification_recipients where id = ?").run(recipientId);
   if (!result.changes) return c.json({ error: "notification_recipient_not_found" }, 404);
+  cleanupNotificationTargetsForDeletedReferences({ recipientIds: [recipientId] });
   return c.json({ ok: true });
 });
 
@@ -15453,7 +16009,7 @@ app.get("/api/sessions", (c) => {
   const includeAutomations = c.req.query("includeAutomations") === "true" || c.req.query("includeAutomations") === "1";
   const visibleSessions = appData.sessions.filter((session) => {
     if (!includeAgentChildren && session.conversationType === "agent" && session.roomId) return false;
-    if (!includeAutomations && session.conversationType === "automation") return false;
+    if (!includeAutomations && session.conversationType === "automation" && sessionHasExistingAutomationOwner(session.id)) return false;
     return true;
   });
   if (!limitQuery && !c.req.query("cursor") && !c.req.query("q") && !c.req.query("projectId") && !c.req.query("status")) return c.json(visibleSessions);
@@ -17939,6 +18495,8 @@ function shutdown(signal: string) {
   clearTimeout(startupAutomationTimer);
   shutdownEmailPlatform();
   shutdownTelegramPlatform();
+  void feishuPlatform.shutdown();
+  void wecomPlatform.shutdown();
   weixinPlatform.shutdown();
   console.log(`Codex Web API shutting down after ${signal}`);
   for (const child of codexTaskProcesses.values()) child.kill("SIGTERM");

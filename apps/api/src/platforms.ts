@@ -46,9 +46,10 @@ export const platformSupportMap: Record<PlatformKind, PlatformCapability[]> = {
   webhook: ["inbound_messages", "outbound_messages", "session_binding", "reply_routing"],
   bark: ["outbound_messages"],
   weixin: ["inbound_messages", "outbound_messages", "session_binding", "session_selection", "reply_routing", "working_status"],
-  wecom: ["outbound_messages"],
-  feishu: ["outbound_messages"],
-  qq: ["outbound_messages"],
+  wecom: ["inbound_messages", "outbound_messages", "session_binding", "session_selection", "reply_routing", "working_status"],
+  dingtalk: ["inbound_messages", "outbound_messages", "session_binding", "reply_routing"],
+  feishu: ["inbound_messages", "outbound_messages", "session_binding", "session_selection", "reply_routing", "command_menu"],
+  qq: ["inbound_messages", "outbound_messages", "session_binding", "session_selection", "reply_routing", "working_status"],
 };
 
 export const platformDescriptions: Record<PlatformKind, string> = {
@@ -57,9 +58,10 @@ export const platformDescriptions: Record<PlatformKind, string> = {
   webhook: "Inbound webhook routes that can create or reuse Codex sessions.",
   bark: "iOS push delivery through Bark-compatible endpoints.",
   weixin: "Personal Weixin bridge with session binding and reply routing.",
-  wecom: "WeCom robot webhook delivery for notifications.",
-  feishu: "Feishu/Lark robot webhook delivery for notifications.",
-  qq: "QQ-compatible webhook delivery for notifications.",
+  wecom: "WeCom AI bot bridge with session binding and reply routing.",
+  dingtalk: "DingTalk robot bridge with signed webhook delivery.",
+  feishu: "Feishu/Lark long-connection bot with session binding and reply routing.",
+  qq: "QQ Bot bridge with session binding and reply routing.",
 };
 
 export function platformAccountMatchesKind(account: NotificationAccountSummary, kind: PlatformKind) {
@@ -67,16 +69,23 @@ export function platformAccountMatchesKind(account: NotificationAccountSummary, 
   if (kind === "email") return account.channelKind === "email";
   if (kind === "bark") return account.channelKind === "bark";
   if (kind === "weixin") return account.channelKind === "weixin";
+  if (kind === "wecom") return account.channelKind === "wecom";
+  if (kind === "dingtalk") return account.channelKind === "dingtalk";
+  if (kind === "feishu") return account.channelKind === "feishu";
+  if (kind === "qq") return account.channelKind === "qq";
   if (kind === "webhook") return account.channelKind === "webhook";
   return account.channelId === kind;
 }
 
 export function platformRouteSummaries({ db, sessions, listNotificationAccounts }: PlatformDeps): PlatformRouteSummary[] {
-  const accounts = new Map(listNotificationAccounts(true).filter((account) => ["telegram", "weixin", "email"].includes(account.channelKind)).map((account) => [account.id, account] as const));
+  const accounts = new Map(listNotificationAccounts(true).filter((account) => ["telegram", "weixin", "wecom", "email", "feishu", "qq"].includes(account.channelKind)).map((account) => [account.id, account] as const));
   const routeTables: Array<{ kind: PlatformKind; table: string }> = [
     { kind: "telegram", table: "telegram_chat_routes" },
     { kind: "weixin", table: "weixin_chat_routes" },
+    { kind: "wecom", table: "wecom_chat_routes" },
     { kind: "email", table: "email_chat_routes" },
+    { kind: "feishu", table: "feishu_chat_routes" },
+    { kind: "qq", table: "qq_chat_routes" },
   ];
   return routeTables.flatMap(({ kind, table }) => (db.prepare(`select * from ${table} order by updated_at desc, chat_id asc`).all() as Array<Record<string, unknown>>).map((row) => {
     const sessionId = String(row.session_id ?? "");
@@ -105,6 +114,8 @@ export function platformOverview(deps: PlatformDeps): PlatformSettingsResponse {
     "bark",
     "weixin",
     "wecom",
+    "dingtalk",
+    "wecom",
     "feishu",
     "qq",
   ] as PlatformKind[]).map((kind) => {
@@ -114,7 +125,8 @@ export function platformOverview(deps: PlatformDeps): PlatformSettingsResponse {
       id: kind,
       kind,
       label: kind === "weixin" ? "Weixin Bot"
-        : kind === "wecom" ? "WeCom Bot"
+        : kind === "dingtalk" ? "DingTalk Bot"
+        : kind === "wecom" ? "WeCom AI Bot"
           : kind === "feishu" ? "Feishu / Lark Bot"
             : kind === "qq" ? "QQ Bot"
               : kind === "bark" ? "Bark"
@@ -126,13 +138,25 @@ export function platformOverview(deps: PlatformDeps): PlatformSettingsResponse {
       builtin: true,
       channelId: kind,
       accountCount: matchedAccounts.length,
-      connectedRouteCount: kind === "webhook" ? webhookRoutes.length : kind === "telegram" || kind === "weixin" ? routes.filter((route) => route.kind === kind).length : 0,
+      connectedRouteCount: kind === "webhook"
+        ? webhookRoutes.length
+        : kind === "telegram" || kind === "weixin" || kind === "wecom" || kind === "dingtalk" || kind === "feishu" || kind === "qq"
+          ? routes.filter((route) => route.kind === kind).length
+          : 0,
       baselineCapabilities: platformBaselineCapabilities,
       supportedCapabilities: platformSupportMap[kind],
       notes: kind === "telegram"
         ? "This is the reference platform. All other platforms are compared against this contract."
         : kind === "weixin"
           ? "Personal Weixin bridge with session binding and reply routing."
+          : kind === "wecom"
+          ? "WeCom AI Bot bridge with session binding and reply routing."
+          : kind === "qq"
+          ? "QQ Bot bridge with session binding and reply routing."
+          : kind === "dingtalk"
+          ? "DingTalk robot sender with signed delivery."
+          : kind === "feishu"
+            ? "Feishu long-connection bot with inbound reply routing."
           : kind === "email"
             ? "IMAP inbound polling plus SMTP outbound replies with per-sender routing."
           : kind === "webhook"

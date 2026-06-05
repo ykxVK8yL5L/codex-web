@@ -67,6 +67,7 @@ type WeixinQrLoginState = {
 type WeixinPlatformDeps = {
   db: Database.Database;
   sessions: SessionSummary[];
+  sessionVisibleInChatTools?: (session: SessionSummary) => boolean;
   listNotificationAccounts: ListNotificationAccounts;
   dispatchMessageToSession: DispatchMessageToSession;
   resolveTelegramTargetSession: ResolveTelegramTargetSession;
@@ -197,10 +198,15 @@ export function createWeixinPlatform(deps: WeixinPlatformDeps) {
   const {
     db,
     sessions,
+    sessionVisibleInChatTools = () => true,
     listNotificationAccounts,
     dispatchMessageToSession,
     resolveTelegramTargetSession,
   } = deps;
+
+  function visibleChatSessions() {
+    return sessions.filter(sessionVisibleInChatTools);
+  }
 
   const pollingOffsets = new Map<string, string>();
   const pollingBusy = new Set<string>();
@@ -694,7 +700,7 @@ export function createWeixinPlatform(deps: WeixinPlatformDeps) {
 
   async function sendWeixinSessionPicker(account: NotificationAccountRecord, chatId: string, message: string) {
     const ui = weixinUi(account);
-    const choices = weixinSessionChoices(sessions);
+    const choices = weixinSessionChoices(visibleChatSessions());
     if (!choices.length) {
       await sendWeixinText(account, chatId, ui.noAvailableSessions);
       return;
@@ -714,7 +720,7 @@ export function createWeixinPlatform(deps: WeixinPlatformDeps) {
 
   async function sendWeixinBindPicker(account: NotificationAccountRecord, chatId: string) {
     const ui = weixinUi(account);
-    const choices = weixinSessionChoices(sessions);
+    const choices = weixinSessionChoices(visibleChatSessions());
     if (!choices.length) {
       await sendWeixinText(account, chatId, ui.noAvailableSessions);
       return;
@@ -819,7 +825,7 @@ export function createWeixinPlatform(deps: WeixinPlatformDeps) {
       return;
     }
     if (command === "/sessions") {
-      await sendWeixinText(account, chatId, weixinGroupedSessionText(account, sessions, 12));
+      await sendWeixinText(account, chatId, weixinGroupedSessionText(account, visibleChatSessions(), 12));
       return;
     }
     if (command === "/bind") {

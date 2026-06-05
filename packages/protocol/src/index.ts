@@ -414,6 +414,23 @@ export interface RateLimitSettings {
   updatedAt: string;
 }
 
+export interface NotificationTestSettings {
+  titleZh: string;
+  titleEn: string;
+  messageZh: string;
+  messageEn: string;
+  includeHelp: boolean;
+  updatedAt: string;
+}
+
+export interface UpdateNotificationTestSettingsRequest {
+  titleZh?: string;
+  titleEn?: string;
+  messageZh?: string;
+  messageEn?: string;
+  includeHelp?: boolean;
+}
+
 export type EnvironmentToolStatus = "installed" | "missing" | "version_mismatch" | "unknown";
 export type EnvironmentToolSource = "mise" | "manual" | "system" | "external";
 export type EnvironmentRecordScope = "global" | "workspace" | "room" | "session";
@@ -678,13 +695,13 @@ export interface TaskHealthRepairResponse {
   health: TaskHealthResponse;
 }
 
-export type NotificationChannelKind = "webhook" | "bark" | "email" | "telegram" | "weixin";
-export type NotificationChannelAdapter = "webhook" | "authenticated_webhook" | "email" | "telegram" | "weixin";
+export type NotificationChannelKind = "webhook" | "bark" | "email" | "telegram" | "weixin" | "wecom" | "dingtalk" | "feishu" | "qq";
+export type NotificationChannelAdapter = "webhook" | "authenticated_webhook" | "email" | "telegram" | "weixin" | "wecom" | "dingtalk" | "feishu" | "qq";
 export type NotificationChannelAuthType = "none" | "bearer" | "query_token" | "token_request";
 export type NotificationSeverity = "info" | "success" | "warning" | "error";
 export type NotificationEventType = "task_completed" | "task_failed" | "task_interrupted" | "needs_approval" | "task_health_issue" | "provider_check_failed" | "backup_failed" | "restore_failed" | "auth_login";
 export type NotificationDeliveryStatus = "pending" | "sent" | "failed" | "skipped";
-export type PlatformKind = "telegram" | "email" | "webhook" | "bark" | "weixin" | "wecom" | "feishu" | "qq";
+export type PlatformKind = "telegram" | "email" | "webhook" | "bark" | "weixin" | "dingtalk" | "wecom" | "feishu" | "qq";
 export type PlatformCapability =
   | "inbound_messages"
   | "outbound_messages"
@@ -735,7 +752,7 @@ export interface NotificationRuleTarget {
   emailTo?: string[];
 }
 
-export type NotificationRecipientKind = "email" | "webhook" | "bark" | "telegram" | "weixin";
+export type NotificationRecipientKind = "email" | "webhook" | "bark" | "telegram" | "weixin" | "wecom" | "dingtalk" | "feishu" | "qq";
 
 export interface NotificationPermissionPolicy {
   allowedAgentIds?: string[];
@@ -787,7 +804,7 @@ export interface NotificationDeliverySummary {
 
 export interface NotificationEphemeralRuleSummary {
   id: string;
-  scopeType: "task" | "session" | "room_task";
+  scopeType: "task" | "session" | "room_task" | "automation";
   scopeId: string;
   eventTypes: NotificationEventType[];
   targets: NotificationRuleTarget[];
@@ -921,6 +938,9 @@ export interface UpsertNotificationRuleRequest {
 export interface TestNotificationAccountRequest {
   emailTo?: string[];
   chatId?: string;
+  title?: string;
+  message?: string;
+  includeHelp?: boolean;
 }
 
 export interface SystemBackupProjectReference {

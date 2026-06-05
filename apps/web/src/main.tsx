@@ -8,6 +8,7 @@ import {
   Boxes,
   Check,
   ChevronDown,
+  ChevronUp,
   Clock3,
   Copy,
   Download,
@@ -59,7 +60,8 @@ import { IconText } from "@/components/IconText";
 import { Input } from "@/components/ui/input";
 import { NotificationPlatformsPanel } from "@/components/settings/NotificationPlatformsPanel";
 import { WebhookNotificationAccountPanel } from "@/components/settings/platforms/WebhookNotificationAccountPanel";
-import { EmailNotificationAccountPanel, TelegramNotificationAccountPanel, WeixinNotificationAccountPanel } from "@/components/settings/platforms";
+import { DingTalkNotificationAccountPanel, EmailNotificationAccountPanel, FeishuNotificationAccountPanel, QQNotificationAccountPanel, TelegramNotificationAccountPanel, WeComNotificationAccountPanel, WeixinNotificationAccountPanel } from "@/components/settings/platforms";
+import { AutomationNotifyRuleDialog } from "@/components/automations";
 import { Switch } from "@/components/ui/switch";
 import { PreviewDirectoryPicker } from "@/components/PreviewDirectoryPicker";
 import { ToastViewport } from "@/components/ToastViewport";
@@ -159,6 +161,7 @@ import type {
   NotificationRuleTarget,
   NotificationSeverity,
   NotificationSettingsResponse,
+  NotificationTestSettings,
   PageResponse,
   PermissionProfileId,
   PlatformSettingsResponse,
@@ -230,6 +233,7 @@ import type {
   UpdateAutomationRequest,
   UpdateAccessTokenRequest,
   UpdateCodexRuntimeSettingsRequest,
+  UpdateNotificationTestSettingsRequest,
   UpdateSkillRequest,
   InstallEnvironmentToolRequest,
   ImportMarketplaceCatalogRequest,
@@ -267,6 +271,18 @@ const browserNotificationsEnabledKey = "codex-web-browser-notifications-enabled"
 const suppressedAppNotificationsKey = "codex-web-suppressed-app-notifications";
 
 const listenModeOptions: AgentListenMode[] = ["none", "passive", "active", "orchestrator"];
+
+function notificationKindLabel(t: TFunction, kind: NotificationAccountSummary["channelKind"] | NotificationRecipientSummary["kind"]) {
+  if (kind === "email") return t("settings.notificationKindEmail");
+  if (kind === "telegram") return t("settings.notificationKindTelegram");
+  if (kind === "weixin") return t("settings.notificationKindWeixin");
+  if (kind === "wecom") return t("settings.notificationKindWeCom");
+  if (kind === "dingtalk") return t("settings.notificationKindDingTalk");
+  if (kind === "feishu") return t("settings.notificationKindFeishu");
+  if (kind === "qq") return t("settings.notificationKindQQ");
+  if (kind === "bark") return t("settings.notificationKindBark");
+  return t("settings.notificationKindWebhook");
+}
 
 function localStorageStringSet(key: string) {
   try {
@@ -1047,7 +1063,7 @@ function App() {
       return response.json() as Promise<T>;
     }
     const [nextSessions, nextProjects, nextProviders, nextAutomations, nextApprovals] = await Promise.all([
-      getJson<PageResponse<SessionSummary>>("/api/sessions?limit=30&includeAutomations=1"),
+      getJson<PageResponse<SessionSummary>>("/api/sessions?limit=30"),
       getJson<ProjectSummary[]>("/api/projects"),
       getJson<ProviderSummary[]>("/api/providers"),
       getJson<AutomationSummary[]>("/api/automations"),
@@ -1093,7 +1109,6 @@ function App() {
     if (search.trim()) params.set("q", search.trim());
     if (projectId !== "all") params.set("projectId", projectId);
     if (status !== "all") params.set("status", status);
-    params.set("includeAutomations", "1");
     const response = await fetch(`/api/sessions?${params}`, {
       headers: { authorization: `Bearer ${sessionToken}` },
     });
@@ -2232,8 +2247,13 @@ function SessionPage({
   }, [session?.id]);
   const notifyRecipients = (notifySettings?.recipients ?? []).filter((recipient) => recipient.enabled);
   const notifyRecipientKinds = [...new Set(notifyRecipients.map((recipient) => recipient.kind))];
-  const filteredNotifyRecipients = notifyRecipients.filter((recipient) => recipient.kind === notifyChannelKind);
-  const notifySenders = (notifySettings?.accounts ?? []).filter((account) => account.enabled && account.channelKind === notifyChannelKind);
+  const notifyRecipientsForKind = (kind: NotificationRecipientSummary["kind"]) => notifyRecipients.filter((recipient) => recipient.kind === kind);
+  const filteredNotifyRecipients = notifyRecipientsForKind(notifyChannelKind);
+  const notifySendersForKind = (kind: NotificationAccountSummary["channelKind"]) => (notifySettings?.accounts ?? []).filter((account) => account.enabled && account.channelKind === kind);
+  function defaultNotifySenderId(recipient?: NotificationRecipientSummary | null) {
+    if (!recipient) return "";
+    return recipient.senderAccountId ?? notifySendersForKind(recipient.kind)[0]?.id ?? "";
+  }
   function displayMessage(message: SessionMessage) {
     if (isRoomSession && message.role === "assistant") {
       const match = message.content.match(/^([^:\n]{1,80}):\n([\s\S]*)$/);
@@ -2798,6 +2818,7 @@ function SessionPage({
     if (firstRecipient) {
       setNotifyChannelKind(firstRecipient.kind);
       setNotifyRecipientId(firstRecipient.id);
+      setNotifySenderAccountId(defaultNotifySenderId(firstRecipient));
     }
     return settings;
   }
@@ -2809,6 +2830,9 @@ function SessionPage({
       notify(t("session.commandNotifyNoRecipients"), "error");
       return;
     }
+    setNotifyChannelKind(firstRecipient.kind);
+    setNotifyRecipientId(firstRecipient.id);
+    setNotifySenderAccountId(defaultNotifySenderId(firstRecipient));
     setNotifyBuilderOpen(true);
   }
 
@@ -4085,28 +4109,24 @@ function SessionPage({
               <span>{t("settings.notificationRecipientKind")}</span>
               <select name="notify-channel-kind" value={notifyChannelKind} onChange={(event) => {
                 const kind = event.target.value as NotificationRecipientSummary["kind"];
+                const nextRecipients = notifyRecipientsForKind(kind);
                 setNotifyChannelKind(kind);
-                setNotifyRecipientId(notifyRecipients.find((recipient) => recipient.kind === kind)?.id ?? "");
-                setNotifySenderAccountId("");
+                setNotifyRecipientId((current) => nextRecipients.some((recipient) => recipient.id === current) ? current : nextRecipients[0]?.id ?? "");
+                setNotifySenderAccountId(defaultNotifySenderId(nextRecipients[0] ?? null));
               }}>
-                {notifyRecipientKinds.map((kind) => <option value={kind} key={kind}>{kind}</option>)}
+                {notifyRecipientKinds.map((kind) => <option value={kind} key={kind}>{notificationKindLabel(t, kind)}</option>)}
               </select>
             </label>
             <label>
               <span>{t("settings.notificationRecipientName")}</span>
-              <select name="notify-recipient-id" value={notifyRecipientId} onChange={(event) => setNotifyRecipientId(event.target.value)}>
+              <select name="notify-recipient-id" value={notifyRecipientId} onChange={(event) => {
+                const nextRecipient = filteredNotifyRecipients.find((recipient) => recipient.id === event.target.value) ?? null;
+                setNotifyRecipientId(event.target.value);
+                setNotifySenderAccountId(defaultNotifySenderId(nextRecipient));
+              }}>
                 {filteredNotifyRecipients.map((recipient) => <option value={recipient.id} key={recipient.id}>{recipient.name}</option>)}
               </select>
             </label>
-            {notifySenders.length > 1 && (
-              <label>
-                <span>{t("settings.notificationChooseSender")}</span>
-                <select name="notify-sender-id" value={notifySenderAccountId} onChange={(event) => setNotifySenderAccountId(event.target.value)}>
-                  <option value="">{t("settings.notificationUseRecipientDefaultSender")}</option>
-                  {notifySenders.map((sender) => <option value={sender.id} key={sender.id}>{sender.name}</option>)}
-                </select>
-              </label>
-            )}
             <div className="dialog-actions">
               <button className="ghost-button" type="button" onClick={() => setNotifyBuilderOpen(false)}>{t("action.cancel")}</button>
               <button className="dark-button" type="submit" disabled={!notifyRecipientId}>{t("action.create")}</button>
@@ -9175,6 +9195,7 @@ function AutomationsPage({
   const [runDetailPanel, setRunDetailPanel] = useState<{ automation: AutomationSummary; run: AutomationRunSummary; log?: string | null } | null>(null);
   const [createPanelOpen, setCreatePanelOpen] = useState(false);
   const [editingAutomation, setEditingAutomation] = useState<AutomationSummary | null>(null);
+  const [notifyAutomation, setNotifyAutomation] = useState<AutomationSummary | null>(null);
   const [editForm, setEditForm] = useState({
     name: "",
     actionType: "agent" as NonNullable<AutomationSummary["actionType"]>,
@@ -9445,6 +9466,10 @@ function AutomationsPage({
     await onChange();
     await loadAutomations(true);
     notify(t("automation.deleted"), "success");
+  }
+
+  function openAutomationNotifyDialog(automation: AutomationSummary) {
+    setNotifyAutomation(automation);
   }
 
   async function runAutomation(automation: AutomationSummary, openSession = false) {
@@ -9915,6 +9940,7 @@ function AutomationsPage({
                   <Button className="icon-only" variant="outline" size="sm" type="button" title={t("automation.runAndOpen")} aria-label={t("automation.runAndOpen")} onClick={() => void runAutomation(automation, true)}><IconText icon={MessageSquare}>{t("automation.runAndOpen")}</IconText></Button>
                   {Boolean(automation.runningRuns) && <Button className="icon-only" variant="outline" size="sm" type="button" title={t("automation.stopRunningRuns")} aria-label={t("automation.stopRunningRuns")} onClick={() => void stopRunningAutomationRuns(automation)}><IconText icon={Square}>{t("automation.stopRunningRuns")}</IconText></Button>}
                   <Button className="icon-only" variant="outline" size="sm" type="button" title={t("automation.runs")} aria-label={t("automation.runs")} onClick={() => void openRuns(automation)}><IconText icon={History}>{t("automation.runs")}</IconText></Button>
+                  <Button className="icon-only" variant="outline" size="sm" type="button" title={t("automation.notify")} aria-label={t("automation.notify")} onClick={() => openAutomationNotifyDialog(automation)}><IconText icon={Bell}>{t("automation.notify")}</IconText></Button>
                   <Button className="icon-only" variant="outline" size="sm" type="button" title={t("automation.editTitle")} aria-label={t("automation.editTitle")} onClick={() => editAutomation(automation)}><IconText icon={Pencil}>{t("automation.editTitle")}</IconText></Button>
                   <Button className="icon-only" variant="outline" size="sm" type="button" title={automation.status === "active" ? t("automation.pause") : t("automation.resume")} aria-label={automation.status === "active" ? t("automation.pause") : t("automation.resume")} onClick={() => void updateAutomation(automation, { status: automation.status === "active" ? "paused" : "active" })}><IconText icon={automation.status === "active" ? Pause : Play}>{automation.status === "active" ? t("automation.pause") : t("automation.resume")}</IconText></Button>
                   <Button className="icon-only" variant="outline" size="sm" type="button" title={t("action.delete")} aria-label={t("action.delete")} onClick={() => void deleteAutomation(automation)}><IconText icon={Trash2}>{t("action.delete")}</IconText></Button>
@@ -10150,6 +10176,14 @@ function AutomationsPage({
           </form>
         </div>
       )}
+      <AutomationNotifyRuleDialog
+        automation={notifyAutomation}
+        open={Boolean(notifyAutomation)}
+        sessionToken={sessionToken}
+        t={t}
+        notify={notify}
+        onClose={() => setNotifyAutomation(null)}
+      />
     </main>
   );
 }
@@ -13036,6 +13070,15 @@ function SettingsPage({
     providerProxyMaxConcurrent: "5",
   });
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettingsResponse | null>(null);
+  const [notificationTestSettings, setNotificationTestSettings] = useState<NotificationTestSettings | null>(null);
+  const [notificationTestForm, setNotificationTestForm] = useState({
+    titleZh: "Codex Web 测试通知",
+    titleEn: "Codex Web test notification",
+    messageZh: "这是一条来自 Codex Web 的测试通知。",
+    messageEn: "This is a test notification from Codex Web.",
+    includeHelp: true,
+  });
+  const [notificationTestSettingsCollapsed, setNotificationTestSettingsCollapsed] = useState(true);
   const [platformSettings, setPlatformSettings] = useState<PlatformSettingsResponse | null>(null);
   const [notificationView, setNotificationView] = useState<"platforms" | "senders" | "recipients" | "rules" | "logs">("platforms");
   const [notificationRuleEnabledFilter, setNotificationRuleEnabledFilter] = useState("");
@@ -13085,6 +13128,7 @@ function SettingsPage({
     telegramBotToken: "",
     telegramProxyUrl: "",
     telegramTestChatId: "",
+    telegramCreateRecipient: true,
     telegramInboundEnabled: false,
     telegramAllowedChatIds: "",
     telegramAllowedUserIds: "",
@@ -13094,16 +13138,54 @@ function SettingsPage({
     weixinAccountId: "",
     weixinUserId: "",
     weixinTestChatId: "",
+    weixinCreateRecipient: true,
     weixinInboundEnabled: false,
-    weixinAllowedChatIds: "",
-    weixinAllowedUserIds: "",
-    weixinDefaultSessionId: "",
+      weixinAllowedChatIds: "",
+      weixinAllowedUserIds: "",
+      weixinDefaultSessionId: "",
+      wecomBotId: "",
+      wecomSecret: "",
+      wecomWebsocketUrl: "wss://openws.work.weixin.qq.com",
+      wecomDmPolicy: "open",
+      wecomAllowFrom: "",
+      wecomGroupPolicy: "open",
+      wecomGroupAllowFrom: "",
+      wecomCreateRecipient: true,
+      wecomInboundEnabled: true,
+      wecomDefaultSessionId: "",
+      wecomTestChatId: "",
+      qqAppId: "",
+    qqClientSecret: "",
+    qqTargetType: "user",
+    qqTargetId: "",
+    qqTestTargetId: "",
+    qqCreateRecipient: true,
+    qqInboundEnabled: false,
+    qqAllowedChatIds: "",
+    qqAllowedUserIds: "",
+    qqDefaultSessionId: "",
+    qqTestChatId: "",
+    dingtalkBotToken: "",
+    dingtalkBotSecret: "",
+    dingtalkBaseUrl: "https://oapi.dingtalk.com/robot/send",
+    feishuAppId: "",
+    feishuAppSecret: "",
+    feishuDomain: "feishu",
+    feishuInboundEnabled: false,
+    feishuTestChatId: "",
     testEmailTo: "",
     permissionAgentIds: "",
     permissionRoomIds: "",
     permissionProjectIds: "",
   });
   const [notificationEditingAccountId, setNotificationEditingAccountId] = useState("");
+  const [notificationAccountEditorOpen, setNotificationAccountEditorOpen] = useState(false);
+  const [notificationCustomTestAccount, setNotificationCustomTestAccount] = useState<NotificationAccountSummary | null>(null);
+  const [notificationCustomTestForm, setNotificationCustomTestForm] = useState({
+    title: "",
+    message: "",
+    includeHelp: true,
+  });
   const [notificationRuleForm, setNotificationRuleForm] = useState({
     name: "",
     enabled: true,
@@ -13131,12 +13213,20 @@ function SettingsPage({
     telegramSenderAccountId: "",
     weixinChatId: "",
     weixinSenderAccountId: "",
+    dingtalkSenderAccountId: "",
+    feishuChatId: "",
+    feishuSenderAccountId: "",
+    wecomChatId: "",
+    wecomSenderAccountId: "",
+    qqChatId: "",
+    qqSenderAccountId: "",
     customConfig: {} as Record<string, string>,
     permissionAgentIds: "",
     permissionRoomIds: "",
     permissionProjectIds: "",
   });
   const [notificationEditingRecipientId, setNotificationEditingRecipientId] = useState("");
+  const [notificationRecipientEditorOpen, setNotificationRecipientEditorOpen] = useState(false);
   const [notificationChannelManagerOpen, setNotificationChannelManagerOpen] = useState(false);
   const [notificationEditingChannelId, setNotificationEditingChannelId] = useState("");
   const [notificationChannelForm, setNotificationChannelForm] = useState({
@@ -13214,6 +13304,20 @@ function SettingsPage({
           providerProxyPerMinute: String(settings.providerProxyPerMinute),
           providerProxyPerHour: String(settings.providerProxyPerHour),
           providerProxyMaxConcurrent: String(settings.providerProxyMaxConcurrent),
+        });
+      })
+      .catch(() => undefined);
+    fetch("/api/settings/notification-test", { headers })
+      .then((response) => response.ok ? response.json() : null)
+      .then((settings: NotificationTestSettings | null) => {
+        if (!settings) return;
+        setNotificationTestSettings(settings);
+        setNotificationTestForm({
+          titleZh: settings.titleZh,
+          titleEn: settings.titleEn,
+          messageZh: settings.messageZh,
+          messageEn: settings.messageEn,
+          includeHelp: settings.includeHelp,
         });
       })
       .catch(() => undefined);
@@ -13362,12 +13466,56 @@ function SettingsPage({
     return (notificationSettings?.accounts ?? []).filter((account) => account.enabled && account.channelKind === "email");
   }
 
+  function feishuNotificationSenders() {
+    return (notificationSettings?.accounts ?? []).filter((account) => account.enabled && account.channelKind === "feishu");
+  }
+
   function telegramNotificationSenders() {
     return (notificationSettings?.accounts ?? []).filter((account) => account.enabled && account.channelKind === "telegram");
   }
 
   function weixinNotificationSenders() {
     return (notificationSettings?.accounts ?? []).filter((account) => account.enabled && account.channelKind === "weixin");
+  }
+
+  function dingtalkNotificationSenders() {
+    return (notificationSettings?.accounts ?? []).filter((account) => account.enabled && account.channelKind === "dingtalk");
+  }
+
+  function wecomNotificationSenders() {
+    return (notificationSettings?.accounts ?? []).filter((account) => account.enabled && account.channelKind === "wecom");
+  }
+
+  function qqNotificationSenders() {
+    return (notificationSettings?.accounts ?? []).filter((account) => account.enabled && account.channelKind === "qq");
+  }
+
+  function notificationSenderAccountsForKind(kind: NotificationAccountSummary["channelKind"]) {
+    if (kind === "email") return emailNotificationSenders();
+    if (kind === "feishu") return feishuNotificationSenders();
+    if (kind === "telegram") return telegramNotificationSenders();
+    if (kind === "weixin") return weixinNotificationSenders();
+    if (kind === "dingtalk") return dingtalkNotificationSenders();
+    if (kind === "wecom") return wecomNotificationSenders();
+    if (kind === "qq") return qqNotificationSenders();
+    return [];
+  }
+
+  function notificationDefaultRecipientSenderId(kind: NotificationRecipientSummary["kind"], senderAccountId?: string | null) {
+    if (senderAccountId && notificationSenderAccountsForKind(kind).some((account) => account.id === senderAccountId)) return senderAccountId;
+    const senders = notificationSenderAccountsForKind(kind);
+    return senders[0]?.id ?? "";
+  }
+
+  function notificationChannelKindLabel(kind: NotificationAccountSummary["channelKind"] | NotificationRecipientSummary["kind"]) {
+    if (kind === "email") return t("settings.notificationKindEmail");
+    if (kind === "telegram") return t("settings.notificationKindTelegram");
+    if (kind === "weixin") return t("settings.notificationKindWeixin");
+    if (kind === "wecom") return t("settings.notificationKindWeCom");
+    if (kind === "dingtalk") return t("settings.notificationKindDingTalk");
+    if (kind === "feishu") return t("settings.notificationKindFeishu");
+    if (kind === "qq") return t("settings.notificationKindQQ");
+    return t("settings.notificationKindWebhook");
   }
 
   function csvIds(value: string) {
@@ -13388,6 +13536,18 @@ function SettingsPage({
     if (field === "icon") return t("settings.notificationBarkIcon");
     if (field === "botToken") return t("settings.notificationTelegramBotToken");
     if (field === "baseUrl") return t("settings.notificationWeixinBaseUrl");
+    if (field === "botId") return t("settings.notificationWeComBotId");
+    if (field === "secret") return t("settings.notificationWeComSecret");
+    if (field === "websocketUrl") return t("settings.notificationWeComWebsocketUrl");
+    if (field === "dmPolicy") return t("settings.notificationWeComDmPolicy");
+    if (field === "allowFrom") return t("settings.notificationWeComAllowFrom");
+    if (field === "groupPolicy") return t("settings.notificationWeComGroupPolicy");
+    if (field === "groupAllowFrom") return t("settings.notificationWeComGroupAllowFrom");
+    if (field === "appId") return t("settings.notificationQQAppId");
+    if (field === "clientSecret") return t("settings.notificationQQClientSecret");
+    if (field === "targetType") return t("settings.notificationQQTargetType");
+    if (field === "targetId") return t("settings.notificationQQTargetId");
+    if (field === "botSecret") return t("settings.notificationDingtalkBotSecret");
     return field;
   }
 
@@ -13466,6 +13626,54 @@ function SettingsPage({
         testChatId: notificationAccountForm.weixinTestChatId,
       };
     }
+    if (notificationAccountForm.channelKind === "wecom") {
+      return {
+        botId: notificationAccountForm.wecomBotId,
+        secret: notificationAccountForm.wecomSecret,
+        websocketUrl: notificationAccountForm.wecomWebsocketUrl,
+        dmPolicy: notificationAccountForm.wecomDmPolicy,
+        allowFrom: csvIds(notificationAccountForm.wecomAllowFrom),
+        groupPolicy: notificationAccountForm.wecomGroupPolicy,
+        groupAllowFrom: csvIds(notificationAccountForm.wecomGroupAllowFrom),
+        inboundEnabled: notificationAccountForm.wecomInboundEnabled,
+        defaultSessionId: notificationAccountForm.wecomDefaultSessionId,
+        testChatId: notificationAccountForm.wecomTestChatId,
+        language: notificationAccountForm.language,
+      };
+    }
+    if (notificationAccountForm.channelKind === "qq") {
+      return {
+        appId: notificationAccountForm.qqAppId,
+        clientSecret: notificationAccountForm.qqClientSecret,
+        targetType: notificationAccountForm.qqTargetType,
+        targetId: notificationAccountForm.qqTargetId,
+        testTargetId: notificationAccountForm.qqTestTargetId,
+        language: notificationAccountForm.language,
+        inboundEnabled: notificationAccountForm.qqInboundEnabled,
+        allowedChatIds: csvIds(notificationAccountForm.qqAllowedChatIds),
+        allowedUserIds: csvIds(notificationAccountForm.qqAllowedUserIds),
+        defaultSessionId: notificationAccountForm.qqDefaultSessionId,
+        testChatId: notificationAccountForm.qqTestChatId,
+      };
+    }
+    if (notificationAccountForm.channelKind === "dingtalk") {
+      return {
+        botToken: notificationAccountForm.dingtalkBotToken,
+        botSecret: notificationAccountForm.dingtalkBotSecret,
+        baseUrl: notificationAccountForm.dingtalkBaseUrl,
+        language: notificationAccountForm.language,
+      };
+    }
+    if (notificationAccountForm.channelKind === "feishu") {
+      return {
+        appId: notificationAccountForm.feishuAppId,
+        appSecret: notificationAccountForm.feishuAppSecret,
+        domain: notificationAccountForm.feishuDomain,
+        inboundEnabled: notificationAccountForm.feishuInboundEnabled,
+        testChatId: notificationAccountForm.feishuTestChatId,
+        language: notificationAccountForm.language,
+      };
+    }
     if (notificationAccountForm.channelKind === "webhook") {
       const headers = Object.fromEntries(notificationAccountForm.webhookHeaders.split("\n").map((line) => {
         const index = line.indexOf(":");
@@ -13490,6 +13698,7 @@ function SettingsPage({
 
   function resetNotificationAccountForm() {
     setNotificationEditingAccountId("");
+    setNotificationAccountEditorOpen(false);
     setNotificationAccountForm({
       name: "",
       channelId: "email",
@@ -13527,6 +13736,7 @@ function SettingsPage({
       telegramBotToken: "",
       telegramProxyUrl: "",
       telegramTestChatId: "",
+      telegramCreateRecipient: true,
       telegramInboundEnabled: false,
       telegramAllowedChatIds: "",
       telegramAllowedUserIds: "",
@@ -13536,10 +13746,41 @@ function SettingsPage({
       weixinAccountId: "",
       weixinUserId: "",
       weixinTestChatId: "",
+      weixinCreateRecipient: true,
       weixinInboundEnabled: false,
       weixinAllowedChatIds: "",
       weixinAllowedUserIds: "",
       weixinDefaultSessionId: "",
+      wecomBotId: "",
+      wecomSecret: "",
+      wecomWebsocketUrl: "wss://openws.work.weixin.qq.com",
+      wecomDmPolicy: "open",
+      wecomAllowFrom: "",
+      wecomGroupPolicy: "open",
+      wecomGroupAllowFrom: "",
+      wecomCreateRecipient: true,
+      wecomInboundEnabled: true,
+      wecomDefaultSessionId: "",
+      wecomTestChatId: "",
+      qqAppId: "",
+      qqClientSecret: "",
+      qqTargetType: "user",
+      qqTargetId: "",
+      qqTestTargetId: "",
+      qqCreateRecipient: true,
+      qqInboundEnabled: false,
+      qqAllowedChatIds: "",
+      qqAllowedUserIds: "",
+      qqDefaultSessionId: "",
+      qqTestChatId: "",
+      dingtalkBotToken: "",
+      dingtalkBotSecret: "",
+      dingtalkBaseUrl: "https://oapi.dingtalk.com/robot/send",
+      feishuAppId: "",
+      feishuAppSecret: "",
+      feishuDomain: "feishu",
+      feishuInboundEnabled: false,
+      feishuTestChatId: "",
       testEmailTo: "",
       permissionAgentIds: "",
       permissionRoomIds: "",
@@ -13551,9 +13792,10 @@ function SettingsPage({
     const config = account.config as Record<string, unknown>;
     const channelKind = notificationAccountKind(account);
     setNotificationEditingAccountId(account.id);
+    setNotificationAccountEditorOpen(true);
     setNotificationAccountForm({
       name: account.name,
-      channelId: account.channelId ?? channelKind,
+      channelId: account.channelId ?? (channelKind === "feishu" ? "feishu-bot" : channelKind === "wecom" ? "wecom-bot" : channelKind === "qq" ? "qq-bot" : channelKind),
       channelKind,
       language: (String(config.language ?? "") === "en-US" ? "en-US" : "zh-CN"),
       enabled: account.enabled,
@@ -13577,7 +13819,7 @@ function SettingsPage({
       emailPassword: String(config.password ?? ""),
       emailFromName: String(config.fromName ?? "Codex Web"),
       emailFromEmail: String(config.fromEmail ?? ""),
-      emailCreateRecipient: false,
+      emailCreateRecipient: true,
       emailInboundEnabled: config.inboundEnabled === true,
       emailImapHost: String(config.imapHost ?? config.host ?? ""),
       emailImapPort: String(config.imapPort ?? "993"),
@@ -13591,6 +13833,7 @@ function SettingsPage({
       telegramBotToken: String(config.botToken ?? ""),
       telegramProxyUrl: String(config.proxyUrl ?? ""),
       telegramTestChatId: String(config.testChatId ?? ""),
+      telegramCreateRecipient: true,
       telegramInboundEnabled: config.inboundEnabled === true,
       telegramAllowedChatIds: configListToCsv(config.allowedChatIds),
       telegramAllowedUserIds: configListToCsv(config.allowedUserIds),
@@ -13600,10 +13843,41 @@ function SettingsPage({
       weixinAccountId: String(config.accountId ?? ""),
       weixinUserId: String(config.userId ?? ""),
       weixinTestChatId: String(config.testChatId ?? ""),
+      weixinCreateRecipient: true,
       weixinInboundEnabled: config.inboundEnabled === true,
       weixinAllowedChatIds: configListToCsv(config.allowedChatIds),
       weixinAllowedUserIds: configListToCsv(config.allowedUserIds),
       weixinDefaultSessionId: String(config.defaultSessionId ?? ""),
+      wecomBotId: String(config.botId ?? ""),
+      wecomSecret: String(config.secret ?? config.botSecret ?? ""),
+      wecomWebsocketUrl: String(config.websocketUrl ?? config.websocket_url ?? "wss://openws.work.weixin.qq.com"),
+      wecomDmPolicy: String(config.dmPolicy ?? "open"),
+      wecomAllowFrom: configListToCsv(config.allowFrom ?? config.allow_from),
+      wecomGroupPolicy: String(config.groupPolicy ?? "open"),
+      wecomGroupAllowFrom: configListToCsv(config.groupAllowFrom ?? config.group_allow_from),
+      wecomCreateRecipient: true,
+      wecomInboundEnabled: config.inboundEnabled === true,
+      wecomDefaultSessionId: String(config.defaultSessionId ?? ""),
+      wecomTestChatId: String(config.testChatId ?? ""),
+      qqAppId: String(config.appId ?? ""),
+      qqClientSecret: String(config.clientSecret ?? config.appSecret ?? ""),
+      qqTargetType: String(config.targetType ?? "user"),
+      qqTargetId: String(config.targetId ?? config.openId ?? ""),
+      qqTestTargetId: String(config.testTargetId ?? config.testChatId ?? config.targetId ?? config.openId ?? ""),
+      qqCreateRecipient: true,
+      qqInboundEnabled: config.inboundEnabled === true,
+      qqAllowedChatIds: configListToCsv(config.allowedChatIds),
+      qqAllowedUserIds: configListToCsv(config.allowedUserIds),
+      qqDefaultSessionId: String(config.defaultSessionId ?? ""),
+      qqTestChatId: String(config.testChatId ?? ""),
+      dingtalkBotToken: String(config.botToken ?? config.accessToken ?? ""),
+      dingtalkBotSecret: String(config.botSecret ?? config.secret ?? ""),
+      dingtalkBaseUrl: String(config.baseUrl ?? "https://oapi.dingtalk.com/robot/send"),
+      feishuAppId: String(config.appId ?? ""),
+      feishuAppSecret: String(config.appSecret ?? ""),
+      feishuDomain: String(config.domain ?? "feishu"),
+      feishuInboundEnabled: config.inboundEnabled === true,
+      feishuTestChatId: String(config.testChatId ?? ""),
       ...notificationPermissionsToForm(account.permissions),
     });
   }
@@ -13751,6 +14025,10 @@ function SettingsPage({
     if (notificationRecipientForm.kind === "email") return { email: notificationRecipientForm.email };
     if (notificationRecipientForm.kind === "telegram") return { chatId: notificationRecipientForm.telegramChatId };
     if (notificationRecipientForm.kind === "weixin") return { chatId: notificationRecipientForm.weixinChatId };
+    if (notificationRecipientForm.kind === "dingtalk") return {};
+    if (notificationRecipientForm.kind === "feishu") return { chatId: notificationRecipientForm.feishuChatId };
+    if (notificationRecipientForm.kind === "wecom") return { chatId: notificationRecipientForm.wecomChatId };
+    if (notificationRecipientForm.kind === "qq") return { chatId: notificationRecipientForm.qqChatId };
     const channel = notificationSettings?.channels.find((item) => item.id === notificationRecipientForm.channelId);
     if (channel?.id && channel.id !== "webhook") return notificationRecipientForm.customConfig;
     return { url: notificationRecipientForm.webhookUrl, method: "POST", headers: {} };
@@ -13758,6 +14036,7 @@ function SettingsPage({
 
   function resetNotificationRecipientForm() {
     setNotificationEditingRecipientId("");
+    setNotificationRecipientEditorOpen(false);
     setNotificationRecipientForm({
       name: "",
       kind: "email",
@@ -13773,6 +14052,13 @@ function SettingsPage({
       telegramSenderAccountId: "",
       weixinChatId: "",
       weixinSenderAccountId: "",
+      dingtalkSenderAccountId: "",
+      feishuChatId: "",
+      feishuSenderAccountId: "",
+      wecomChatId: "",
+      wecomSenderAccountId: "",
+      qqChatId: "",
+      qqSenderAccountId: "",
       customConfig: {},
       permissionAgentIds: "",
       permissionRoomIds: "",
@@ -13782,12 +14068,14 @@ function SettingsPage({
 
   function editNotificationRecipient(recipient: NotificationRecipientSummary) {
     const config = recipient.config as Record<string, unknown>;
+    const senderAccountId = notificationSenderAccountsForKind(recipient.kind).some((account) => account.id === recipient.senderAccountId) ? recipient.senderAccountId ?? "" : "";
     setNotificationEditingRecipientId(recipient.id);
+    setNotificationRecipientEditorOpen(true);
     setNotificationRecipientForm({
       name: recipient.name,
       kind: recipient.kind,
       enabled: recipient.enabled,
-      senderAccountId: recipient.senderAccountId ?? "",
+      senderAccountId,
       channelId: recipient.channelId ?? "webhook",
       email: String(config.email ?? ""),
       webhookUrl: String(config.url ?? ""),
@@ -13795,9 +14083,16 @@ function SettingsPage({
       barkDeviceKey: String(config.deviceKey ?? ""),
       barkGroup: String(config.group ?? "Codex Web"),
       telegramChatId: String(config.chatId ?? ""),
-      telegramSenderAccountId: recipient.senderAccountId ?? "",
+      telegramSenderAccountId: senderAccountId,
       weixinChatId: String(config.chatId ?? ""),
-      weixinSenderAccountId: recipient.senderAccountId ?? "",
+      weixinSenderAccountId: senderAccountId,
+      dingtalkSenderAccountId: senderAccountId,
+      feishuChatId: String(config.chatId ?? ""),
+      feishuSenderAccountId: senderAccountId,
+      wecomChatId: String(config.chatId ?? ""),
+      wecomSenderAccountId: senderAccountId,
+      qqChatId: String(config.chatId ?? ""),
+      qqSenderAccountId: senderAccountId,
       customConfig: Object.fromEntries(Object.entries(config).map(([key, value]) => [key, String(value ?? "")])),
       ...notificationPermissionsToForm(recipient.permissions),
     });
@@ -13815,12 +14110,20 @@ function SettingsPage({
           kind: notificationRecipientForm.kind,
           enabled: notificationRecipientForm.enabled,
           senderAccountId: notificationRecipientForm.kind === "email"
-            ? notificationRecipientForm.senderAccountId || (emailNotificationSenders().length === 1 ? emailNotificationSenders()[0].id : null)
+            ? notificationDefaultRecipientSenderId("email", notificationRecipientForm.senderAccountId)
             : notificationRecipientForm.kind === "telegram"
-              ? notificationRecipientForm.telegramSenderAccountId || (telegramNotificationSenders().length === 1 ? telegramNotificationSenders()[0].id : null)
+              ? notificationDefaultRecipientSenderId("telegram", notificationRecipientForm.telegramSenderAccountId)
               : notificationRecipientForm.kind === "weixin"
-                ? notificationRecipientForm.weixinSenderAccountId || (weixinNotificationSenders().length === 1 ? weixinNotificationSenders()[0].id : null)
-              : null,
+                ? notificationDefaultRecipientSenderId("weixin", notificationRecipientForm.weixinSenderAccountId)
+                : notificationRecipientForm.kind === "dingtalk"
+                  ? notificationDefaultRecipientSenderId("dingtalk", notificationRecipientForm.dingtalkSenderAccountId)
+                : notificationRecipientForm.kind === "feishu"
+                  ? notificationDefaultRecipientSenderId("feishu", notificationRecipientForm.feishuSenderAccountId)
+                : notificationRecipientForm.kind === "wecom"
+                  ? notificationDefaultRecipientSenderId("wecom", notificationRecipientForm.wecomSenderAccountId)
+                  : notificationRecipientForm.kind === "qq"
+                    ? notificationDefaultRecipientSenderId("qq", notificationRecipientForm.qqSenderAccountId)
+                    : null,
           channelId: notificationRecipientForm.kind === "webhook" ? notificationRecipientForm.channelId : null,
           config: notificationRecipientConfig(),
           permissions: notificationPermissionsFromForm(notificationRecipientForm),
@@ -13886,16 +14189,34 @@ function SettingsPage({
       });
       if (!response.ok) throw new Error("notification_account_failed");
       const account = await response.json() as NotificationAccountSummary;
-      if (!notificationEditingAccountId && notificationAccountForm.channelKind === "email" && notificationAccountForm.emailCreateRecipient && notificationAccountForm.emailFromEmail.trim()) {
+      const createRecipient = !notificationEditingAccountId && (
+        (notificationAccountForm.channelKind === "email" && notificationAccountForm.emailCreateRecipient && notificationAccountForm.emailFromEmail.trim()) ||
+        (notificationAccountForm.channelKind === "telegram" && notificationAccountForm.telegramCreateRecipient && notificationAccountForm.telegramTestChatId.trim()) ||
+        (notificationAccountForm.channelKind === "weixin" && notificationAccountForm.weixinCreateRecipient && notificationAccountForm.weixinTestChatId.trim()) ||
+        (notificationAccountForm.channelKind === "wecom" && notificationAccountForm.wecomCreateRecipient && notificationAccountForm.wecomTestChatId.trim()) ||
+        (notificationAccountForm.channelKind === "qq" && notificationAccountForm.qqCreateRecipient && (notificationAccountForm.qqTestChatId.trim() || notificationAccountForm.qqTestTargetId.trim()))
+      );
+      const existingLinkedRecipient = (notificationSettings?.recipients ?? []).some((recipient) => recipient.senderAccountId === account.id && recipient.kind === notificationAccountForm.channelKind);
+      if (createRecipient && !existingLinkedRecipient) {
+        const senderAccountId = account.id;
+        const config = notificationAccountForm.channelKind === "email"
+          ? { email: notificationAccountForm.emailFromEmail.trim() }
+          : notificationAccountForm.channelKind === "telegram"
+            ? { chatId: notificationAccountForm.telegramTestChatId.trim() }
+            : notificationAccountForm.channelKind === "weixin"
+              ? { chatId: notificationAccountForm.weixinTestChatId.trim() }
+              : notificationAccountForm.channelKind === "wecom"
+                ? { chatId: notificationAccountForm.wecomTestChatId.trim() }
+                : { chatId: notificationAccountForm.qqTestChatId.trim() || notificationAccountForm.qqTestTargetId.trim() };
         await fetch("/api/notifications/recipients", {
           method: "POST",
           headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
           body: JSON.stringify({
-            name: notificationAccountForm.name || notificationAccountForm.emailFromEmail,
-            kind: "email",
+            name: notificationAccountForm.name || notificationAccountForm.emailFromEmail || account.name,
+            kind: notificationAccountForm.channelKind,
             enabled: true,
-            senderAccountId: account.id,
-            config: { email: notificationAccountForm.emailFromEmail.trim() },
+            senderAccountId,
+            config,
           }),
         });
       }
@@ -13909,13 +14230,27 @@ function SettingsPage({
     }
   }
 
+  function notificationAccountTestTarget(account: NotificationAccountSummary) {
+    const accountConfig = account.config && typeof account.config === "object" ? account.config as Record<string, unknown> : {};
+    const chatId = account.channelKind === "weixin"
+      ? notificationAccountForm.weixinTestChatId.trim() || String(accountConfig.testChatId ?? accountConfig.userId ?? accountConfig.accountId ?? "").trim()
+      : account.channelKind === "wecom"
+        ? notificationAccountForm.wecomTestChatId.trim() || String(accountConfig.testChatId ?? "").trim()
+      : account.channelKind === "feishu"
+        ? notificationAccountForm.feishuTestChatId.trim() || String(accountConfig.testChatId ?? "").trim()
+        : account.channelKind === "qq"
+          ? notificationAccountForm.qqTestChatId.trim() || notificationAccountForm.qqTestTargetId.trim() || String(accountConfig.testChatId ?? accountConfig.testTargetId ?? accountConfig.targetId ?? accountConfig.openId ?? "").trim()
+          : notificationAccountForm.telegramTestChatId.trim() || String(accountConfig.testChatId ?? "").trim();
+    return {
+      emailTo: notificationAccountForm.testEmailTo.split(",").map((item) => item.trim()).filter(Boolean),
+      chatId,
+    };
+  }
+
   async function testNotificationAccount(account: NotificationAccountSummary) {
     setBusy(`notification-test:${account.id}`);
     try {
-      const emailTo = notificationAccountForm.testEmailTo.split(",").map((item) => item.trim()).filter(Boolean);
-      const chatId = notificationAccountForm.channelKind === "weixin"
-        ? notificationAccountForm.weixinTestChatId.trim()
-        : notificationAccountForm.telegramTestChatId.trim();
+      const { emailTo, chatId } = notificationAccountTestTarget(account);
       const response = await fetch(`/api/notifications/accounts/${account.id}/test`, {
         method: "POST",
         headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
@@ -13931,17 +14266,66 @@ function SettingsPage({
     }
   }
 
+  async function sendCustomNotificationTest(event: React.FormEvent) {
+    event.preventDefault();
+    const account = notificationCustomTestAccount;
+    if (!account) return;
+    setBusy(`notification-custom-test:${account.id}`);
+    try {
+      const { emailTo, chatId } = notificationAccountTestTarget(account);
+      const response = await fetch(`/api/notifications/accounts/${account.id}/test`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          emailTo,
+          chatId: chatId || undefined,
+          title: notificationCustomTestForm.title.trim() || undefined,
+          message: notificationCustomTestForm.message.trim() || undefined,
+          includeHelp: notificationCustomTestForm.includeHelp,
+        }),
+      });
+      await loadNotifications();
+      notify(response.ok ? t("settings.notificationTestSent") : t("settings.notificationTestFailed"), response.ok ? "success" : "error");
+      if (response.ok) {
+        setNotificationCustomTestAccount(null);
+        setNotificationCustomTestForm({ title: "", message: "", includeHelp: true });
+      }
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function deleteNotificationAccount(account: NotificationAccountSummary) {
-    const confirmed = await dialog.confirm({
-      title: t("settings.notificationDeleteAccountConfirm"),
-      message: account.name,
-      confirmLabel: t("action.delete"),
-      danger: true,
-    });
-    if (!confirmed) return;
+    const linkedRecipients = (notificationSettings?.recipients ?? []).filter((recipient) => recipient.senderAccountId === account.id);
+    let deleteLinkedRecipients = false;
+    if (linkedRecipients.length) {
+      const decision = await dialog.confirmWithCheckbox({
+        title: t("settings.notificationDeleteAccountConfirm"),
+        message: t("settings.notificationDeleteAccountLinkedMessage")
+          .replace("{name}", account.name)
+          .replace("{count}", String(linkedRecipients.length)),
+        checkboxLabel: t("settings.notificationDeleteAccountLinkedCheckbox").replace("{count}", String(linkedRecipients.length)),
+        checkboxDefaultChecked: false,
+        confirmLabel: t("action.delete"),
+        danger: true,
+      });
+      if (!decision.confirmed) return;
+      deleteLinkedRecipients = decision.checked;
+    } else {
+      const confirmed = await dialog.confirm({
+        title: t("settings.notificationDeleteAccountConfirm"),
+        message: account.name,
+        confirmLabel: t("action.delete"),
+        danger: true,
+      });
+      if (!confirmed) return;
+    }
     setBusy(`notification-account-delete:${account.id}`);
     try {
-      await fetch(`/api/notifications/accounts/${account.id}`, { method: "DELETE", headers: { authorization: `Bearer ${sessionToken}` } });
+      const params = new URLSearchParams();
+      if (deleteLinkedRecipients) params.set("deleteLinkedRecipients", "true");
+      const suffix = params.toString() ? `?${params.toString()}` : "";
+      await fetch(`/api/notifications/accounts/${account.id}${suffix}`, { method: "DELETE", headers: { authorization: `Bearer ${sessionToken}` } });
       await loadNotifications();
     } finally {
       setBusy("");
@@ -14101,9 +14485,10 @@ function SettingsPage({
     const account = metadata.account && typeof metadata.account === "object" ? metadata.account as Record<string, unknown> : {};
     const recipient = metadata.recipient && typeof metadata.recipient === "object" ? metadata.recipient as Record<string, unknown> : {};
     const target = metadata.target && typeof metadata.target === "object" ? metadata.target as Record<string, unknown> : {};
+    const targetKind = (recipient.kind ?? account.kind) as NotificationAccountSummary["channelKind"] | NotificationRecipientSummary["kind"] | undefined;
     return {
       targetName: recipient.name ? String(recipient.name) : account.name ? String(account.name) : delivery.accountId ?? "-",
-      targetKind: recipient.kind ? String(recipient.kind) : account.kind ? String(account.kind) : "-",
+      targetKind: targetKind ? notificationChannelKindLabel(targetKind) : "-",
       accountName: account.name ? String(account.name) : delivery.accountId ?? "-",
       responseStatus: delivery.responseStatus ?? "-",
       attempts: delivery.attempts,
@@ -14894,6 +15279,43 @@ function SettingsPage({
       notify(t("settings.rateLimitSaved"), "success");
     } catch {
       notify(t("settings.rateLimitSaveFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function saveNotificationTestSettings(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy("notification-test-settings");
+    try {
+      const body: UpdateNotificationTestSettingsRequest = {
+        titleZh: notificationTestForm.titleZh,
+        titleEn: notificationTestForm.titleEn,
+        messageZh: notificationTestForm.messageZh,
+        messageEn: notificationTestForm.messageEn,
+        includeHelp: notificationTestForm.includeHelp,
+      };
+      const response = await fetch("/api/settings/notification-test", {
+        method: "PATCH",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) {
+        notify(t("settings.notificationTestSettingsSaveFailed"), "error");
+        return;
+      }
+      const settings = (await response.json()) as NotificationTestSettings;
+      setNotificationTestSettings(settings);
+      setNotificationTestForm({
+        titleZh: settings.titleZh,
+        titleEn: settings.titleEn,
+        messageZh: settings.messageZh,
+        messageEn: settings.messageEn,
+        includeHelp: settings.includeHelp,
+      });
+      notify(t("settings.notificationTestSettingsSaved"), "success");
+    } catch {
+      notify(t("settings.notificationTestSettingsSaveFailed"), "error");
     } finally {
       setBusy("");
     }
@@ -16006,9 +16428,58 @@ function SettingsPage({
           {notificationView === "platforms" && <NotificationPlatformsPanel platformSettings={platformSettings} t={t} />}
           {notificationView === "senders" && (
             <>
-          <form className="notification-card" onSubmit={createNotificationAccount}>
-            <strong>{t("settings.notificationAccountsTitle")}</strong>
-            <span>{t("settings.notificationAccountsHelp")}</span>
+          <form className="notification-card" onSubmit={saveNotificationTestSettings}>
+            <div className="environment-card-head">
+              <div>
+                <strong>{t("settings.notificationTestSettingsTitle")}</strong>
+                <span>{t("settings.notificationTestSettingsHelp")}</span>
+              </div>
+              <button className="ghost-button icon-only" type="button" title={notificationTestSettingsCollapsed ? t("action.open") : t("action.collapse")} aria-label={notificationTestSettingsCollapsed ? t("action.open") : t("action.collapse")} onClick={() => setNotificationTestSettingsCollapsed((current) => !current)}>
+                <IconText icon={notificationTestSettingsCollapsed ? ChevronDown : ChevronUp}>{notificationTestSettingsCollapsed ? t("action.open") : t("action.collapse")}</IconText>
+              </button>
+            </div>
+            {!notificationTestSettingsCollapsed && (
+              <>
+                <div className="backup-scope-grid">
+                  <label>
+                    <span>{t("settings.notificationTestTitleZh")}</span>
+                    <input name="notification-test-title-zh" className="search-input" value={notificationTestForm.titleZh} onChange={(event) => setNotificationTestForm((current) => ({ ...current, titleZh: event.target.value }))} required />
+                  </label>
+                  <label>
+                    <span>{t("settings.notificationTestTitleEn")}</span>
+                    <input name="notification-test-title-en" className="search-input" value={notificationTestForm.titleEn} onChange={(event) => setNotificationTestForm((current) => ({ ...current, titleEn: event.target.value }))} required />
+                  </label>
+                </div>
+                <label>
+                  <span>{t("settings.notificationTestMessageZh")}</span>
+                  <textarea name="notification-test-message-zh" className="search-input" rows={3} value={notificationTestForm.messageZh} onChange={(event) => setNotificationTestForm((current) => ({ ...current, messageZh: event.target.value }))} required />
+                </label>
+                <label>
+                  <span>{t("settings.notificationTestMessageEn")}</span>
+                  <textarea name="notification-test-message-en" className="search-input" rows={3} value={notificationTestForm.messageEn} onChange={(event) => setNotificationTestForm((current) => ({ ...current, messageEn: event.target.value }))} required />
+                </label>
+                <label className="checkbox-row">
+                  <input name="notification-test-include-help" type="checkbox" checked={notificationTestForm.includeHelp} onChange={(event) => setNotificationTestForm((current) => ({ ...current, includeHelp: event.target.checked }))} />
+                  <span>{t("settings.notificationCustomTestIncludeHelp")}</span>
+                </label>
+                {notificationTestSettings && <span className="subtle">{formatShortDate(notificationTestSettings.updatedAt)}</span>}
+                <div className="settings-actions">
+                  <button className="ghost-button" type="submit" disabled={busy === "notification-test-settings"}><IconText icon={Save}>{t("action.save")}</IconText></button>
+                </div>
+              </>
+            )}
+          </form>
+          {notificationAccountEditorOpen && (
+            <div className="dialog-layer" role="presentation">
+              <button className="dialog-backdrop" type="button" aria-label={t("action.close")} onClick={resetNotificationAccountForm} />
+              <form className="dialog-card notification-editor-dialog" role="dialog" aria-modal="true" aria-labelledby="notification-account-editor-title" onSubmit={createNotificationAccount}>
+            <div className="dialog-head">
+              <div>
+                <strong id="notification-account-editor-title">{notificationEditingAccountId ? t("action.saveChanges") : t("settings.notificationAddAccount")}</strong>
+                <p>{t("settings.notificationAccountsHelp")}</p>
+              </div>
+              <button className="drawer-close" type="button" aria-label={t("action.close")} onClick={resetNotificationAccountForm}><X size={16} /></button>
+            </div>
             <label>
               <span>{t("settings.notificationAccountName")}</span>
               <input name="notification-account-name" className="search-input" value={notificationAccountForm.name} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, name: event.target.value }))} required />
@@ -16017,12 +16488,16 @@ function SettingsPage({
               <span>{t("settings.notificationSenderType")}</span>
               <select name="notification-account-channel-kind" className="search-input" value={notificationAccountForm.channelKind} disabled={Boolean(notificationEditingAccountId)} onChange={(event) => {
                 const channelKind = event.target.value as NotificationAccountSummary["channelKind"];
-                setNotificationAccountForm((current) => ({ ...current, channelKind, channelId: channelKind }));
+                setNotificationAccountForm((current) => ({ ...current, channelKind, channelId: channelKind === "feishu" ? "feishu-bot" : channelKind === "wecom" ? "wecom-bot" : channelKind === "qq" ? "qq-bot" : channelKind }));
               }}>
-                <option value="email">Email SMTP</option>
-                <option value="telegram">Telegram Bot</option>
-                <option value="weixin">Weixin Bot</option>
-                <option value="webhook">Webhook</option>
+                <option value="email">{notificationChannelKindLabel("email")}</option>
+                <option value="telegram">{notificationChannelKindLabel("telegram")}</option>
+                <option value="weixin">{notificationChannelKindLabel("weixin")}</option>
+                <option value="wecom">{notificationChannelKindLabel("wecom")}</option>
+                <option value="dingtalk">{notificationChannelKindLabel("dingtalk")}</option>
+                <option value="feishu">{notificationChannelKindLabel("feishu")}</option>
+                <option value="qq">{notificationChannelKindLabel("qq")}</option>
+                <option value="webhook">{notificationChannelKindLabel("webhook")}</option>
               </select>
             </label>
             <label className="checkbox-row">
@@ -16041,7 +16516,7 @@ function SettingsPage({
         <span>{t("settings.notificationAllowedProjects")}</span>
         <input name="notification-account-allowed-projects" className="search-input" value={notificationAccountForm.permissionProjectIds} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, permissionProjectIds: event.target.value }))} placeholder="project-id-1, project-id-2" />
       </label>
-      {(notificationAccountForm.channelKind === "telegram" || notificationAccountForm.channelKind === "weixin") && (
+      {(notificationAccountForm.channelKind === "telegram" || notificationAccountForm.channelKind === "weixin" || notificationAccountForm.channelKind === "dingtalk" || notificationAccountForm.channelKind === "feishu" || notificationAccountForm.channelKind === "qq") && (
         <label>
           <span>{t("common.language")}</span>
           <select name="notification-account-language" className="search-input" value={notificationAccountForm.language} onChange={(event) => setNotificationAccountForm((current) => ({ ...current, language: event.target.value as Locale }))}>
@@ -16050,10 +16525,10 @@ function SettingsPage({
         </label>
       )}
             {notificationAccountForm.channelKind === "email" && (
-              <EmailNotificationAccountPanel form={notificationAccountForm} setForm={setNotificationAccountForm} t={t} showCreateRecipient={!notificationEditingAccountId} />
+              <EmailNotificationAccountPanel form={notificationAccountForm} setForm={setNotificationAccountForm} t={t} showCreateRecipient />
             )}
             {notificationAccountForm.channelKind === "telegram" && (
-              <TelegramNotificationAccountPanel form={notificationAccountForm} setForm={setNotificationAccountForm} t={t} />
+              <TelegramNotificationAccountPanel form={notificationAccountForm} setForm={setNotificationAccountForm} t={t} showCreateRecipient />
             )}
             {notificationAccountForm.channelKind === "weixin" && (
               <WeixinNotificationAccountPanel
@@ -16063,38 +16538,54 @@ function SettingsPage({
                 sessionToken={sessionToken}
                 t={t}
                 loadNotifications={loadNotifications}
+                showCreateRecipient
               />
+            )}
+            {notificationAccountForm.channelKind === "wecom" && (
+              <WeComNotificationAccountPanel form={notificationAccountForm} setForm={setNotificationAccountForm} t={t} showCreateRecipient />
+            )}
+            {notificationAccountForm.channelKind === "dingtalk" && (
+              <DingTalkNotificationAccountPanel form={notificationAccountForm} setForm={setNotificationAccountForm} t={t} />
+            )}
+            {notificationAccountForm.channelKind === "feishu" && (
+              <FeishuNotificationAccountPanel form={notificationAccountForm} setForm={setNotificationAccountForm} t={t} />
+            )}
+            {notificationAccountForm.channelKind === "qq" && (
+              <QQNotificationAccountPanel form={notificationAccountForm} setForm={setNotificationAccountForm} t={t} showCreateRecipient />
             )}
             {notificationAccountForm.channelKind === "webhook" && (
               <WebhookNotificationAccountPanel form={notificationAccountForm} setForm={setNotificationAccountForm} t={t} />
             )}
             <div className="settings-actions">
               <button className="ghost-button" type="submit" disabled={busy === "notification-account"}><IconText icon={notificationEditingAccountId ? Save : Plus}>{notificationEditingAccountId ? t("action.saveChanges") : t("settings.notificationAddAccount")}</IconText></button>
-              {notificationEditingAccountId && <button className="ghost-button" type="button" onClick={resetNotificationAccountForm}>{t("action.cancel")}</button>}
+              <button className="ghost-button" type="button" onClick={resetNotificationAccountForm}>{t("action.cancel")}</button>
               <button className="ghost-button" type="button" onClick={() => void loadNotifications()}><IconText icon={RefreshCw}>{t("action.refresh")}</IconText></button>
             </div>
           </form>
-          <div className="notification-card">
-            <div className="filter-toolbar compact-filter-toolbar">
-              <select name="notification-rule-enabled-filter" className="filter-select" value={notificationRuleEnabledFilter} onChange={(event) => setNotificationRuleEnabledFilter(event.target.value)}>
-                <option value="">{t("session.allStatuses")}</option>
-                <option value="true">{t("contacts.enabled")}</option>
-                <option value="false">{t("contacts.disabled")}</option>
-              </select>
             </div>
-          </div>
+          )}
           <section className="notification-card">
-            <strong>{t("settings.notificationAccountList")}</strong>
+            <div className="environment-card-head">
+              <div>
+                <strong>{t("settings.notificationAccountList")}</strong>
+                <span>{t("settings.notificationAccountsHelp")}</span>
+              </div>
+              <button className="ghost-button" type="button" onClick={() => { resetNotificationAccountForm(); setNotificationAccountEditorOpen(true); }}><IconText icon={Plus}>{t("settings.notificationAddAccount")}</IconText></button>
+            </div>
             {(notificationSettings?.accounts ?? []).map((account) => (
               <div className="storage-item" key={account.id}>
                 <div>
                   <strong>{account.name}</strong>
-                  <span>{account.channelKind} · {account.enabled ? "enabled" : "disabled"} · {account.lastTestStatus ?? "untested"} · {notificationPermissionSummary(account.permissions)}</span>
+                  <span>{notificationChannelKindLabel(notificationAccountKind(account))} · {account.enabled ? "enabled" : "disabled"} · {account.lastTestStatus ?? "untested"} · {notificationPermissionSummary(account.permissions)}</span>
                   {account.lastError && <span className="result-error">{account.lastError}</span>}
                 </div>
                 <div className="storage-actions">
                   <button className="ghost-button" type="button" onClick={() => editNotificationAccount(account)}>{t("action.edit")}</button>
                   <button className="ghost-button" type="button" disabled={busy === `notification-test:${account.id}`} onClick={() => void testNotificationAccount(account)}>{t("settings.notificationTest")}</button>
+                  <button className="ghost-button" type="button" disabled={busy === `notification-custom-test:${account.id}`} onClick={() => {
+                    setNotificationCustomTestAccount(account);
+                    setNotificationCustomTestForm({ title: "", message: "", includeHelp: true });
+                  }}>{t("settings.notificationCustomTest")}</button>
                   <button className="ghost-button danger-button" type="button" onClick={() => void deleteNotificationAccount(account)}>{t("action.delete")}</button>
                 </div>
               </div>
@@ -16105,20 +16596,45 @@ function SettingsPage({
           )}
           {notificationView === "recipients" && (
             <>
-          <form className="notification-card" onSubmit={createNotificationRecipient}>
-            <strong>{t("settings.notificationRecipientsTitle")}</strong>
-            <span>{t("settings.notificationRecipientsHelp")}</span>
+          {notificationRecipientEditorOpen && (
+            <div className="dialog-layer" role="presentation">
+              <button className="dialog-backdrop" type="button" aria-label={t("action.close")} onClick={resetNotificationRecipientForm} />
+              <form className="dialog-card notification-editor-dialog" role="dialog" aria-modal="true" aria-labelledby="notification-recipient-editor-title" onSubmit={createNotificationRecipient}>
+            <div className="dialog-head">
+              <div>
+                <strong id="notification-recipient-editor-title">{notificationEditingRecipientId ? t("action.saveChanges") : t("settings.notificationAddRecipient")}</strong>
+                <p>{t("settings.notificationRecipientsHelp")}</p>
+              </div>
+              <button className="drawer-close" type="button" aria-label={t("action.close")} onClick={resetNotificationRecipientForm}><X size={16} /></button>
+            </div>
             <label>
               <span>{t("settings.notificationRecipientName")}</span>
               <input name="notification-recipient-name" className="search-input" value={notificationRecipientForm.name} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, name: event.target.value }))} required />
             </label>
             <label>
               <span>{t("settings.notificationRecipientKind")}</span>
-              <select name="notification-recipient-kind" className="search-input" value={notificationRecipientForm.kind} disabled={Boolean(notificationEditingRecipientId)} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, kind: event.target.value as NotificationRecipientSummary["kind"] }))}>
-                <option value="email">Email</option>
-                <option value="telegram">Telegram</option>
-                <option value="weixin">Weixin</option>
-                <option value="webhook">Webhook</option>
+              <select name="notification-recipient-kind" className="search-input" value={notificationRecipientForm.kind} disabled={Boolean(notificationEditingRecipientId)} onChange={(event) => {
+                const kind = event.target.value as NotificationRecipientSummary["kind"];
+                setNotificationRecipientForm((current) => ({
+                  ...current,
+                  kind,
+                  senderAccountId: notificationDefaultRecipientSenderId(kind, null),
+                  telegramSenderAccountId: notificationDefaultRecipientSenderId(kind, null),
+                  weixinSenderAccountId: notificationDefaultRecipientSenderId(kind, null),
+                  dingtalkSenderAccountId: notificationDefaultRecipientSenderId(kind, null),
+                  feishuSenderAccountId: notificationDefaultRecipientSenderId(kind, null),
+                  wecomSenderAccountId: notificationDefaultRecipientSenderId(kind, null),
+                  qqSenderAccountId: notificationDefaultRecipientSenderId(kind, null),
+                }));
+              }}>
+                <option value="email">{notificationChannelKindLabel("email")}</option>
+                <option value="telegram">{notificationChannelKindLabel("telegram")}</option>
+                <option value="weixin">{notificationChannelKindLabel("weixin")}</option>
+                <option value="dingtalk">{notificationChannelKindLabel("dingtalk")}</option>
+                <option value="feishu">{notificationChannelKindLabel("feishu")}</option>
+                <option value="wecom">{notificationChannelKindLabel("wecom")}</option>
+                <option value="qq">{notificationChannelKindLabel("qq")}</option>
+                <option value="webhook">{notificationChannelKindLabel("webhook")}</option>
               </select>
             </label>
             <label className="checkbox-row">
@@ -16143,7 +16659,7 @@ function SettingsPage({
                   <span>{t("settings.notificationEmailTo")}</span>
                   <input name="notification-recipient-email" className="search-input" value={notificationRecipientForm.email} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, email: event.target.value }))} />
                 </label>
-                {emailNotificationSenders().length > 1 ? (
+                {emailNotificationSenders().length > 0 ? (
                   <label>
                     <span>{t("settings.notificationDefaultEmailSender")}</span>
                     <select name="notification-recipient-email-sender" className="search-input" value={notificationRecipientForm.senderAccountId} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, senderAccountId: event.target.value }))}>
@@ -16195,7 +16711,7 @@ function SettingsPage({
                   <span>{t("settings.notificationTelegramChatId")}</span>
                   <input name="notification-recipient-telegram-chat-id" className="search-input" value={notificationRecipientForm.telegramChatId} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, telegramChatId: event.target.value }))} />
                 </label>
-                {telegramNotificationSenders().length > 1 ? (
+                {telegramNotificationSenders().length > 0 ? (
                   <label>
                     <span>{t("settings.notificationDefaultTelegramSender")}</span>
                     <select name="notification-recipient-telegram-sender" className="search-input" value={notificationRecipientForm.telegramSenderAccountId} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, telegramSenderAccountId: event.target.value }))}>
@@ -16214,7 +16730,7 @@ function SettingsPage({
                   <span>{t("settings.notificationWeixinChatId")}</span>
                   <input name="notification-recipient-weixin-chat-id" className="search-input" value={notificationRecipientForm.weixinChatId} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, weixinChatId: event.target.value }))} />
                 </label>
-                {weixinNotificationSenders().length > 1 ? (
+                {weixinNotificationSenders().length > 0 ? (
                   <label>
                     <span>{t("settings.notificationDefaultWeixinSender")}</span>
                     <select name="notification-recipient-weixin-sender" className="search-input" value={notificationRecipientForm.weixinSenderAccountId} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, weixinSenderAccountId: event.target.value }))}>
@@ -16227,18 +16743,98 @@ function SettingsPage({
                 )}
               </>
             )}
+            {notificationRecipientForm.kind === "dingtalk" && (
+              <>
+                {dingtalkNotificationSenders().length > 0 ? (
+                  <label>
+                    <span>{t("settings.notificationDefaultDingTalkSender")}</span>
+                    <select name="notification-recipient-dingtalk-sender" className="search-input" value={notificationRecipientForm.dingtalkSenderAccountId} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, dingtalkSenderAccountId: event.target.value }))}>
+                      <option value="">{t("settings.notificationChooseSender")}</option>
+                      {dingtalkNotificationSenders().map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
+                    </select>
+                  </label>
+                ) : (
+                  <span className="subtle">{dingtalkNotificationSenders().length === 1 ? t("settings.notificationDingTalkSenderAuto") : t("settings.notificationDingTalkSenderMissing")}</span>
+                )}
+              </>
+            )}
+            {notificationRecipientForm.kind === "feishu" && (
+              <>
+                <label>
+                  <span>{t("settings.notificationFeishuChatId")}</span>
+                  <input name="notification-recipient-feishu-chat-id" className="search-input" value={notificationRecipientForm.feishuChatId} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, feishuChatId: event.target.value }))} />
+                </label>
+                {feishuNotificationSenders().length > 0 ? (
+                  <label>
+                    <span>{t("settings.notificationDefaultFeishuSender")}</span>
+                    <select name="notification-recipient-feishu-sender" className="search-input" value={notificationRecipientForm.feishuSenderAccountId} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, feishuSenderAccountId: event.target.value }))}>
+                      <option value="">{t("settings.notificationChooseSender")}</option>
+                      {feishuNotificationSenders().map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
+                    </select>
+                  </label>
+                ) : (
+                  <span className="subtle">{feishuNotificationSenders().length === 1 ? t("settings.notificationFeishuSenderAuto") : t("settings.notificationFeishuSenderMissing")}</span>
+                )}
+              </>
+            )}
+            {notificationRecipientForm.kind === "wecom" && (
+              <>
+                <label>
+                  <span>{t("settings.notificationWeComChatId")}</span>
+                  <input name="notification-recipient-wecom-chat-id" className="search-input" value={notificationRecipientForm.wecomChatId} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, wecomChatId: event.target.value }))} />
+                </label>
+                {wecomNotificationSenders().length > 0 ? (
+                  <label>
+                    <span>{t("settings.notificationDefaultWeComSender")}</span>
+                    <select name="notification-recipient-wecom-sender" className="search-input" value={notificationRecipientForm.wecomSenderAccountId} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, wecomSenderAccountId: event.target.value }))}>
+                      <option value="">{t("settings.notificationChooseSender")}</option>
+                      {wecomNotificationSenders().map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
+                    </select>
+                  </label>
+                ) : (
+                  <span className="subtle">{wecomNotificationSenders().length === 1 ? t("settings.notificationWeComSenderAuto") : t("settings.notificationWeComSenderMissing")}</span>
+                )}
+              </>
+            )}
+            {notificationRecipientForm.kind === "qq" && (
+              <>
+                <label>
+                  <span>{t("settings.notificationQQChatId")}</span>
+                  <input name="notification-recipient-qq-chat-id" className="search-input" value={notificationRecipientForm.qqChatId} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, qqChatId: event.target.value }))} />
+                </label>
+                {qqNotificationSenders().length > 0 ? (
+                  <label>
+                    <span>{t("settings.notificationDefaultQQSender")}</span>
+                    <select name="notification-recipient-qq-sender" className="search-input" value={notificationRecipientForm.qqSenderAccountId} onChange={(event) => setNotificationRecipientForm((current) => ({ ...current, qqSenderAccountId: event.target.value }))}>
+                      <option value="">{t("settings.notificationChooseSender")}</option>
+                      {qqNotificationSenders().map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
+                    </select>
+                  </label>
+                ) : (
+                  <span className="subtle">{qqNotificationSenders().length === 1 ? t("settings.notificationQQSenderAuto") : t("settings.notificationQQSenderMissing")}</span>
+                )}
+              </>
+            )}
             <div className="settings-actions">
               <button className="ghost-button" type="submit" disabled={busy === "notification-recipient"}><IconText icon={notificationEditingRecipientId ? Save : Plus}>{notificationEditingRecipientId ? t("action.saveChanges") : t("settings.notificationAddRecipient")}</IconText></button>
-              {notificationEditingRecipientId && <button className="ghost-button" type="button" onClick={resetNotificationRecipientForm}>{t("action.cancel")}</button>}
+              <button className="ghost-button" type="button" onClick={resetNotificationRecipientForm}>{t("action.cancel")}</button>
             </div>
           </form>
+            </div>
+          )}
           <section className="notification-card">
-            <strong>{t("settings.notificationRecipientList")}</strong>
+            <div className="environment-card-head">
+              <div>
+                <strong>{t("settings.notificationRecipientList")}</strong>
+                <span>{t("settings.notificationRecipientsHelp")}</span>
+              </div>
+              <button className="ghost-button" type="button" onClick={() => { resetNotificationRecipientForm(); setNotificationRecipientEditorOpen(true); }}><IconText icon={Plus}>{t("settings.notificationAddRecipient")}</IconText></button>
+            </div>
             {(notificationSettings?.recipients ?? []).map((recipient) => (
               <div className="storage-item" key={recipient.id}>
                 <div>
                   <strong>{recipient.name}</strong>
-                  <span>{recipient.kind} · {recipient.enabled ? "enabled" : "disabled"} · {notificationPermissionSummary(recipient.permissions)}</span>
+                  <span>{notificationChannelKindLabel(recipient.kind)} · {recipient.enabled ? "enabled" : "disabled"} · {notificationPermissionSummary(recipient.permissions)}</span>
                 </div>
                 <div className="storage-actions">
                   <button className="ghost-button" type="button" onClick={() => editNotificationRecipient(recipient)}>{t("action.edit")}</button>
@@ -16305,7 +16901,7 @@ function SettingsPage({
                 {(notificationSettings?.recipients ?? []).map((recipient) => (
                   <label className="checkbox-row" key={recipient.id}>
                     <input name={`notification-rule-recipient-${recipient.id}`} type="checkbox" checked={notificationRuleForm.recipientIds.includes(recipient.id)} onChange={() => toggleNotificationTarget(recipient.id)} />
-                    <span>{recipient.name} · {recipient.kind}</span>
+                    <span>{recipient.name} · {notificationChannelKindLabel(recipient.kind)}</span>
                   </label>
                 ))}
               </div>
@@ -16350,7 +16946,7 @@ function SettingsPage({
             {(notificationSettings?.ephemeralRules ?? []).map((rule: NotificationEphemeralRuleSummary) => (
               <div className="storage-item" key={rule.id}>
                 <div>
-                  <strong>{rule.scopeType} · {rule.scopeId}</strong>
+                  <strong>{rule.scopeType === "automation" ? t("automation.notifyTitle") : rule.scopeType} · {rule.scopeId}</strong>
                   <span>{rule.enabled ? "enabled" : "disabled"} · {rule.eventTypes.join(", ")} · {rule.targets.map((target) => notificationSettings?.recipients.find((recipient) => recipient.id === target.recipientId)?.name ?? target.recipientId ?? target.accountId).filter(Boolean).join(", ")}</span>
                   <span>{rule.expireMode} · {formatShortDate(rule.createdAt)}{rule.triggeredAt ? ` · triggered ${formatShortDate(rule.triggeredAt)}` : ""}</span>
                 </div>
@@ -16616,8 +17212,38 @@ function SettingsPage({
             )}
             {restoreMessage && <span className={restoreMessage === t("settings.restoreFailed") ? "result-error" : "result-ok"}>{restoreMessage}</span>}
           </section>
-        </TabsContent>
+      </TabsContent>
       </Tabs>
+      {notificationCustomTestAccount && (
+        <div className="dialog-layer" role="presentation">
+          <button className="dialog-backdrop" type="button" aria-label={t("action.close")} onClick={() => setNotificationCustomTestAccount(null)} />
+          <form className="dialog-card notification-custom-test-dialog" role="dialog" aria-modal="true" aria-labelledby="notification-custom-test-title" onSubmit={sendCustomNotificationTest}>
+            <div className="dialog-head">
+              <div>
+                <strong id="notification-custom-test-title">{t("settings.notificationCustomTestTitle")}</strong>
+                <p>{notificationCustomTestAccount.name} · {t("settings.notificationCustomTestHelp")}</p>
+              </div>
+              <button className="drawer-close" type="button" aria-label={t("action.close")} onClick={() => setNotificationCustomTestAccount(null)}><X size={16} /></button>
+            </div>
+            <label>
+              <span>{t("settings.notificationCustomTestSubject")}</span>
+              <input name="notification-custom-test-title" className="search-input" value={notificationCustomTestForm.title} placeholder={t("settings.notificationCustomTestSubjectPlaceholder")} onChange={(event) => setNotificationCustomTestForm((current) => ({ ...current, title: event.target.value }))} />
+            </label>
+            <label>
+              <span>{t("settings.notificationCustomTestMessage")}</span>
+              <textarea name="notification-custom-test-message" rows={6} className="search-input" value={notificationCustomTestForm.message} placeholder={t("settings.notificationCustomTestMessagePlaceholder")} onChange={(event) => setNotificationCustomTestForm((current) => ({ ...current, message: event.target.value }))} required />
+            </label>
+            <label className="checkbox-row">
+              <input name="notification-custom-test-include-help" type="checkbox" checked={notificationCustomTestForm.includeHelp} onChange={(event) => setNotificationCustomTestForm((current) => ({ ...current, includeHelp: event.target.checked }))} />
+              <span>{t("settings.notificationCustomTestIncludeHelp")}</span>
+            </label>
+            <div className="dialog-actions">
+              <button className="ghost-button" type="button" onClick={() => setNotificationCustomTestAccount(null)}>{t("action.cancel")}</button>
+              <button className="dark-button" type="submit" disabled={busy === `notification-custom-test:${notificationCustomTestAccount.id}`}><IconText icon={Send}>{t("action.send")}</IconText></button>
+            </div>
+          </form>
+        </div>
+      )}
       {notificationChannelManagerOpen && (
         <div className="dialog-layer" role="presentation">
           <div className="dialog-backdrop" onClick={() => { resetNotificationChannelForm(); setNotificationChannelManagerOpen(false); }} />

@@ -9,6 +9,7 @@ type TelegramNotificationAccountForm = {
   telegramBotToken: string;
   telegramProxyUrl: string;
   telegramTestChatId: string;
+  telegramCreateRecipient: boolean;
   telegramInboundEnabled: boolean;
   telegramAllowedChatIds: string;
   telegramAllowedUserIds: string;
@@ -19,9 +20,10 @@ type Props = {
   form: TelegramNotificationAccountForm;
   setForm: Dispatch<SetStateAction<any>>;
   t: TFunction;
+  showCreateRecipient?: boolean;
 };
 
-export function TelegramNotificationAccountPanel({ form, setForm, t }: Props) {
+export function TelegramNotificationAccountPanel({ form, setForm, t, showCreateRecipient = false }: Props) {
   return (
     <>
       <label>
@@ -48,6 +50,12 @@ export function TelegramNotificationAccountPanel({ form, setForm, t }: Props) {
         <span>{t("settings.notificationTelegramDefaultSessionId")}</span>
         <input name="notification-telegram-default-session-id" className="search-input" value={form.telegramDefaultSessionId} onChange={(event) => setForm((current: any) => ({ ...current, telegramDefaultSessionId: event.target.value }))} placeholder="task-..." />
       </label>
+      {showCreateRecipient && (
+        <label className="checkbox-row">
+          <input name="notification-telegram-create-recipient" type="checkbox" checked={form.telegramCreateRecipient} onChange={(event) => setForm((current: any) => ({ ...current, telegramCreateRecipient: event.target.checked }))} />
+          <span>{t("settings.notificationTelegramCreateRecipient")}</span>
+        </label>
+      )}
       <label>
         <span>{t("settings.notificationTelegramTestChatId")}</span>
         <input name="notification-telegram-test-chat-id" className="search-input" value={form.telegramTestChatId} onChange={(event) => setForm((current: any) => ({ ...current, telegramTestChatId: event.target.value }))} />
