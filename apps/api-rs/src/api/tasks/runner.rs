@@ -133,6 +133,7 @@ pub async fn create_task(
         provider,
         selected_model,
         true,
+        Some(message.id.clone()),
     )
     .await?;
     Ok(session)
@@ -225,6 +226,7 @@ pub async fn continue_task(
         provider,
         selected_model,
         provider_switched || session.codex_session_id.is_none(),
+        Some(message.id.clone()),
     )
     .await?;
     Ok(ContinueTaskOutcome::Session(session))
@@ -285,6 +287,7 @@ pub async fn recover_task(
         provider,
         selected_model,
         false,
+        Some(message.id.clone()),
     )
     .await?;
     Ok(session)
@@ -703,6 +706,7 @@ async fn run_next_queued_message_if_idle(
         provider,
         selected_model,
         reset_output,
+        Some(message.id.clone()),
     )
     .await?;
     Ok(true)
@@ -749,6 +753,7 @@ pub async fn start_room_run(
         provider,
         selected_model,
         reset_output,
+        None,
     )
     .await
 }
@@ -838,6 +843,7 @@ async fn start_runner(
     provider: Option<ProviderRecord>,
     model: Option<String>,
     reset_output: bool,
+    current_message_id: Option<String>,
 ) -> anyhow::Result<()> {
     if state.tasks.get(&session.id).is_some() {
         anyhow::bail!("task_running");
@@ -998,7 +1004,10 @@ async fn start_runner(
         .ok()
         .flatten()
         .unwrap_or_else(|| session.clone());
-        if status == "failed" && !killed {
+        let missing_assistant_reply = !killed
+            && exit_code == Some(0)
+            && !has_assistant_message_after(&state, &session.id, current_message_id.as_deref());
+        if (status == "failed" && !killed) || missing_assistant_reply {
             let summary = tokio::fs::read_to_string(&log_path)
                 .await
                 .map(|output| task_error_summary(&output))
@@ -1006,7 +1015,13 @@ async fn start_runner(
             let exit_text = exit_code
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "null".to_string());
-            let content = if summary.trim().is_empty() {
+            let content = if missing_assistant_reply {
+                if summary.trim().is_empty() {
+                    format!("Codex 任务已结束，退出码为 {exit_text}，但没有返回可显示的助手回复。")
+                } else {
+                    format!("Codex 任务已结束，退出码为 {exit_text}，但没有返回可显示的助手回复。\n\n{summary}")
+                }
+            } else if summary.trim().is_empty() {
                 format!("任务运行失败，Codex 退出码为 {exit_text}。")
             } else {
                 format!("任务运行失败，Codex 退出码为 {exit_text}。\n\n{summary}")
@@ -1939,6 +1954,41 @@ fn task_error_summary(output: &str) -> String {
         .chars()
         .take(2000)
         .collect()
+}
+
+fn has_assistant_message_after(
+    state: &AppState,
+    session_id: &str,
+    message_id: Option<&str>,
+) -> bool {
+    let Some(message_id) = message_id.filter(|value| !value.trim().is_empty()) else {
+        return true;
+    };
+    let Ok(connection) = state.db.open_read_only() else {
+        return true;
+    };
+    let Some(connection) = connection else {
+        return true;
+    };
+    let Ok(Some((created_at, id))) = connection
+        .query_row(
+            "select created_at, id from messages where session_id = ? and id = ?",
+            rusqlite::params![session_id, message_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+    else {
+        return true;
+    };
+    connection
+        .query_row(
+            "select 1 from messages where session_id = ? and role = 'assistant' and (created_at > ? or (created_at = ? and id > ?)) limit 1",
+            rusqlite::params![session_id, created_at, created_at, id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|item| item.is_some())
+        .unwrap_or(true)
 }
 
 fn extract_codex_thread_id(line: &str) -> Option<String> {

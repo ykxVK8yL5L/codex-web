@@ -1950,6 +1950,7 @@ const automationRouteDeps = {
   upsertSession,
 };
 const codexTaskStdoutBuffers = new Map<string, string>();
+const codexTaskCurrentMessageIds = new Map<string, string>();
 const codexTaskLogOffsets = new Map<string, number>();
 const codexTaskTailers = new Map<string, NodeJS.Timeout>();
 const finalizedRecoveredTasks = new Set<string>();
@@ -4903,12 +4904,35 @@ function clearCodexTaskRuntime(sessionId: string, kill = false) {
   codexTaskOutputs.delete(sessionId);
   codexTaskStopRequested.delete(sessionId);
   codexTaskStdoutBuffers.delete(sessionId);
+  codexTaskCurrentMessageIds.delete(sessionId);
   stopCodexTaskTailer(sessionId);
+}
+
+function hasAssistantMessageAfter(sessionId: string, messageId?: string | null) {
+  if (!messageId) return true;
+  const row = db.prepare("select created_at, id from messages where session_id = ? and id = ?").get(sessionId, messageId) as { created_at?: string; id?: string } | undefined;
+  if (!row?.created_at || !row.id) return true;
+  return Boolean(db.prepare(`
+    select 1 from messages
+    where session_id = ?
+      and role = 'assistant'
+      and (created_at > ? or (created_at = ? and id > ?))
+    limit 1
+  `).get(sessionId, row.created_at, row.created_at, row.id));
+}
+
+function emptyCodexReplyMessage(sessionId: string, exitCode: number | null) {
+  const summary = readTaskErrorSummary(sessionId);
+  return [
+    `Codex 任务已结束，退出码为 ${exitCode ?? "null"}，但没有返回可显示的助手回复。`,
+    summary,
+  ].filter(Boolean).join("\n\n");
 }
 
 function finalizeCodexRunnerTask(session: SessionSummary, exitCode: number | null, reason?: string) {
   if (finalizedRecoveredTasks.has(session.id)) return;
   finalizedRecoveredTasks.add(session.id);
+  const currentMessageId = codexTaskCurrentMessageIds.get(session.id) ?? null;
   const running = latestRunningTaskRun(session.id);
   const agentRun = db.prepare("select * from agent_runs where session_id = ? order by started_at desc, id desc limit 1").get(session.id) as Record<string, unknown> | undefined;
   const wasStopped = codexTaskStopRequested.has(session.id) || Boolean((running as { stop_requested?: unknown } | undefined)?.stop_requested);
@@ -4920,14 +4944,18 @@ function finalizeCodexRunnerTask(session: SessionSummary, exitCode: number | nul
   weixinPlatform.clearActiveReplyTargets(session.id);
   codexTaskProcesses.delete(session.id);
   codexTaskStdoutBuffers.delete(session.id);
+  codexTaskCurrentMessageIds.delete(session.id);
   stopCodexTaskTailer(session.id);
   const output = codexTaskOutputs.get(session.id);
   if (output) output.exitCode = exitCode;
+  const missingAssistantReply = !wasStopped && exitCode === 0 && !hasAssistantMessageAfter(session.id, currentMessageId);
   session.status = exitCode === 0 && !wasStopped ? "done" : "paused";
   finishTaskRun(session.id, wasStopped ? "stopped" : exitCode === 0 ? "done" : "failed", exitCode, reason ?? (wasStopped ? "user_stopped" : undefined));
-  if (exitCode !== 0 && !wasStopped) {
+  if ((exitCode !== 0 && !wasStopped) || missingAssistantReply) {
     const summary = readTaskErrorSummary(session.id);
-    const content = [`任务运行失败，Codex 退出码为 ${exitCode ?? "null"}。`, summary].filter(Boolean).join("\n\n");
+    const content = missingAssistantReply
+      ? emptyCodexReplyMessage(session.id, exitCode)
+      : [`任务运行失败，Codex 退出码为 ${exitCode ?? "null"}。`, summary].filter(Boolean).join("\n\n");
     appendSessionMessage(session.id, "assistant", content);
     publishTaskEvent(session.id, { type: "message", message: allSessionMessages(session.id).at(-1)!, session });
   }
@@ -5269,6 +5297,8 @@ function startCodexTask(
   if (shouldResetTaskLog) codexTaskOutputs.set(session.id, { output: "", exitCode: null });
   else if (!codexTaskOutputs.has(session.id)) codexTaskOutputs.set(session.id, readCodexOutput(session.id));
   codexTaskStdoutBuffers.set(session.id, "");
+  if (contextInput?.currentMessageId) codexTaskCurrentMessageIds.set(session.id, contextInput.currentMessageId);
+  else codexTaskCurrentMessageIds.delete(session.id);
   finalizedRecoveredTasks.delete(session.id);
   if (shouldResetTaskLog) {
     mkdirSync(sessionLogsPath(session.id), { recursive: true });
