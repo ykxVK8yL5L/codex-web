@@ -983,22 +983,6 @@ async fn start_runner(
         let reason = if killed { Some("user_stopped") } else { None };
         let _ = write_meta(&meta_path, exit_code, status).await;
         let _ = runs::finish_running_for_session(&state.db, &session.id, status, exit_code, reason);
-        let _ = crate::api::automations::runtime::finish_run_for_session(
-            &state,
-            &session.id,
-            exit_code,
-            killed,
-        );
-        // Mirror TS finishAgentRun: when this session backs a room agent_run, close it out and
-        // propagate the resulting task status. No-op for non-room/codex sessions.
-        let finished_room_id = crate::api::rooms::store::finish_agent_run_for_session(
-            &state.db,
-            &session.id,
-            exit_code,
-            killed,
-        )
-        .ok()
-        .flatten();
         let updated_session = session_store::update_runtime(
             &state.db,
             &session.id,
@@ -1044,6 +1028,23 @@ async fn start_runner(
                 );
             }
         }
+        let _ = crate::api::automations::runtime::finish_run_for_session(
+            &state,
+            &session.id,
+            exit_code,
+            killed,
+        );
+        // Mirror TS finishAgentRun: when this session backs a room agent_run, close it out and
+        // propagate the resulting task status. This intentionally runs after a failure assistant
+        // message is appended so failed room agents still surface a visible reply in the room.
+        let finished_room_id = crate::api::rooms::store::finish_agent_run_for_session(
+            &state.db,
+            &session.id,
+            exit_code,
+            killed,
+        )
+        .ok()
+        .flatten();
         if status == "done" {
             super::events::publish_done(&state, &updated_session, exit_code);
         } else {

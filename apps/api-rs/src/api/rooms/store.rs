@@ -1877,7 +1877,7 @@ pub fn finish_agent_run_for_session(
     let mut finished_room_id: Option<String> = None;
     if let Some((task_id, room_id_for_message, agent_id_for_message, run_id_for_message)) = run_info
     {
-        if status == "done" {
+        if status != "stopped" {
             append_room_agent_message_from_child_session(
                 &connection,
                 &room_id_for_message,
@@ -1888,6 +1888,22 @@ pub fn finish_agent_run_for_session(
                 &now,
             )?;
         }
+        record_room_event(
+            &connection,
+            &room_id_for_message,
+            match status {
+                "done" => "agent.completed",
+                "stopped" => "agent.stopped",
+                _ => "agent.failed",
+            },
+            &serde_json::json!({
+                "runId": run_id_for_message,
+                "taskId": task_id,
+                "exitCode": exit_code
+            }),
+            Some(&agent_id_for_message),
+            None,
+        )?;
         if let Some(task_id) = task_id {
             let task_status = match status {
                 "done" => "done",
