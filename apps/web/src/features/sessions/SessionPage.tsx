@@ -188,6 +188,7 @@ export function SessionPage({
   const [infoOpen, setInfoOpen] = useState(false);
   const [goalInfoExpandSignal, setGoalInfoExpandSignal] = useState(0);
   const [mobileContextPanel, setMobileContextPanel] = useState<"progress" | "changes" | "activity" | null>(null);
+  const [changeFileBrowser, setChangeFileBrowser] = useState<{ path: string } | null>(null);
   const [roomConsoleOpen, setRoomConsoleOpen] = useState(false);
   const [taskLogPanel, setTaskLogPanel] = useState<{ log: string } | null>(null);
   const [taskContextPanel, setTaskContextPanel] = useState<{ files: TaskContextResponse["files"]; selectedName: string; content: string } | null>(null);
@@ -1870,12 +1871,24 @@ export function SessionPage({
               t={t}
               initialPanel={mobileContextPanel}
               modal
-              onOpenFile={() => {
+              onOpenFile={(path) => {
                 setMobileContextPanel(null);
-                openWorkspaceFiles();
+                setChangeFileBrowser({ path });
               }}
             />
           </section>
+        </div>
+      )}
+      {changeFileBrowser && session && (
+        <div className="workspace-modal compact-modal" role="dialog" aria-modal="true">
+          <div className="workspace-modal-head">
+            <div>
+              <strong>{changeFileBrowser.path}</strong>
+              <span>{t("nav.files")}</span>
+            </div>
+            <button className="ghost-button icon-only" type="button" onClick={() => setChangeFileBrowser(null)} title={t("action.close")} aria-label={t("action.close")}><X size={16} /></button>
+          </div>
+          <FilesPage sessionToken={sessionToken} t={t} initialRootPath={session.workspacePath} initialMountName={session.title || "Session Workspace"} initialPath={changeFileBrowser.path} embedded TerminalComponent={TerminalPage} />
         </div>
       )}
       {infoOpen && (

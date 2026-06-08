@@ -206,6 +206,10 @@ export interface CreatePreviewRequest {
   autoStart?: boolean;
 }
 
+export interface UpdatePreviewRequest {
+  label?: string;
+}
+
 export interface ProviderSummary {
   id: string;
   name: string;

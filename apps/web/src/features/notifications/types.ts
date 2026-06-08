@@ -76,6 +76,7 @@ export type NotificationAccountForm = {
   qqTestTargetId: string;
   qqCreateRecipient: boolean;
   qqInboundEnabled: boolean;
+  qqIntents: string;
   qqAllowedChatIds: string;
   qqAllowedUserIds: string;
   qqDefaultSessionId: string;

@@ -55,6 +55,7 @@ export function ProvidersPage({
   const [modelVisible, setModelVisible] = useState<Record<string, number>>({});
   const [discoveringDraftModels, setDiscoveringDraftModels] = useState(false);
   const [detectingDraftInterface, setDetectingDraftInterface] = useState(false);
+  const [savingProvider, setSavingProvider] = useState(false);
   const [draftModels, setDraftModels] = useState<ProviderModelsResponse | null>(null);
   const [discoveringEditModels, setDiscoveringEditModels] = useState(false);
   const [clearingHealthProviderId, setClearingHealthProviderId] = useState("");
@@ -133,13 +134,17 @@ export function ProvidersPage({
 
   async function createProvider(event: React.FormEvent) {
     event.preventDefault();
+    if (savingProvider || detectingDraftInterface) return;
+    setSavingProvider(true);
     setMessage("");
     if (kind !== "local" && !apiKey.trim()) {
       showError(t("provider.apiKeyRequired"));
+      setSavingProvider(false);
       return;
     }
     if (rpmLimitEnabled && !rpmLimit.trim()) {
       showError(t("provider.rpmRequired"));
+      setSavingProvider(false);
       return;
     }
     let detectedKind = kind;
@@ -159,6 +164,7 @@ export function ProvidersPage({
     }
     if (detectedKind === "openai-compatible-chat" && !baseUrl.trim()) {
       showError(t("provider.baseUrlRequired"));
+      setSavingProvider(false);
       return;
     }
     const body: CreateProviderRequest = {
@@ -182,6 +188,7 @@ export function ProvidersPage({
     });
     if (!response.ok) {
       showError(t("provider.createFailed"));
+      setSavingProvider(false);
       return;
     }
     setName("");
@@ -195,6 +202,7 @@ export function ProvidersPage({
     setDraftModels(null);
     setCreatePanelOpen(false);
     await onChange();
+    setSavingProvider(false);
     notify(t("provider.created"), "success");
   }
 
@@ -728,7 +736,7 @@ export function ProvidersPage({
             </button>
           )}
           {message && <span className="form-error">{message}</span>}
-          <button className="dark-button"><IconText icon={Save}>{t("provider.saveProvider")}</IconText></button>
+          <button className="dark-button" disabled={savingProvider || detectingDraftInterface}><IconText icon={Save}>{savingProvider || detectingDraftInterface ? t("provider.detecting") : t("provider.saveProvider")}</IconText></button>
         </form>
         <section className="management-grid provider-management-grid">
           <div className="project-list-head">
@@ -989,7 +997,7 @@ export function ProvidersPage({
               </button>
             )}
             {message && <span className="form-error">{message}</span>}
-            <button className="dark-button"><IconText icon={Save}>{t("provider.saveProvider")}</IconText></button>
+            <button className="dark-button" disabled={savingProvider || detectingDraftInterface}><IconText icon={Save}>{savingProvider || detectingDraftInterface ? t("provider.detecting") : t("provider.saveProvider")}</IconText></button>
           </form>
         </div>
       )}

@@ -14,6 +14,7 @@ export type QQNotificationAccountForm = {
   qqTestTargetId: string;
   qqCreateRecipient: boolean;
   qqInboundEnabled: boolean;
+  qqIntents: string;
   qqAllowedChatIds: string;
   qqAllowedUserIds: string;
   qqDefaultSessionId: string;
@@ -49,6 +50,10 @@ export function QQNotificationAccountPanel({ form, setForm, t, showCreateRecipie
         </summary>
         <div className="settings-collapsible-body">
           <span className="subtle">{t("settings.notificationQQAdvancedHelp")}</span>
+          <label>
+            <span>{t("settings.notificationQQIntents")}</span>
+            <input name="notification-qq-intents" className="search-input" value={form.qqIntents} onChange={(event) => setForm((current: any) => ({ ...current, qqIntents: event.target.value }))} placeholder="1174409729" />
+          </label>
           <label>
             <span>{t("settings.notificationQQAllowedChatIds")}</span>
             <input name="notification-qq-allowed-chat-ids" className="search-input" value={form.qqAllowedChatIds} onChange={(event) => setForm((current: any) => ({ ...current, qqAllowedChatIds: event.target.value }))} placeholder="chat-id-1, chat-id-2" />

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Copy, Download, Globe, Info, Lock, MoreHorizontal, Play, RefreshCw, Square, Trash2, Unlock, X } from "lucide-react";
+import { Copy, Download, Globe, Info, Lock, MoreHorizontal, Pencil, Play, RefreshCw, Square, Trash2, Unlock, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAppDialog } from "@/components/AppDialog";
 import { FilterSearchInput, FilterToolbar } from "@/components/FilterControls";
@@ -215,6 +215,34 @@ export function PreviewsPage({
     setPreviews((items) => (items ?? []).filter((item) => item.id !== preview.id));
   }
 
+  async function renamePreview(preview: PreviewSummary) {
+    const label = await dialog.prompt({
+      title: t("preview.rename"),
+      message: preview.targetHost ? `${preview.targetHost}:${preview.port}` : preview.id,
+      placeholder: preview.label,
+      defaultValue: preview.label,
+      confirmLabel: t("action.save"),
+    });
+    if (label === null) return;
+    const nextLabel = label.trim();
+    if (!nextLabel || nextLabel === preview.label) return;
+    const response = await fetch(`/api/previews/${preview.id}`, {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ label: nextLabel }),
+    });
+    if (!response.ok) {
+      setMessage(t("preview.renameFailed"));
+      notify(t("preview.renameFailed"), "error");
+      return;
+    }
+    const nextPreview = (await response.json()) as PreviewSummary;
+    setPreviews((items) => (items ?? []).map((item) => item.id === nextPreview.id ? nextPreview : item));
+    setDetailPreview((current) => current?.id === nextPreview.id ? nextPreview : current);
+    setMessage(t("preview.renamed"));
+    notify(t("preview.renamed"), "success");
+  }
+
   async function copyPreviewUrl(preview: PreviewSummary) {
     const copied = await copyText(`${window.location.origin}${preview.url}`);
     setMessage(copied ? t("action.copied") : t("settings.copyFailed"));
@@ -279,6 +307,7 @@ export function PreviewsPage({
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
                   <DropdownMenuItem disabled={preview.status !== "running"} onSelect={() => void openPreviewUrl(preview, sessionToken, notify, t)}><IconText icon={Globe}>{t("project.openPreview")}</IconText></DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => void renamePreview(preview)}><IconText icon={Pencil}>{t("action.rename")}</IconText></DropdownMenuItem>
                   <DropdownMenuItem onSelect={() => void copyPreviewUrl(preview)}><IconText icon={Copy}>{t("action.copy")}</IconText></DropdownMenuItem>
                   <DropdownMenuItem onSelect={() => void updatePreviewAccess(preview, preview.access === "private" ? "public" : "private")}>
                     <IconText icon={preview.access === "private" ? Unlock : Lock}>{preview.access === "private" ? t("preview.makePublic") : t("preview.makePrivate")}</IconText>

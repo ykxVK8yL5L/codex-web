@@ -6,6 +6,8 @@
     "dev": "pnpm --parallel --filter @codex-web/web --filter @codex-web/api dev",
     "dev:web": "pnpm --filter @codex-web/web dev",
     "dev:api": "pnpm --filter @codex-web/api dev",
+    "dev:api-rs": "cargo run --manifest-path apps/api-rs/Cargo.toml",
+    "check:api-rs": "cargo check --manifest-path apps/api-rs/Cargo.toml",
     "check": "pnpm --recursive check",
     "smoke": "node scripts/smoke.mjs"
   },

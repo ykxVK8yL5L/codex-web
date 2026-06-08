@@ -503,6 +503,34 @@ export function ProjectsPage({
     notify(t("project.previewDeleted"), "success");
   }
 
+  async function renameProjectPreview(preview: PreviewSummary) {
+    const label = await dialog.prompt({
+      title: t("preview.rename"),
+      message: `${preview.targetHost}:${preview.port}`,
+      placeholder: preview.label,
+      defaultValue: preview.label,
+      confirmLabel: t("action.save"),
+    });
+    if (label === null) return;
+    const nextLabel = label.trim();
+    if (!nextLabel || nextLabel === preview.label) return;
+    const response = await fetch(`/api/previews/${preview.id}`, {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ label: nextLabel }),
+    });
+    if (!response.ok) {
+      showError(t("preview.renameFailed"));
+      return;
+    }
+    const nextPreview = (await response.json()) as PreviewSummary;
+    setPreviewPanel((current) => current ? {
+      ...current,
+      previews: (current.previews ?? []).map((item) => item.id === nextPreview.id ? nextPreview : item),
+    } : current);
+    notify(t("preview.renamed"), "success");
+  }
+
   return (
     <main className="projects-page">
       {dialog.node}
@@ -809,6 +837,7 @@ export function ProjectsPage({
                 </div>
                 <div className="preview-actions">
                   <button className="ghost-button" type="button" onClick={() => void openPreviewUrl(preview, sessionToken, notify, t)}>{t("project.openPreview")}</button>
+                  <button className="ghost-button" type="button" onClick={() => void renameProjectPreview(preview)}>{t("action.rename")}</button>
                   <button className="ghost-button" type="button" disabled={preview.status !== "running" && preview.status !== "starting"} onClick={() => void stopProjectPreview(preview)}>{t("action.disconnect")}</button>
                   <button className="ghost-button danger-button" type="button" onClick={() => void deleteProjectPreview(preview)}>{t("action.delete")}</button>
                 </div>

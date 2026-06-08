@@ -10,6 +10,7 @@ import type {
   PreviewSummary,
   ProjectSummary,
   SessionSummary,
+  UpdatePreviewRequest,
 } from "@codex-web/protocol";
 import { decodePageCursor, pageFromRows, parsePageLimit } from "../pagination.js";
 
@@ -228,6 +229,16 @@ export function registerPreviewRoutes(app: Hono, deps: PreviewRoutesDeps) {
     if (!preview) return c.json({ error: "preview_not_found" }, 404);
     const body = await c.req.json<{ access?: PreviewAccess }>().catch(() => null);
     preview.access = deps.previewAccess(body?.access);
+    deps.updatePreview(preview);
+    return c.json(deps.publicPreview(preview));
+  });
+
+  app.patch("/api/previews/:id", async (c) => {
+    const preview = deps.previews.get(c.req.param("id"));
+    if (!preview) return c.json({ error: "preview_not_found" }, 404);
+    const body = await c.req.json<UpdatePreviewRequest>().catch(() => null);
+    const label = String(body?.label ?? "").trim();
+    if (label) preview.label = label;
     deps.updatePreview(preview);
     return c.json(deps.publicPreview(preview));
   });
