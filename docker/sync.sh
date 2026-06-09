@@ -4,10 +4,16 @@ set -eu
 # REMOTE_FOLDER example: remote:codex-web-backup
 # The remote layout preserves local absolute paths under REMOTE_FOLDER:
 #   /app/apps/api/data -> ${REMOTE_FOLDER}/app/apps/api/data
+# BACKUP_PATHS entries ending in / are directories; other entries are files.
+# Restore discovers top-level entries from REMOTE_FOLDER:
+#   ${REMOTE_FOLDER}/data -> /data
+#   ${REMOTE_FOLDER}/apps -> /apps
+#   ${REMOTE_FOLDER}/app -> /app
 
 BACKUP_PATHS="
-/app/apps/api/data
-/app/data
+/app/apps/api/data/
+/app/data/
+/app/sync.sh
 "
 
 require_remote_folder() {
@@ -29,14 +35,38 @@ backup() {
     exit 1
   }
 
-  for local_path in $BACKUP_PATHS; do
+  for backup_path in $BACKUP_PATHS; do
+    case "$backup_path" in
+      */)
+        entry_type="dir"
+        local_path="${backup_path%/}"
+        ;;
+      *)
+        entry_type="file"
+        local_path="$backup_path"
+        ;;
+    esac
+
     if [ ! -e "$local_path" ]; then
-      echo "skip missing path: $local_path"
+      echo "skip missing path: $backup_path"
       continue
     fi
+    if [ "$entry_type" = "dir" ] && [ ! -d "$local_path" ]; then
+      echo "skip non-directory path marked as directory: $backup_path" >&2
+      continue
+    fi
+    if [ "$entry_type" = "file" ] && [ ! -f "$local_path" ]; then
+      echo "skip non-file path marked as file: $backup_path" >&2
+      continue
+    fi
+
     remote_path="$(remote_path_for "$local_path")"
     echo "backup: $local_path -> $remote_path"
-    rclone copy "$local_path" "$remote_path" --create-empty-src-dirs
+    if [ "$entry_type" = "dir" ]; then
+      rclone copy "$local_path" "$remote_path" --create-empty-src-dirs
+    else
+      rclone copyto "$local_path" "$remote_path"
+    fi
   done
 }
 
@@ -47,11 +77,33 @@ restore() {
     exit 1
   }
 
-  for local_path in $BACKUP_PATHS; do
-    remote_path="$(remote_path_for "$local_path")"
+  remote_root="${REMOTE_FOLDER%/}"
+  entries="$(rclone lsf "$remote_root")"
+  if [ -z "$entries" ]; then
+    echo "remote folder is empty: $remote_root"
+    return 0
+  fi
+
+  printf "%s\n" "$entries" | while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    clean_entry="${entry%/}"
+    case "$clean_entry" in
+      ""|.|..|/*|*"/../"*|../*|*".."/*)
+        echo "skip unsafe remote entry: $entry" >&2
+        continue
+        ;;
+    esac
+
+    remote_path="$remote_root/$clean_entry"
+    local_path="/$clean_entry"
     echo "restore: $remote_path -> $local_path"
-    mkdir -p "$local_path"
-    rclone copy "$remote_path" "$local_path" --create-empty-src-dirs
+    if [ "${entry%/}" != "$entry" ]; then
+      mkdir -p "$local_path"
+      rclone copy "$remote_path" "$local_path" --create-empty-src-dirs
+    else
+      mkdir -p "$(dirname "$local_path")"
+      rclone copyto "$remote_path" "$local_path"
+    fi
   done
 }
 
