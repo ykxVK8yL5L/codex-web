@@ -1060,11 +1060,11 @@ async fn start_runner(
         )
         .ok()
         .flatten();
-        if status == "done" {
-            super::events::publish_done(&state, &updated_session, exit_code);
-        } else {
-            super::events::publish_error(&state, &updated_session, status);
-        }
+        // Mirror the TypeScript runtime: process completion is always a `done`
+        // task event, with `exitCode` distinguishing success from failure. Using
+        // SSE `event: error` for normal task failure collides with EventSource's
+        // native connection-error event and makes the browser close/reconnect.
+        super::events::publish_done(&state, &updated_session, exit_code);
         publish_task_app_notification(&state, &updated_session, exit_code, killed, status);
         crate::api::sessions::compaction::schedule_auto_compaction(
             state.clone(),

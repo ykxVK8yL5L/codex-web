@@ -153,7 +153,7 @@ pub fn stream(
                                     emitted_terminal = true;
                                 }
                                 "paused" | "interrupted" | "failed" => {
-                                    yield Ok(sse_event("error", serde_json::json!({ "type": "error", "session": session_value, "error": session.status })));
+                                    yield Ok(sse_event("task-error", serde_json::json!({ "type": "error", "session": session_value, "error": session.status })));
                                     emitted_terminal = true;
                                 }
                                 _ => {}
@@ -252,5 +252,6 @@ fn read_exit_code(state: &AppState, session_id: &str) -> Option<i64> {
 }
 
 fn sse_event(name: &str, payload: serde_json::Value) -> Event {
-    Event::default().event(name).data(payload.to_string())
+    let event_name = if name == "error" { "task-error" } else { name };
+    Event::default().event(event_name).data(payload.to_string())
 }

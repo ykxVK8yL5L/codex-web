@@ -712,7 +712,7 @@ export function SessionPage({
       if (closed) return;
       source?.close();
       source = new EventSource(eventUrl);
-      for (const name of ["snapshot", "started", "output", "activity", "workspace", "message", "queue", "done", "error"]) {
+      for (const name of ["snapshot", "started", "output", "activity", "workspace", "message", "queue", "done", "error", "task-error"]) {
         source.addEventListener(name, handleEvent);
       }
       source.onopen = () => {
