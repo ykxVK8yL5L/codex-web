@@ -179,6 +179,48 @@ pnpm --filter @codex-web/api dev
 
 The current API package does not yet provide a dedicated production start script. If deploying outside development, add a production entrypoint or run the compiled/tsx API process under a supervisor such as systemd, pm2, Docker, or the platform's process manager.
 
+### Rust API Docker Deployment
+
+The Rust API can be deployed with `Dockerfile-rs`. The image builds the web frontend first, runs Nginx on `5173`, serves `/app/apps/web/dist`, and proxies `/api/*` and `/preview/*` to the Rust API on `127.0.0.1:8787` inside the container.
+
+Build the Rust image:
+
+```bash
+docker build -f Dockerfile-rs -t codex-web-rs .
+```
+
+Run the container:
+
+```bash
+docker run -d --name codex-web-rs \
+  -p 5173:5173 \
+  -v codex-web-rs-data:/app/data \
+  -v codex-web-codex-home:/root/.codex \
+  codex-web-rs
+```
+
+Rust runtime data is stored under `/app/data` via:
+
+```text
+CODEX_WEB_DATA_DIR=/app/data
+```
+
+Codex CLI keeps its default home at `/root/.codex`; mount it if you want CLI auth/configuration to survive container recreation.
+
+The Rust image also includes `rclone` and the same sync helper. For Rust deployments the startup script can restore `/app/data` before the API starts:
+
+```bash
+docker run -d --name codex-web-rs \
+  -p 5173:5173 \
+  -v codex-web-rs-data:/app/data \
+  -v codex-web-codex-home:/root/.codex \
+  -e REMOTE_FOLDER=remote:codex-web-backup \
+  -e CODEX_WEB_RESTORE_ON_START=1 \
+  codex-web-rs
+```
+
+With `CODEX_WEB_RESTORE_ON_START=1`, `/app/data` is restored from `REMOTE_FOLDER/app/data` before Nginx and the Rust API start. The existing `docker/sync.sh` helper is unchanged and still defaults to the TypeScript data path `/app/apps/api/data`.
+
 ## Important Environment Variables
 
 - `HOST`: API bind host, default `0.0.0.0`

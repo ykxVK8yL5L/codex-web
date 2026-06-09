@@ -7,6 +7,7 @@ set -eu
 
 BACKUP_PATHS="
 /app/apps/api/data
+/app/data
 "
 
 require_remote_folder() {
