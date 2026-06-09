@@ -884,7 +884,7 @@ async fn start_runner(
         &prompt,
         provider.as_ref(),
         model.as_deref(),
-        !reset_output && session.codex_session_id.is_some(),
+        false,
         &local_api_base,
         &cwd,
         &runtime,
@@ -923,7 +923,7 @@ async fn start_runner(
         &log_path,
         &format!(
             "[codex-web-rs] mode={} session={} codexThread={} promptChars={} promptHash={} cwd={}\n\n--- user ---\n{}\n\n--- agent ---\n$ codex {}\n",
-            if !reset_output && session.codex_session_id.is_some() { "resume" } else { "exec" },
+            "exec",
             session.id,
             session.codex_session_id.as_deref().unwrap_or("new"),
             prompt.chars().count(),
@@ -1129,6 +1129,7 @@ async fn stream_lines<R>(
             }
         }
         if let Some((state, session)) = session_state.as_ref() {
+            let _ = crate::api::usage::record_codex_usage(&state.db, session, &line);
             if let Some(thread_id) = extract_codex_thread_id(&line) {
                 let _ = session_store::update_runtime(
                     &state.db,
@@ -1562,7 +1563,7 @@ fn prompt_with_managed_context(
     Ok([
         "Use this Codex Web managed context as authoritative project/session context.".to_string(),
         format!("A copy has been written to: {}", context_path.display()),
-        "Do not assume unavailable chat history beyond this pack and any Codex resume state."
+        "Do not assume unavailable chat history beyond this pack."
             .to_string(),
         String::new(),
         truncate_context(&pack, 60_000),

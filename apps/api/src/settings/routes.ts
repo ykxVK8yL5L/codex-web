@@ -10,6 +10,8 @@ import type {
   RoomRunMergeResponse,
   SystemBackupPreviewResponse,
   SystemRestoreResponse,
+  TokenUsageDisplaySettings,
+  TokenUsageRetentionSettings,
   UpdateCodexRuntimeSettingsRequest,
   UpdateNotificationTestSettingsRequest,
   UpdateSessionCompactionSettingsRequest,
@@ -101,6 +103,8 @@ export function registerSettingsRoutes(app: Hono, deps: SettingsRoutesDeps) {
   const previewAccessRequests = getPreviewAccessRequests();
   let rateLimitSettings = getRateLimitSettings();
   let sessionCompactionSettings = getSessionCompactionSettings();
+  let tokenUsageRetentionSettings = deps.getTokenUsageRetentionSettings() as TokenUsageRetentionSettings;
+  let tokenUsageDisplaySettings = deps.getTokenUsageDisplaySettings() as TokenUsageDisplaySettings;
   let systemBackupSettings = getSystemBackupSettings();
   let notificationTestSettings = deps.getNotificationTestSettings();
   const appNotificationRouteDeps = deps.getAppNotificationRouteDeps();
@@ -164,6 +168,36 @@ export function registerSettingsRoutes(app: Hono, deps: SettingsRoutesDeps) {
     sessionCompactionSettings = next;
     setSessionCompactionSettings(next);
     runtimeSettingsStore.sessionCompaction.save(next);
+    return c.json(next);
+  });
+
+  app.get("/api/settings/token-usage-retention", (c) => c.json(tokenUsageRetentionSettings));
+
+  app.patch("/api/settings/token-usage-retention", async (c) => {
+    const body = await c.req.json<Partial<TokenUsageRetentionSettings>>().catch(() => null);
+    const next = runtimeSettingsStore.tokenUsageRetention.sanitize({
+      ...tokenUsageRetentionSettings,
+      ...(body ?? {}),
+      updatedAt: new Date().toISOString(),
+    });
+    tokenUsageRetentionSettings = next;
+    deps.setTokenUsageRetentionSettings(next);
+    runtimeSettingsStore.tokenUsageRetention.save(next);
+    return c.json(next);
+  });
+
+  app.get("/api/settings/token-usage-display", (c) => c.json(tokenUsageDisplaySettings));
+
+  app.patch("/api/settings/token-usage-display", async (c) => {
+    const body = await c.req.json<Partial<TokenUsageDisplaySettings>>().catch(() => null);
+    const next = runtimeSettingsStore.tokenUsageDisplay.sanitize({
+      ...tokenUsageDisplaySettings,
+      ...(body ?? {}),
+      updatedAt: new Date().toISOString(),
+    });
+    tokenUsageDisplaySettings = next;
+    deps.setTokenUsageDisplaySettings(next);
+    runtimeSettingsStore.tokenUsageDisplay.save(next);
     return c.json(next);
   });
   

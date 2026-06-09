@@ -5,6 +5,8 @@ import type {
   CodexSandboxMode,
   PreviewAccessSettings,
   SessionCompactionSettings,
+  TokenUsageDisplaySettings,
+  TokenUsageRetentionSettings,
 } from "@codex-web/protocol";
 
 type RuntimeSettingsDefaults = {
@@ -129,6 +131,67 @@ export function createRuntimeSettingsStore(db: Database.Database, defaultsInput:
     `).run(JSON.stringify(settings), settings.updatedAt);
   }
 
+  function defaultTokenUsageRetentionSettings(): TokenUsageRetentionSettings {
+    return { retentionDays: 0, updatedAt: new Date().toISOString() };
+  }
+
+  function sanitizeTokenUsageRetentionSettings(value?: Partial<TokenUsageRetentionSettings>): TokenUsageRetentionSettings {
+    const defaults = defaultTokenUsageRetentionSettings();
+    const days = Number(value?.retentionDays ?? defaults.retentionDays);
+    return {
+      retentionDays: Number.isFinite(days) ? Math.min(Math.max(Math.floor(days), 0), 3650) : defaults.retentionDays,
+      updatedAt: typeof value?.updatedAt === "string" ? value.updatedAt : defaults.updatedAt,
+    };
+  }
+
+  function loadTokenUsageRetentionSettings(): TokenUsageRetentionSettings {
+    const row = db.prepare("select value from app_settings where key = 'token_usage_retention'").get() as { value: string } | undefined;
+    if (!row) return defaultTokenUsageRetentionSettings();
+    try {
+      return sanitizeTokenUsageRetentionSettings(JSON.parse(row.value) as Partial<TokenUsageRetentionSettings>);
+    } catch {
+      return defaultTokenUsageRetentionSettings();
+    }
+  }
+
+  function saveTokenUsageRetentionSettings(settings: TokenUsageRetentionSettings) {
+    db.prepare(`
+      insert into app_settings (key, value, updated_at)
+      values ('token_usage_retention', ?, ?)
+      on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at
+    `).run(JSON.stringify(settings), settings.updatedAt);
+  }
+
+  function defaultTokenUsageDisplaySettings(): TokenUsageDisplaySettings {
+    return { showMessageUsage: false, updatedAt: new Date().toISOString() };
+  }
+
+  function sanitizeTokenUsageDisplaySettings(value?: Partial<TokenUsageDisplaySettings>): TokenUsageDisplaySettings {
+    const defaults = defaultTokenUsageDisplaySettings();
+    return {
+      showMessageUsage: typeof value?.showMessageUsage === "boolean" ? value.showMessageUsage : defaults.showMessageUsage,
+      updatedAt: typeof value?.updatedAt === "string" ? value.updatedAt : defaults.updatedAt,
+    };
+  }
+
+  function loadTokenUsageDisplaySettings(): TokenUsageDisplaySettings {
+    const row = db.prepare("select value from app_settings where key = 'token_usage_display'").get() as { value: string } | undefined;
+    if (!row) return defaultTokenUsageDisplaySettings();
+    try {
+      return sanitizeTokenUsageDisplaySettings(JSON.parse(row.value) as Partial<TokenUsageDisplaySettings>);
+    } catch {
+      return defaultTokenUsageDisplaySettings();
+    }
+  }
+
+  function saveTokenUsageDisplaySettings(settings: TokenUsageDisplaySettings) {
+    db.prepare(`
+      insert into app_settings (key, value, updated_at)
+      values ('token_usage_display', ?, ?)
+      on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at
+    `).run(JSON.stringify(settings), settings.updatedAt);
+  }
+
   return {
     codexRuntime: {
       load: loadCodexRuntimeSettings,
@@ -144,6 +207,16 @@ export function createRuntimeSettingsStore(db: Database.Database, defaultsInput:
       load: loadSessionCompactionSettings,
       save: saveSessionCompactionSettings,
       sanitize: sanitizeSessionCompactionSettings,
+    },
+    tokenUsageRetention: {
+      load: loadTokenUsageRetentionSettings,
+      save: saveTokenUsageRetentionSettings,
+      sanitize: sanitizeTokenUsageRetentionSettings,
+    },
+    tokenUsageDisplay: {
+      load: loadTokenUsageDisplaySettings,
+      save: saveTokenUsageDisplaySettings,
+      sanitize: sanitizeTokenUsageDisplaySettings,
     },
   };
 }

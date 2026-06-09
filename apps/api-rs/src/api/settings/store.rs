@@ -5,8 +5,9 @@ use crate::db::Db;
 
 use super::models::{
     CodexRuntimeSettings, NotificationTestSettings, PreviewAccessSettings, RateLimitSettings,
-    SessionCompactionSettings, UpdateCodexRuntimeSettings, UpdateNotificationTestSettings,
-    UpdateSessionCompactionSettings,
+    SessionCompactionSettings, TokenUsageDisplaySettings, TokenUsageRetentionSettings,
+    UpdateCodexRuntimeSettings, UpdateNotificationTestSettings, UpdateSessionCompactionSettings,
+    UpdateTokenUsageDisplaySettings, UpdateTokenUsageRetentionSettings,
 };
 
 pub fn preview_access(db: &Db) -> anyhow::Result<PreviewAccessSettings> {
@@ -90,6 +91,44 @@ pub fn save_rate_limit(
         updated_at: crate::api::common::timestamp(),
     });
     save_json(db, "rate_limit", &next)?;
+    Ok(next)
+}
+
+pub fn token_usage_retention(db: &Db) -> anyhow::Result<TokenUsageRetentionSettings> {
+    Ok(load_json(db, "token_usage_retention")?
+        .map(sanitize_token_usage_retention)
+        .unwrap_or_else(default_token_usage_retention))
+}
+
+pub fn save_token_usage_retention(
+    db: &Db,
+    input: UpdateTokenUsageRetentionSettings,
+) -> anyhow::Result<TokenUsageRetentionSettings> {
+    let current = token_usage_retention(db)?;
+    let next = sanitize_token_usage_retention(TokenUsageRetentionSettings {
+        retention_days: input.retention_days.unwrap_or(current.retention_days),
+        updated_at: crate::api::common::timestamp(),
+    });
+    save_json(db, "token_usage_retention", &next)?;
+    Ok(next)
+}
+
+pub fn token_usage_display(db: &Db) -> anyhow::Result<TokenUsageDisplaySettings> {
+    Ok(load_json(db, "token_usage_display")?
+        .map(sanitize_token_usage_display)
+        .unwrap_or_else(default_token_usage_display))
+}
+
+pub fn save_token_usage_display(
+    db: &Db,
+    input: UpdateTokenUsageDisplaySettings,
+) -> anyhow::Result<TokenUsageDisplaySettings> {
+    let current = token_usage_display(db)?;
+    let next = sanitize_token_usage_display(TokenUsageDisplaySettings {
+        show_message_usage: input.show_message_usage.unwrap_or(current.show_message_usage),
+        updated_at: crate::api::common::timestamp(),
+    });
+    save_json(db, "token_usage_display", &next)?;
     Ok(next)
 }
 
@@ -300,6 +339,20 @@ fn sanitize_session_compaction(input: SessionCompactionSettings) -> SessionCompa
     }
 }
 
+fn default_token_usage_display() -> TokenUsageDisplaySettings {
+    TokenUsageDisplaySettings {
+        show_message_usage: false,
+        updated_at: crate::api::common::timestamp(),
+    }
+}
+
+fn sanitize_token_usage_display(input: TokenUsageDisplaySettings) -> TokenUsageDisplaySettings {
+    TokenUsageDisplaySettings {
+        show_message_usage: input.show_message_usage,
+        updated_at: input.updated_at,
+    }
+}
+
 fn default_rate_limit() -> RateLimitSettings {
     RateLimitSettings {
         enabled: env_bool("CODEX_WEB_RATE_LIMIT_ENABLED", true),
@@ -324,6 +377,20 @@ fn sanitize_rate_limit(input: RateLimitSettings) -> RateLimitSettings {
         provider_proxy_per_minute: clamp(input.provider_proxy_per_minute, 1, 100_000),
         provider_proxy_per_hour: clamp(input.provider_proxy_per_hour, 1, 100_000),
         provider_proxy_max_concurrent: clamp(input.provider_proxy_max_concurrent, 1, 1000),
+        updated_at: input.updated_at,
+    }
+}
+
+fn default_token_usage_retention() -> TokenUsageRetentionSettings {
+    TokenUsageRetentionSettings {
+        retention_days: 0,
+        updated_at: crate::api::common::timestamp(),
+    }
+}
+
+fn sanitize_token_usage_retention(input: TokenUsageRetentionSettings) -> TokenUsageRetentionSettings {
+    TokenUsageRetentionSettings {
+        retention_days: clamp(input.retention_days, 0, 3650),
         updated_at: input.updated_at,
     }
 }

@@ -3,6 +3,16 @@
 > 由 AI 协作维护。源真值：`apps/api/src/`（Hono）。目标：`apps/api-rs/src/`（axum）。
 > 每完成一块跑 `cargo check` 验证。
 
+## 当前状态（Rust parity 收束）
+
+- Rust API 路由审计已达到 TS 路由覆盖：详见 `ROUTE_AUDIT.md`。
+- 通知平台与外部通知主链已补齐：Telegram、WeChat、WeCom、Feishu、QQ Bot、email/webhook 的发送、入站命令、typing/working 状态、会话隔离、测试消息、失败回传、ephemeral notification rule、delivery retry、browser/app notification 转发等均按 TS 行为对齐或在 Rust 中补强。
+- Room 主流程已补齐：room tasks/runs、agent orchestration、structured `codex-web-room-update` ingest、artifacts/decisions/handoffs/suggestedTasks、artifact cards、merge approval gate、approval deny decision、auto compaction context、room blackboard context、room activity SSE refresh。
+- Assistant skill blocks 已补齐：`codex-web-notification`、`codex-web-cross-session`、`codex-web-room-update`、`codex-web-artifact` / `artifact`。
+- 清理链补齐：session/task/room/room_task scope 的 notification ephemeral rules 会随 session/room 删除和 maintenance cleanup 清理。
+- Rust Docker 部署入口：仓库根目录 `Dockerfile-rs`。运行时数据目录为 `/app/data`（`CODEX_WEB_DATA_DIR=/app/data`），Codex CLI 保持默认 `/root/.codex`。
+- 最近验证：`cargo fmt && cargo check` 通过；仅剩既有 warning：`previews/mod.rs` unused `delete` import、`WeixinQrSession.created_at_ms` 未读取。
+
 ## ✅ 已完成（本轮）
 - **auth**: `POST /access-token`、`POST /otp/reset`、`POST /otp/reset/confirm`
   - state.rs 增加 pending_reset_otp_secret；models 增加 UpdateAccessTokenRequest / ConfirmOtpResetRequest / ResetOtpResponse

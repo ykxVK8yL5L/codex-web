@@ -3,7 +3,7 @@ mod environment;
 mod maintenance;
 mod models;
 mod storage;
-mod store;
+pub(crate) mod store;
 
 use axum::{
     extract::{Multipart, Path, Query, State},
@@ -46,6 +46,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/session-compaction",
             get(session_compaction).patch(update_session_compaction),
+        )
+        .route(
+            "/token-usage-retention",
+            get(token_usage_retention).patch(update_token_usage_retention),
+        )
+        .route(
+            "/token-usage-display",
+            get(token_usage_display).patch(update_token_usage_display),
         )
         .route("/rate-limit", get(rate_limit).patch(update_rate_limit))
         .route(
@@ -161,6 +169,40 @@ async fn update_session_compaction(
 ) -> Result<Json<models::SessionCompactionSettings>, (StatusCode, Json<serde_json::Value>)> {
     Ok(Json(
         store::save_session_compaction(&state.db, body).map_err(api_error)?,
+    ))
+}
+
+async fn token_usage_retention(
+    State(state): State<AppState>,
+) -> Result<Json<models::TokenUsageRetentionSettings>, (StatusCode, Json<serde_json::Value>)> {
+    Ok(Json(
+        store::token_usage_retention(&state.db).map_err(api_error)?,
+    ))
+}
+
+async fn update_token_usage_retention(
+    State(state): State<AppState>,
+    Json(body): Json<models::UpdateTokenUsageRetentionSettings>,
+) -> Result<Json<models::TokenUsageRetentionSettings>, (StatusCode, Json<serde_json::Value>)> {
+    Ok(Json(
+        store::save_token_usage_retention(&state.db, body).map_err(api_error)?,
+    ))
+}
+
+async fn token_usage_display(
+    State(state): State<AppState>,
+) -> Result<Json<models::TokenUsageDisplaySettings>, (StatusCode, Json<serde_json::Value>)> {
+    Ok(Json(
+        store::token_usage_display(&state.db).map_err(api_error)?,
+    ))
+}
+
+async fn update_token_usage_display(
+    State(state): State<AppState>,
+    Json(body): Json<models::UpdateTokenUsageDisplaySettings>,
+) -> Result<Json<models::TokenUsageDisplaySettings>, (StatusCode, Json<serde_json::Value>)> {
+    Ok(Json(
+        store::save_token_usage_display(&state.db, body).map_err(api_error)?,
     ))
 }
 

@@ -179,6 +179,7 @@ export function registerTaskRoutes(app: Hono, deps: TaskRoutesDeps) {
     if (!body) return c.json({ error: "invalid_session_update" }, 400);
     if (body.title !== undefined) session.title = body.title.trim() || session.title;
     if (body.notificationsEnabled !== undefined) session.notificationsEnabled = body.notificationsEnabled !== false;
+    if (body.showMessageUsage !== undefined) session.showMessageUsage = body.showMessageUsage === true;
     session.updatedAt = new Date().toISOString();
     upsertSession(session);
     return c.json(session);

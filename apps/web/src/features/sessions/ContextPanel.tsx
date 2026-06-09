@@ -1,17 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Activity, Check, Clock3, Copy, FolderGit2, FolderOpen, Globe, Info, RefreshCw, RotateCcw, Save, Terminal as TerminalIcon, Trash2, X } from "lucide-react";
-import type { CodexTaskDetail, GoalDetailResponse, MessageCardSummary, PreviewSummary, QueuedMessage, SessionSummary, TaskActivityResponse, WorkspaceChangeFile, WorkspaceChanges } from "@codex-web/protocol";
+import type { CodexTaskDetail, GoalDetailResponse, MessageCardSummary, PreviewSummary, QueuedMessage, SessionSummary, TaskActivityResponse, TokenUsageResponse, WorkspaceChangeFile, WorkspaceChanges } from "@codex-web/protocol";
 import { useAppDialog } from "@/components/AppDialog";
 import { IconText } from "@/components/IconText";
 import { copyText } from "@/lib/clipboard";
 import { sessionInfoRequestedEvent, taskActivityChangedEvent, workspaceChangedEvent } from "@/lib/events";
-import { formatBytes, formatShortDate } from "@/lib/format";
+import { formatBytes, formatShortDate, formatTokens } from "@/lib/format";
 import { openPreviewUrl } from "@/lib/previews";
 import { ActivityPanel } from "@/features/sessions/ActivityPanel";
 import { QueuedMessageRow } from "@/features/sessions/QueuedMessageRow";
 import { activityFromSummary, readableActivityStatus, readableGoalMode, readableGoalStatus, readableStatus, type ActivityItem, type TFunction } from "@/features/sessions/utils";
 
 type ToastTone = "info" | "success" | "error";
+type BrowserRow = {
+  id: string;
+  label: string;
+  detail: string;
+  href: string;
+  cardId: string | null;
+};
 
 export function ContextPanel({
   sessionToken,
@@ -49,15 +56,19 @@ export function ContextPanel({
   const [activityItems, setActivityItems] = useState<ActivityItem[]>([]);
   const [activityCursor, setActivityCursor] = useState<string | null>(null);
   const [activityHasMore, setActivityHasMore] = useState(false);
+  const [usageOverview, setUsageOverview] = useState<TokenUsageResponse | null>(null);
+  const [usageDelta, setUsageDelta] = useState(0);
   const [contextDraggedQueueId, setContextDraggedQueueId] = useState<string | null>(null);
   const activityRefreshTimerRef = useRef<number | null>(null);
   const changesRefreshTimerRef = useRef<number | null>(null);
+  const usageTotalRef = useRef(0);
+  const usageDeltaTimerRef = useRef<number | null>(null);
   const selectedFile = changes?.files.find((item) => item.path === selectedPath) ?? changes?.files[0] ?? null;
   const goal = goalDetail?.goal ?? session?.goal ?? null;
   const goalItems = goalDetail?.items ?? [];
   const latestActivity = activityItems[0] ?? null;
   const previewIds = new Set(previews.map((preview) => preview.id));
-  const browserRows = [
+  const browserRows = uniqueBrowserRows([
     ...previews.map((preview) => ({
       id: `preview:${preview.id}`,
       label: preview.label,
@@ -79,7 +90,7 @@ export function ContextPanel({
         cardId: card.id,
       }];
     }),
-  ].slice(0, 6);
+  ]).slice(0, 6);
   const progressSteps = [
     ...(goal ? [{ id: goal.id, label: goal.text, meta: `${readableGoalMode(goal.mode, t)} · ${readableGoalStatus(goal.status, t)}`, done: goal.status === "completed" }] : []),
     ...(goal?.currentFocus ? [{ id: goal.currentFocus.id, label: goal.currentFocus.text, meta: t("progress.currentFocus"), done: goal.currentFocus.status === "completed" }] : []),
@@ -180,6 +191,33 @@ export function ContextPanel({
     setActivityHasMore(result.hasMore);
   }, [activityCursor, session?.id, sessionToken]);
 
+  const loadUsageOverview = useCallback(async () => {
+    if (!session?.id) {
+      setUsageOverview(null);
+      setUsageDelta(0);
+      usageTotalRef.current = 0;
+      return;
+    }
+    const params = new URLSearchParams({ sessionId: session.id, limit: "1" });
+    const response = await fetch(`/api/usage?${params}`, {
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    if (!response.ok) return;
+    const nextUsage = (await response.json()) as TokenUsageResponse;
+    const previousTotal = usageTotalRef.current;
+    const nextTotal = nextUsage.summary.totalTokens;
+    if (previousTotal > 0 && nextTotal > previousTotal) {
+      setUsageDelta(nextTotal - previousTotal);
+      if (usageDeltaTimerRef.current !== null) window.clearTimeout(usageDeltaTimerRef.current);
+      usageDeltaTimerRef.current = window.setTimeout(() => {
+        usageDeltaTimerRef.current = null;
+        setUsageDelta(0);
+      }, 1400);
+    }
+    usageTotalRef.current = nextTotal;
+    setUsageOverview(nextUsage);
+  }, [session?.id, sessionToken]);
+
   const scheduleLoadActivity = useCallback(() => {
     if (activityRefreshTimerRef.current !== null) window.clearTimeout(activityRefreshTimerRef.current);
     activityRefreshTimerRef.current = window.setTimeout(() => {
@@ -209,8 +247,22 @@ export function ContextPanel({
     setActivityCursor(null);
     setActivityHasMore(false);
     if (activePanel === "activity" || activePanel === "progress") void loadActivity();
-    if (activePanel === "progress") void Promise.all([loadPreviews(), loadBrowserCards()]);
-  }, [activePanel, loadBrowserCards, loadPreviews, session?.id, sessionToken]);
+    if (activePanel === "progress") void Promise.all([loadPreviews(), loadBrowserCards(), loadUsageOverview()]);
+  }, [activePanel, loadBrowserCards, loadPreviews, loadUsageOverview, session?.id, sessionToken]);
+
+  useEffect(() => {
+    usageTotalRef.current = 0;
+    setUsageDelta(0);
+    setUsageOverview(null);
+    if (usageDeltaTimerRef.current !== null) {
+      window.clearTimeout(usageDeltaTimerRef.current);
+      usageDeltaTimerRef.current = null;
+    }
+  }, [session?.id]);
+
+  useEffect(() => () => {
+    if (usageDeltaTimerRef.current !== null) window.clearTimeout(usageDeltaTimerRef.current);
+  }, []);
 
   useEffect(() => {
     function handleWorkspaceChanged(event: Event) {
@@ -234,7 +286,7 @@ export function ContextPanel({
       if (!session?.id || detail?.sessionId !== session.id) return;
       if (activePanel !== "activity" && activePanel !== "progress") return;
       scheduleLoadActivity();
-      if (activePanel === "progress") void loadBrowserCards();
+      if (activePanel === "progress") void Promise.all([loadBrowserCards(), loadUsageOverview()]);
     }
     window.addEventListener(taskActivityChangedEvent, handleTaskActivityChanged);
     return () => {
@@ -244,7 +296,7 @@ export function ContextPanel({
         activityRefreshTimerRef.current = null;
       }
     };
-  }, [activePanel, loadBrowserCards, scheduleLoadActivity, session?.id]);
+  }, [activePanel, loadBrowserCards, loadUsageOverview, scheduleLoadActivity, session?.id]);
 
   async function copyPatch(file?: WorkspaceChangeFile | null) {
     const value = file ? file.patch || file.newContent || "" : changes?.raw.diff ?? "";
@@ -340,9 +392,21 @@ export function ContextPanel({
             <IconText icon={Activity}>{t("session.activityTitle")}</IconText>
           </button>
         </div>
-        <button className="ghost-button icon-only" type="button" title={t("action.refresh")} aria-label={t("action.refresh")} onClick={() => activePanel === "changes" ? void loadChanges() : activePanel === "progress" ? void Promise.all([loadActivity(), loadGoalDetail(), loadPreviews(), loadBrowserCards()]) : void loadActivity()} disabled={!session}><IconText icon={RefreshCw}>{t("action.refresh")}</IconText></button>
+        <button className="ghost-button icon-only" type="button" title={t("action.refresh")} aria-label={t("action.refresh")} onClick={() => activePanel === "changes" ? void loadChanges() : activePanel === "progress" ? void Promise.all([loadActivity(), loadGoalDetail(), loadPreviews(), loadBrowserCards(), loadUsageOverview()]) : void loadActivity()} disabled={!session}><IconText icon={RefreshCw}>{t("action.refresh")}</IconText></button>
       </header>
       <section className={`panel progress-panel ${activePanel === "progress" ? "active" : ""}`}>
+        <div className="progress-usage-card">
+          <div className="progress-usage-main">
+            <span>{t("usage.currentSession")}</span>
+            <strong>{formatTokens(usageOverview?.summary.totalTokens ?? 0)}</strong>
+            <em>{t("usage.totalTokens")}</em>
+          </div>
+          {usageDelta > 0 && <span className="progress-usage-delta">+{formatTokens(usageDelta)}</span>}
+          <div className="progress-usage-breakdown" title={`${t("usage.inputTokens")} ${formatTokens(usageOverview?.summary.inputTokens ?? 0)} · ${t("usage.outputTokens")} ${formatTokens(usageOverview?.summary.outputTokens ?? 0)} · ${t("usage.cachedInputTokens")} ${formatTokens(usageOverview?.summary.cachedInputTokens ?? 0)} · ${t("usage.reasoningTokens")} ${formatTokens(usageOverview?.summary.reasoningOutputTokens ?? 0)}`}>
+            <span>{t("usage.inputTokens")} {formatTokens(usageOverview?.summary.inputTokens ?? 0)}</span>
+            <span>{t("usage.outputTokens")} {formatTokens(usageOverview?.summary.outputTokens ?? 0)}</span>
+          </div>
+        </div>
         <div className="progress-section">
           <div className="progress-section-head">
             <strong>{t("progress.title")}</strong>
@@ -462,4 +526,13 @@ export function ContextPanel({
       </section>
     </aside>
   );
+}
+
+function uniqueBrowserRows(rows: BrowserRow[]) {
+  const seen = new Set<string>();
+  return rows.filter((row) => {
+    if (seen.has(row.id)) return false;
+    seen.add(row.id);
+    return true;
+  });
 }

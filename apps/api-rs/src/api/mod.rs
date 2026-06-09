@@ -17,6 +17,7 @@ pub mod sessions;
 pub mod settings;
 pub mod tasks;
 pub mod terminal;
+pub mod usage;
 pub mod webhooks;
 
 use axum::{middleware, Router};
@@ -55,6 +56,7 @@ fn protected_api_router() -> Router<AppState> {
         .nest("/api/rooms", rooms::router())
         .nest("/api/sessions", sessions::router())
         .nest("/api/settings", settings::router())
+        .nest("/api/usage", usage::router())
         .nest("/api/codex/tasks", tasks::router())
         .nest("/api/task-runs", tasks::task_runs_router())
         .nest("/api/execution-contexts", execution_contexts::router())

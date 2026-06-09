@@ -46,9 +46,22 @@ async fn main() -> anyhow::Result<()> {
 fn spawn_scheduled_work_loop(state: AppState) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut last_usage_cleanup = std::time::Instant::now() - std::time::Duration::from_secs(3600);
         loop {
             interval.tick().await;
             api::automations::runtime::check_scheduled_work_threaded(state.clone());
+            if last_usage_cleanup.elapsed() >= std::time::Duration::from_secs(3600) {
+                last_usage_cleanup = std::time::Instant::now();
+                if let Ok(settings) = api::settings::store::token_usage_retention(&state.db) {
+                    match api::usage::cleanup_by_retention(&state.db, settings.retention_days) {
+                        Ok(deleted) if deleted > 0 => {
+                            tracing::info!("token usage retention cleanup deleted {deleted} records");
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!("token usage retention cleanup failed: {error}"),
+                    }
+                }
+            }
             if let Err(error) = api::rooms::trigger_due_room_schedules_runtime(state.clone()).await
             {
                 tracing::warn!("room schedule check failed: {error}");

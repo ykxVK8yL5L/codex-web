@@ -347,6 +347,8 @@ import type {
   TaskLogResponse,
   TaskRunSummary,
   TerminalSessionSummary,
+  TokenUsageRetentionSettings,
+  TokenUsageDisplaySettings,
   UploadAttachmentInput,
   UpdateQueuedMessageRequest,
   UpdateAgentGroupRequest,
@@ -421,6 +423,7 @@ import { registerProviderRoutes } from "./providers/routes.js";
 import { createProviderRuntime } from "./providers/runtime.js";
 import { registerPreviewLogStreamRoute, registerPreviewRoutes } from "./previews/routes.js";
 import { createPreviewRuntime } from "./previews/runtime.js";
+import { cleanupTokenUsageRecords, ensureTokenUsageSchema, recordCodexUsage, registerUsageRoutes } from "./usage.js";
 import { createPreviewAccessService } from "./previews/access.js";
 import { createPreviewLogEventBus } from "./previews/events.js";
 import { createPreviewProcessRuntime } from "./previews/processes.js";
@@ -623,6 +626,8 @@ const {
 let codexRuntimeSettings = runtimeSettingsStore.codexRuntime.load();
 let previewAccessSettings = runtimeSettingsStore.previewAccess.load();
 let sessionCompactionSettings = runtimeSettingsStore.sessionCompaction.load();
+let tokenUsageRetentionSettings = runtimeSettingsStore.tokenUsageRetention.load();
+let tokenUsageDisplaySettings = runtimeSettingsStore.tokenUsageDisplay.load();
 let rateLimitSettings = rateLimitStore.load();
 let systemBackupSettings = loadSystemBackupSettings();
 let notificationTestSettings: NotificationTestSettings;
@@ -1253,6 +1258,7 @@ const sessionDeletionService = createSessionDeletionService({
 const { deleteSessionData } = sessionDeletionService;
 const sessionCompactionRuntime = createSessionCompactionRuntime({
   allSessionMessages,
+  appendSessionMessage,
   appendCodexErrorOutput: (session, value) => appendCodexErrorOutput(session, value),
   appData,
   db,
@@ -1576,6 +1582,8 @@ const settingsRouteDeps = {
   getPreviewAccessSettings: () => previewAccessSettings,
   getRateLimitSettings: () => rateLimitSettings,
   getSessionCompactionSettings: () => sessionCompactionSettings,
+  getTokenUsageDisplaySettings: () => tokenUsageDisplaySettings,
+  getTokenUsageRetentionSettings: () => tokenUsageRetentionSettings,
   getSystemBackupSettings: () => systemBackupSettings,
   join,
   listApprovalGrants,
@@ -1627,6 +1635,12 @@ const settingsRouteDeps = {
   },
   setSessionCompactionSettings: (next: SessionCompactionSettings) => {
     sessionCompactionSettings = next;
+  },
+  setTokenUsageRetentionSettings: (next: TokenUsageRetentionSettings) => {
+    tokenUsageRetentionSettings = next;
+  },
+  setTokenUsageDisplaySettings: (next: TokenUsageDisplaySettings) => {
+    tokenUsageDisplaySettings = next;
   },
   setSystemBackupSettings: (next: SystemBackupSettings) => {
     systemBackupSettings = next;
@@ -2030,6 +2044,28 @@ function openDatabase() {
       rpm_limit_enabled integer not null default 0,
       use_proxy integer not null default 0
     );
+    create table if not exists token_usage_records (
+      id text primary key,
+      session_id text not null,
+      session_title text,
+      message_id text,
+      task_run_id text,
+      provider_id text,
+      provider_name text,
+      model text,
+      source text not null,
+      raw_hash text not null,
+      input_tokens integer not null default 0,
+      cached_input_tokens integer not null default 0,
+      output_tokens integer not null default 0,
+      reasoning_output_tokens integer not null default 0,
+      total_tokens integer not null default 0,
+      raw_usage text,
+      created_at text not null
+    );
+    create unique index if not exists token_usage_records_raw_hash_idx on token_usage_records(raw_hash);
+    create index if not exists token_usage_records_session_idx on token_usage_records(session_id, created_at desc);
+    create index if not exists token_usage_records_provider_idx on token_usage_records(provider_id, created_at desc);
     create table if not exists projects (
       id text primary key,
       name text not null,
@@ -2050,6 +2086,7 @@ function openDatabase() {
       model text,
       codex_session_id text,
       notifications_enabled integer not null default 1,
+      show_message_usage integer not null default 0,
       status text not null,
       created_at text,
       updated_at text not null
@@ -2751,6 +2788,9 @@ function openDatabase() {
   if (!sessionColumns.some((column) => column.name === "notifications_enabled")) {
     database.prepare("alter table sessions add column notifications_enabled integer not null default 1").run();
   }
+  if (!sessionColumns.some((column) => column.name === "show_message_usage")) {
+    database.prepare("alter table sessions add column show_message_usage integer not null default 0").run();
+  }
   const roomColumns = database.prepare("pragma table_info(rooms)").all() as Array<{ name: string }>;
   if (!roomColumns.some((column) => column.name === "session_id")) {
     database.prepare("alter table rooms add column session_id text").run();
@@ -2876,8 +2916,8 @@ function openDatabase() {
 
 function upsertSession(session: SessionSummary) {
   db.prepare(`
-    insert into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, status, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    insert into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, show_message_usage, status, created_at, updated_at)
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     on conflict(id) do update set
       kind = excluded.kind,
       conversation_type = excluded.conversation_type,
@@ -2889,6 +2929,7 @@ function upsertSession(session: SessionSummary) {
       model = excluded.model,
       codex_session_id = excluded.codex_session_id,
       notifications_enabled = excluded.notifications_enabled,
+      show_message_usage = excluded.show_message_usage,
       status = excluded.status,
       created_at = excluded.created_at,
       updated_at = excluded.updated_at
@@ -2904,6 +2945,7 @@ function upsertSession(session: SessionSummary) {
     session.model ?? null,
     session.codexSessionId ?? null,
     session.notificationsEnabled === false ? 0 : 1,
+    session.showMessageUsage === true ? 1 : 0,
     session.status,
     session.createdAt ?? null,
     session.updatedAt,
@@ -3545,7 +3587,7 @@ function promptWithManagedContext(
   return [
     "Use this Codex Web managed context as authoritative project/session context.",
     `A copy has been written to: ${contextPackPath}`,
-    "Do not assume unavailable chat history beyond this pack and any Codex resume state.",
+    "Do not assume unavailable chat history beyond this pack.",
     "",
     fitManagedContextForPrompt(pack),
     "",
@@ -4213,6 +4255,7 @@ function processCodexLogChunk(session: SessionSummary, value: string) {
   codexTaskStdoutBuffers.set(session.id, lines.pop() ?? "");
   for (const line of lines) {
     rememberCodexSessionId(session, line);
+    recordCodexUsage({ db, sessions: appData.sessions, providers: appData.providers, parsePageLimit, latestRunningTaskRun }, session, line);
     const activity = line.trim() ? readActivityEvent(line) : null;
     if (activity && activity.type === "activity") {
       publishTaskEvent(session.id, activity);
@@ -5309,14 +5352,11 @@ function startCodexTask(
   } else {
     appendCodexOutput(session.id, "\n\n--- follow-up ---\n");
   }
-  const useResume = !resetOutput && Boolean(session.codexSessionId);
-  const args = useResume
-    ? ["exec", "resume", "--json", ...codexExecPermissionArgs("resume", cwd, effectiveExtraWritableDirs, effectiveRuntime), ...codexProviderConfigArgs(provider)]
-    : ["exec", "--json", ...codexExecPermissionArgs("exec", cwd, effectiveExtraWritableDirs, effectiveRuntime), ...codexProviderConfigArgs(provider)];
+  const useResume = false;
+  const args = ["exec", "--json", ...codexExecPermissionArgs("exec", cwd, effectiveExtraWritableDirs, effectiveRuntime), ...codexProviderConfigArgs(provider)];
   const selectedModel = model || provider?.defaultModel;
   if (selectedModel) args.push("-m", selectedModel);
-  if (useResume && session.codexSessionId) args.push(session.codexSessionId);
-  else args.push("--");
+  args.push("--");
   args.push(managedPrompt);
   const env = managedChildEnv();
   if (provider?.apiKey) env.OPENAI_API_KEY = provider.apiKey;
@@ -5541,6 +5581,9 @@ registerRoomRoutes(app, roomRouteDeps);
 
 registerProviderRoutes(app, providerRouteDeps);
 
+ensureTokenUsageSchema(db);
+registerUsageRoutes(app, { db, sessions: appData.sessions, providers: appData.providers, parsePageLimit, latestRunningTaskRun, getRetentionDays: () => tokenUsageRetentionSettings.retentionDays });
+
 registerExtensionRoutes(app, extensionRouteDeps);
 
 registerFileRoutes(app, fileRouteDeps);
@@ -5553,6 +5596,13 @@ const terminalApiWsServer = startTerminalApiWebSocket(apiServer);
 const previewWsServer = startPreviewWebSocketProxy(apiServer);
 const automationTimer = setInterval(checkScheduledWork, 60_000);
 automationTimer.unref();
+function cleanupTokenUsageByRetention() {
+  const deleted = cleanupTokenUsageRecords(db, tokenUsageRetentionSettings.retentionDays);
+  if (deleted > 0) console.log(`token usage retention cleanup deleted ${deleted} records`);
+}
+cleanupTokenUsageByRetention();
+const tokenUsageCleanupTimer = setInterval(cleanupTokenUsageByRetention, 60 * 60_000);
+tokenUsageCleanupTimer.unref();
 const startupAutomationTimer = setTimeout(runStartupAutomations, 2_000);
 startupAutomationTimer.unref();
 let shuttingDown = false;
@@ -5560,6 +5610,7 @@ function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
   clearInterval(automationTimer);
+  clearInterval(tokenUsageCleanupTimer);
   clearTimeout(startupAutomationTimer);
   shutdownEmailPlatform();
   shutdownTelegramPlatform();

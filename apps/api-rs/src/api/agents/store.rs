@@ -943,7 +943,7 @@ pub fn agent_sessions(
     if !table_exists(&connection, "sessions")? || !table_exists(&connection, "agent_sessions")? {
         return Ok(page(Vec::new(), false));
     }
-    let mut sql = "select sessions.id, sessions.kind, sessions.conversation_type, sessions.room_id, sessions.title, sessions.project_id, sessions.workspace_path, sessions.provider_id, sessions.model, sessions.codex_session_id, sessions.notifications_enabled, sessions.status, sessions.created_at, sessions.updated_at from sessions inner join agent_sessions on agent_sessions.session_id = sessions.id where agent_sessions.agent_id = ?".to_string();
+    let mut sql = "select sessions.id, sessions.kind, sessions.conversation_type, sessions.room_id, sessions.title, sessions.project_id, sessions.workspace_path, sessions.provider_id, sessions.model, sessions.codex_session_id, sessions.notifications_enabled, sessions.show_message_usage, sessions.status, sessions.created_at, sessions.updated_at from sessions inner join agent_sessions on agent_sessions.session_id = sessions.id where agent_sessions.agent_id = ?".to_string();
     if status.is_some() {
         sql.push_str(" and sessions.status = ?");
     }
@@ -1117,7 +1117,7 @@ pub fn create_agent_session(
     let project_db_id = project.as_ref().map(|p| p.id.clone());
     let model = agent.model.clone();
     connection.execute(
-        "insert into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, status, created_at, updated_at) values (?, ?, 'agent', null, ?, ?, ?, ?, ?, null, 1, 'paused', ?, ?)",
+        "insert into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, show_message_usage, status, created_at, updated_at) values (?, ?, 'agent', null, ?, ?, ?, ?, ?, null, 1, 0, 'paused', ?, ?)",
         params![
             &id,
             kind,
@@ -1437,7 +1437,7 @@ fn collection_rooms(
         return Ok(page(Vec::new(), false));
     }
     let mut sql = format!(
-        "select sessions.id, sessions.kind, sessions.conversation_type, sessions.room_id, sessions.title, sessions.project_id, sessions.workspace_path, sessions.provider_id, sessions.model, sessions.codex_session_id, sessions.notifications_enabled, sessions.status, sessions.created_at, sessions.updated_at from rooms inner join sessions on sessions.id = rooms.session_id where rooms.{column} = ?"
+        "select sessions.id, sessions.kind, sessions.conversation_type, sessions.room_id, sessions.title, sessions.project_id, sessions.workspace_path, sessions.provider_id, sessions.model, sessions.codex_session_id, sessions.notifications_enabled, sessions.show_message_usage, sessions.status, sessions.created_at, sessions.updated_at from rooms inner join sessions on sessions.id = rooms.session_id where rooms.{column} = ?"
     );
     if status.is_some() {
         sql.push_str(" and sessions.status = ?");
@@ -1667,7 +1667,7 @@ fn read_session(
     connection: &rusqlite::Connection,
     id: &str,
 ) -> anyhow::Result<Option<SessionSummary>> {
-    let mut statement = connection.prepare("select id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, status, created_at, updated_at from sessions where id = ?")?;
+    let mut statement = connection.prepare("select id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, show_message_usage, status, created_at, updated_at from sessions where id = ?")?;
     let mut session = statement.query_row([id], session_from_row).optional()?;
     if let Some(session) = session.as_mut() {
         session.direct_agent_id = connection
@@ -1703,9 +1703,10 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary>
         model: row.get(8)?,
         codex_session_id: row.get(9)?,
         notifications_enabled: row.get::<_, Option<i64>>(10)?.unwrap_or(1) != 0,
-        status: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
+        show_message_usage: row.get::<_, Option<i64>>(11)?.unwrap_or(0) != 0,
+        status: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
         goal: None,
     })
 }

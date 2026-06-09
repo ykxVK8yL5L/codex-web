@@ -30,6 +30,18 @@ export function formatBytes(value: number) {
   return `${size >= 10 || unit === 0 ? Math.round(size) : size.toFixed(1)} ${units[unit]}`;
 }
 
+export function formatTokens(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return "0";
+  const units = ["", "K", "M", "B"];
+  let size = value;
+  let unit = 0;
+  while (size >= 1000 && unit < units.length - 1) {
+    size /= 1000;
+    unit += 1;
+  }
+  return `${size >= 10 || unit === 0 ? Math.round(size) : size.toFixed(1)}${units[unit]}`;
+}
+
 function shellQuote(value: string) {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }

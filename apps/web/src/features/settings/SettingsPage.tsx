@@ -12,10 +12,10 @@ import { NotificationPlatformsPanel } from "@/components/settings/NotificationPl
 import { apiKeyActionLabel, apiKeyGroupLabel, apiKeyModuleLabel, apiKeyPermissionGroupDescription, apiKeyPermissionGroupLabel, apiKeyPermissionGroupTitle, apiKeyPermissionLabel, apiKeyPermissionOptionLabel, apiKeyPermissionOptionTitle, apiKeyPresetLabel } from "@/features/settings/labels";
 import { readableBackupManifestText, readableNotificationEvent, readableStorageItemType, readableStorageSessionKind, readableStorageSessionType } from "@/features/settings/utils";
 import { clearNotificationDeliveriesRequest, clearNotificationRulesRequest, buildNotificationAccountConfig, buildNotificationRecipientConfig, createNotificationAccountForm, createNotificationChannelForm, createNotificationEphemeralRule, createNotificationRecipientForm, createNotificationRuleForm, createNotificationTestSettingsForm, deleteNotificationAccountRequest, deleteNotificationChannelRequest, deleteNotificationDeliveryRequest, deleteNotificationEphemeralRuleRequest, deleteNotificationRecipientRequest, deleteNotificationRuleRequest, fetchNotificationDeliveriesPage, fetchNotificationEphemeralRulesPage, fetchNotificationPlatformSettings, fetchNotificationRulesPage, fetchNotificationSettings, fetchNotificationTestSettings, NotificationAccountEditorDialog, NotificationAccountList, NotificationChannelManagerDialog, NotificationCustomTestDialog, type NotificationAccountForm, type NotificationCustomTestForm, notificationKindLabel, notificationAccountFormFromAccount, notificationRecipientFormFromRecipient, notificationRuleFormFromRule, notificationAccountKind as resolveNotificationAccountKind, notificationPermissionSummary as notificationPermissionSummaryText, notificationPermissionsFromForm, notificationPermissionsToForm, notificationAccountTestTarget as buildNotificationAccountTestTarget, notificationSenderAccountsForKind as getNotificationSenderAccountsForKind, NotificationRecipientList, NotificationRecipientEditorDialog, NotificationTestSettingsCard, type NotificationChannelForm, type NotificationRecipientForm, type NotificationRuleForm, type NotificationTestSettingsForm, retryNotificationDeliveryRequest, testNotificationAccountRequest, testNotificationRecipientRequest, updateNotificationTestSettings, selectedNotificationChannel as resolveSelectedNotificationChannel, upsertNotificationAccount, upsertNotificationChannel, upsertNotificationRecipient, upsertNotificationRule } from "@/features/notifications";
-import { formatBytes, formatShortDate, prettyJson } from "@/lib/format";
+import { formatBytes, formatShortDate, formatTokens, prettyJson } from "@/lib/format";
 import type { Locale, TranslationKey } from "@/lib/i18n";
 import { copyText } from "@/lib/utils";
-import type { ApprovalSummary, ApiKeyDetailResponse, ApiKeyPermission, ApiKeyPermissionGroup, ApiKeyPermissionsResponse, ApiKeyPreset, ApiKeySummary, AuthState, CodexApprovalPolicy, CodexRuntimeSettings, CodexSandboxMode, ConfirmOtpResetRequest, CreateApiKeyRequest, EnvironmentBulkActionRequest, EnvironmentOverview, EnvironmentPackageDetailResponse, EnvironmentPackageRecord, EnvironmentRestoreMissingRequest, EnvironmentRestorePreviewResponse, EnvironmentRestoreRun, EnvironmentToolProbe, EnvironmentToolRecord, EnvironmentToolRegistryItem, EnvironmentToolVersionItem, InstallEnvironmentToolRequest, LoginResponse, MaintenanceCleanupResponse, NotificationAccountSummary, NotificationChannelDefinition, NotificationDeliverySummary, NotificationEphemeralRuleSummary, NotificationEventType, NotificationRecipientSummary, NotificationRuleSummary, NotificationRuleTarget, NotificationSettingsResponse, NotificationSeverity, NotificationTestSettings, PlatformSettingsResponse, PreviewAccessSettings, RateLimitSettings, ResetOtpResponse, SessionCompactionSettings, StorageItemSummary, StorageScanResponse, SystemBackupPreviewResponse, SystemBackupSettings, SystemRestoreResponse, TaskHealthRepairResponse, TaskHealthResponse, UpdateAccessTokenRequest, UpdateApiKeyRequest, UpdateCodexRuntimeSettingsRequest, UpdateSessionCompactionSettingsRequest, UpdateSystemBackupSettingsRequest } from "@codex-web/protocol";
+import type { ApprovalSummary, ApiKeyDetailResponse, ApiKeyPermission, ApiKeyPermissionGroup, ApiKeyPermissionsResponse, ApiKeyPreset, ApiKeySummary, AuthState, CodexApprovalPolicy, CodexRuntimeSettings, CodexSandboxMode, ConfirmOtpResetRequest, CreateApiKeyRequest, EnvironmentBulkActionRequest, EnvironmentOverview, EnvironmentPackageDetailResponse, EnvironmentPackageRecord, EnvironmentRestoreMissingRequest, EnvironmentRestorePreviewResponse, EnvironmentRestoreRun, EnvironmentToolProbe, EnvironmentToolRecord, EnvironmentToolRegistryItem, EnvironmentToolVersionItem, InstallEnvironmentToolRequest, LoginResponse, MaintenanceCleanupResponse, NotificationAccountSummary, NotificationChannelDefinition, NotificationDeliverySummary, NotificationEphemeralRuleSummary, NotificationEventType, NotificationRecipientSummary, NotificationRuleSummary, NotificationRuleTarget, NotificationSettingsResponse, NotificationSeverity, NotificationTestSettings, PlatformSettingsResponse, PreviewAccessSettings, RateLimitSettings, ResetOtpResponse, SessionCompactionSettings, StorageItemSummary, StorageScanResponse, SystemBackupPreviewResponse, SystemBackupSettings, SystemRestoreResponse, TaskHealthRepairResponse, TaskHealthResponse, TokenUsageDisplaySettings, TokenUsageResponse, TokenUsageRetentionSettings, UpdateAccessTokenRequest, UpdateApiKeyRequest, UpdateCodexRuntimeSettingsRequest, UpdateSessionCompactionSettingsRequest, UpdateSystemBackupSettingsRequest } from "@codex-web/protocol";
 
 type TFunction = (key: TranslationKey) => string;
 type ToastTone = "info" | "success" | "error";
@@ -82,6 +82,14 @@ export function SettingsPage({
   const [cleanupArchivedApprovalDays, setCleanupArchivedApprovalDays] = useState(30);
   const [cleanupApprovalAuditLog, setCleanupApprovalAuditLog] = useState(false);
   const [taskHealth, setTaskHealth] = useState<TaskHealthResponse | null>(null);
+  const [usageOverview, setUsageOverview] = useState<TokenUsageResponse | null>(null);
+  const [usageRecentPage, setUsageRecentPage] = useState(0);
+  const [usageFilterFrom, setUsageFilterFrom] = useState("");
+  const [usageFilterTo, setUsageFilterTo] = useState("");
+  const [appliedUsageFilter, setAppliedUsageFilter] = useState({ createdFrom: "", createdTo: "" });
+  const [usageRetention, setUsageRetention] = useState<TokenUsageRetentionSettings | null>(null);
+  const [usageDisplay, setUsageDisplay] = useState<TokenUsageDisplaySettings | null>(null);
+  const [usageRetentionDays, setUsageRetentionDays] = useState("0");
   const [settingsTab, setSettingsTab] = useState<"account" | "runtime" | "environment" | "network" | "notifications" | "maintenance" | "storage" | "backup">("account");
   const [busy, setBusy] = useState("");
   const [codexRuntime, setCodexRuntime] = useState<CodexRuntimeSettings | null>(null);
@@ -172,6 +180,8 @@ export function SettingsPage({
   const [notificationChannelManagerOpen, setNotificationChannelManagerOpen] = useState(false);
   const [notificationEditingChannelId, setNotificationEditingChannelId] = useState("");
   const [notificationChannelForm, setNotificationChannelForm] = useState<NotificationChannelForm>(createNotificationChannelForm());
+  const usageTotalPages = usageOverview?.recentTotalPages ?? 1;
+  const usagePageButtons = Array.from({ length: Math.min(5, usageTotalPages) }, (_, index) => Math.min(Math.max(usageRecentPage - 2, 0), Math.max(usageTotalPages - 5, 0)) + index).filter((page) => page < usageTotalPages);
 
   function showTokenNotice(value: string) {
     setTokenMessage(value);
@@ -220,6 +230,21 @@ export function SettingsPage({
           minNewMessages: String(settings.minNewMessages),
           minNewChars: String(settings.minNewChars),
         });
+      })
+      .catch(() => undefined);
+    fetch("/api/settings/token-usage-retention", { headers })
+      .then((response) => response.ok ? response.json() : null)
+      .then((settings: TokenUsageRetentionSettings | null) => {
+        if (!settings) return;
+        setUsageRetention(settings);
+        setUsageRetentionDays(String(settings.retentionDays));
+      })
+      .catch(() => undefined);
+    fetch("/api/settings/token-usage-display", { headers })
+      .then((response) => response.ok ? response.json() : null)
+      .then((settings: TokenUsageDisplaySettings | null) => {
+        if (!settings) return;
+        setUsageDisplay(settings);
       })
       .catch(() => undefined);
     fetch("/api/settings/rate-limit", { headers })
@@ -290,6 +315,7 @@ export function SettingsPage({
       })
       .catch(() => undefined);
     void loadNotifications();
+    void loadUsageOverview();
   }, [sessionToken]);
 
   useEffect(() => {
@@ -324,6 +350,156 @@ export function SettingsPage({
     setNotificationRuleCursor(rulesPage?.nextCursor ?? null);
     setNotificationEphemeralRuleCursor(ephemeralRulesPage?.nextCursor ?? null);
     setNotificationDeliveryCursor(deliveriesPage?.nextCursor ?? null);
+  }
+
+  async function loadUsageOverview(page = 0, filters = appliedUsageFilter) {
+    const params = new URLSearchParams({ limit: "10", page: String(Math.max(0, page)) });
+    const from = datetimeLocalToIso(filters.createdFrom);
+    const to = datetimeLocalToIso(filters.createdTo);
+    if (from) params.set("createdFrom", from);
+    if (to) params.set("createdTo", to);
+    const response = await fetch(`/api/usage?${params}`, {
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    if (!response.ok) return;
+    const result = (await response.json()) as TokenUsageResponse;
+    setUsageOverview(result);
+    setUsageRecentPage(result.recentPage);
+  }
+
+  function applyUsageTimeFilter(event?: React.FormEvent) {
+    event?.preventDefault();
+    const filters = { createdFrom: usageFilterFrom, createdTo: usageFilterTo };
+    setAppliedUsageFilter(filters);
+    setUsageRecentPage(0);
+    void loadUsageOverview(0, filters);
+  }
+
+  function clearUsageTimeFilter() {
+    const filters = { createdFrom: "", createdTo: "" };
+    setUsageFilterFrom("");
+    setUsageFilterTo("");
+    setAppliedUsageFilter(filters);
+    setUsageRecentPage(0);
+    void loadUsageOverview(0, filters);
+  }
+
+  async function saveUsageRetention(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy("usage-retention");
+    try {
+      const response = await fetch("/api/settings/token-usage-retention", {
+        method: "PATCH",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ retentionDays: Number(usageRetentionDays) }),
+      });
+      if (!response.ok) {
+        notify(t("usage.retentionSaveFailed"), "error");
+        return;
+      }
+      const settings = (await response.json()) as TokenUsageRetentionSettings;
+      setUsageRetention(settings);
+      setUsageRetentionDays(String(settings.retentionDays));
+      notify(t("usage.retentionSaved"), "success");
+    } catch {
+      notify(t("usage.retentionSaveFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function updateUsageDisplay(showMessageUsage: boolean) {
+    setBusy("usage-display");
+    try {
+      const response = await fetch("/api/settings/token-usage-display", {
+        method: "PATCH",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ showMessageUsage }),
+      });
+      if (!response.ok) {
+        notify(t("usage.displaySaveFailed"), "error");
+        return;
+      }
+      setUsageDisplay((await response.json()) as TokenUsageDisplaySettings);
+      notify(t("usage.displaySaved"), "success");
+    } catch {
+      notify(t("usage.displaySaveFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function cleanupUsageRecords() {
+    if (!window.confirm(t("usage.cleanupConfirm"))) return;
+    setBusy("usage-cleanup");
+    try {
+      const response = await fetch("/api/usage/cleanup", {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      const result = await response.json().catch(() => null) as { deleted?: number } | null;
+      if (!response.ok || !result) {
+        notify(t("usage.cleanupFailed"), "error");
+        return;
+      }
+      notify(t("usage.cleanupDone").replace("{count}", String(result.deleted ?? 0)), "success");
+      void loadUsageOverview();
+    } catch {
+      notify(t("usage.cleanupFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function clearUsageRecords() {
+    if (!window.confirm(t("usage.clearConfirm"))) return;
+    setBusy("usage-clear");
+    try {
+      const response = await fetch("/api/usage/clear", {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      const result = await response.json().catch(() => null) as { deleted?: number } | null;
+      if (!response.ok || !result) {
+        notify(t("usage.clearFailed"), "error");
+        return;
+      }
+      notify(t("usage.clearDone").replace("{count}", String(result.deleted ?? 0)), "success");
+      void loadUsageOverview();
+    } catch {
+      notify(t("usage.clearFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function deleteFilteredUsageRecords() {
+    const createdFrom = datetimeLocalToIso(appliedUsageFilter.createdFrom);
+    const createdTo = datetimeLocalToIso(appliedUsageFilter.createdTo);
+    if (!createdFrom && !createdTo) {
+      notify(t("usage.deleteFilteredNeedsFilter"), "error");
+      return;
+    }
+    if (!window.confirm(t("usage.deleteFilteredConfirm"))) return;
+    setBusy("usage-delete-filtered");
+    try {
+      const response = await fetch("/api/usage/delete-filtered", {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ createdFrom, createdTo }),
+      });
+      const result = await response.json().catch(() => null) as { deleted?: number } | null;
+      if (!response.ok || !result) {
+        notify(t("usage.deleteFilteredFailed"), "error");
+        return;
+      }
+      notify(t("usage.deleteFilteredDone").replace("{count}", String(result.deleted ?? 0)), "success");
+      void loadUsageOverview(0);
+    } catch {
+      notify(t("usage.deleteFilteredFailed"), "error");
+    } finally {
+      setBusy("");
+    }
   }
 
   async function loadMoreNotificationRules() {
@@ -3025,6 +3201,110 @@ export function SettingsPage({
             </div>
           )}
           </section>
+          <section className="provider-card">
+          <strong>{t("usage.title")}</strong>
+          <span>{t("usage.globalHelp")}</span>
+          <label className="room-setting-row">
+            <span>{t("usage.showMessageUsageGlobal")}</span>
+            <Switch checked={usageDisplay?.showMessageUsage === true} disabled={busy === "usage-display"} onCheckedChange={(checked) => void updateUsageDisplay(checked)} />
+          </label>
+          <span className="subtle">{t("usage.showMessageUsageGlobalHelp")}</span>
+          <form className="usage-retention-form" onSubmit={saveUsageRetention}>
+            <label>
+              <span>{t("usage.retentionDays")}</span>
+              <input name="usageRetentionDays" className="search-input" type="number" min="0" max="3650" value={usageRetentionDays} onChange={(event) => setUsageRetentionDays(event.target.value)} />
+            </label>
+            <button className="ghost-button" type="submit" disabled={busy === "usage-retention"}><IconText icon={Save}>{t("action.save")}</IconText></button>
+          </form>
+          {usageRetention && <code>{usageRetention.retentionDays > 0 ? t("usage.retentionCurrent").replace("{days}", String(usageRetention.retentionDays)) : t("usage.retentionForever")}</code>}
+          <div className="settings-actions">
+            <button className="ghost-button" type="button" onClick={() => void loadUsageOverview()}><IconText icon={RefreshCw}>{t("action.refresh")}</IconText></button>
+            <button className="ghost-button danger-button" type="button" disabled={busy === "usage-cleanup" || !usageRetention?.retentionDays} onClick={() => void cleanupUsageRecords()}><IconText icon={Trash2}>{t("usage.cleanupNow")}</IconText></button>
+            <button className="ghost-button danger-button" type="button" disabled={busy === "usage-clear" || !usageOverview?.summary.records} onClick={() => void clearUsageRecords()}><IconText icon={Trash2}>{t("usage.clearAll")}</IconText></button>
+          </div>
+          {usageOverview && (
+            <>
+              <div className="item-row">
+                <strong>{t("usage.requestRecords")}</strong>
+                <span>{usageOverview.recent.length}/{usageOverview.summary.records}</span>
+              </div>
+              <form className="usage-filter-form" onSubmit={applyUsageTimeFilter}>
+                <label>
+                  <span>{t("usage.filterFrom")}</span>
+                  <input name="usageFilterFrom" className="search-input" type="datetime-local" value={usageFilterFrom} onChange={(event) => setUsageFilterFrom(event.target.value)} />
+                </label>
+                <label>
+                  <span>{t("usage.filterTo")}</span>
+                  <input name="usageFilterTo" className="search-input" type="datetime-local" value={usageFilterTo} onChange={(event) => setUsageFilterTo(event.target.value)} />
+                </label>
+                <div className="settings-actions">
+                  <button className="ghost-button" type="submit">{t("usage.applyFilter")}</button>
+                  <button className="ghost-button" type="button" disabled={!usageFilterFrom && !usageFilterTo && !appliedUsageFilter.createdFrom && !appliedUsageFilter.createdTo} onClick={clearUsageTimeFilter}>{t("usage.clearFilter")}</button>
+                  <button className="ghost-button danger-button" type="button" disabled={busy === "usage-delete-filtered" || (!appliedUsageFilter.createdFrom && !appliedUsageFilter.createdTo) || !usageOverview.summary.records} onClick={() => void deleteFilteredUsageRecords()}><IconText icon={Trash2}>{t("usage.deleteFiltered")}</IconText></button>
+                </div>
+              </form>
+            </>
+          )}
+          {usageOverview && usageOverview.summary.records > 0 ? (
+            <>
+              <div className="session-info-grid">
+                <div className="session-info-row"><span>{t("usage.totalTokens")}</span><strong>{formatTokens(usageOverview.summary.totalTokens)}</strong></div>
+                <div className="session-info-row"><span>{t("usage.inputTokens")}</span><strong>{formatTokens(usageOverview.summary.inputTokens)}</strong></div>
+                <div className="session-info-row"><span>{t("usage.outputTokens")}</span><strong>{formatTokens(usageOverview.summary.outputTokens)}</strong></div>
+                <div className="session-info-row"><span>{t("usage.cachedInputTokens")}</span><strong>{formatTokens(usageOverview.summary.cachedInputTokens)}</strong></div>
+                <div className="session-info-row"><span>{t("usage.reasoningTokens")}</span><strong>{formatTokens(usageOverview.summary.reasoningOutputTokens)}</strong></div>
+                <div className="session-info-row"><span>{t("usage.records")}</span><strong>{usageOverview.summary.records}</strong></div>
+              </div>
+              <span className="subtle">{t("usage.breakdownHelp")}</span>
+              <div className="storage-list">
+                {[...usageOverview.byProvider.slice(0, 3), ...usageOverview.byModel.slice(0, 3), ...usageOverview.bySession.slice(0, 3)].map((bucket, index) => (
+                  <div className="storage-item" key={`${bucket.key}:${index}`}>
+                    <div>
+                      <strong>{bucket.label ?? bucket.key}</strong>
+                      <span>{bucket.providerId ? t("usage.byProvider") : bucket.model ? t("usage.byModel") : t("usage.bySession")} · {bucket.deleted ? `${t("usage.deleted")} · ` : ""}{formatTokens(bucket.summary.totalTokens)} {t("usage.totalTokens")}</span>
+                    </div>
+                    <div className="storage-actions">
+                      <span className="pill">{t("usage.inputTokens")} {formatTokens(bucket.summary.inputTokens)}</span>
+                      <span className="pill">{t("usage.outputTokens")} {formatTokens(bucket.summary.outputTokens)}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="storage-list">
+                {usageOverview.recent.map((record) => (
+                  <div className="storage-item" key={record.id}>
+                    <div>
+                      <strong>{record.sessionTitle ?? record.sessionId}</strong>
+                      <span>{formatShortDate(record.createdAt)} · {record.providerName ?? record.providerId ?? "-"} / {record.model ?? "-"}</span>
+                      <span>{t("usage.requestId")} {record.id} · {t("usage.source")} {record.source}</span>
+                    </div>
+                    <div className="storage-actions">
+                      <span className="pill">{formatTokens(record.totalTokens)} {t("usage.totalTokens")}</span>
+                      <span className="pill">{t("usage.inputTokens")} {formatTokens(record.inputTokens)}</span>
+                      <span className="pill">{t("usage.cachedInputTokens")} {formatTokens(record.cachedInputTokens)}</span>
+                      <span className="pill">{t("usage.outputTokens")} {formatTokens(record.outputTokens)}</span>
+                      <span className="pill">{t("usage.reasoningTokens")} {formatTokens(record.reasoningOutputTokens)}</span>
+                      <span className="pill">{t("usage.billableInputTokens")} {formatTokens(record.billableInputTokens)}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {usageTotalPages > 1 && (
+                <div className="settings-actions">
+                  <button className="ghost-button" type="button" disabled={usageRecentPage === 0} onClick={() => void loadUsageOverview(usageRecentPage - 1)}>{t("usage.previousPage")}</button>
+                  {usagePageButtons[0] > 0 && <button className="ghost-button" type="button" onClick={() => void loadUsageOverview(0)}>1</button>}
+                  {usagePageButtons[0] > 1 && <span className="pill">...</span>}
+                  {usagePageButtons.map((page) => (
+                    <button className={`ghost-button${page === usageRecentPage ? " active" : ""}`} type="button" key={page} onClick={() => void loadUsageOverview(page)}>{page + 1}</button>
+                  ))}
+                  {usagePageButtons.at(-1) !== undefined && usagePageButtons.at(-1)! < usageTotalPages - 2 && <span className="pill">...</span>}
+                  {usagePageButtons.at(-1) !== undefined && usagePageButtons.at(-1)! < usageTotalPages - 1 && <button className="ghost-button" type="button" onClick={() => void loadUsageOverview(usageTotalPages - 1)}>{usageTotalPages}</button>}
+                  <button className="ghost-button" type="button" disabled={usageRecentPage >= usageTotalPages - 1} onClick={() => void loadUsageOverview(usageRecentPage + 1)}>{t("usage.nextPage")}</button>
+                </div>
+              )}
+            </>
+          ) : <div className="empty-state">{t("usage.empty")}</div>}
+          </section>
         </TabsContent>
         <TabsContent className="settings-list" value="storage">
           <section className="provider-card">
@@ -3336,4 +3616,10 @@ export function SettingsPage({
       {dialog.node}
     </main>
   );
+}
+
+function datetimeLocalToIso(value: string) {
+  if (!value.trim()) return "";
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : "";
 }

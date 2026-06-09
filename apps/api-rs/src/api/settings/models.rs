@@ -44,6 +44,32 @@ pub struct RateLimitSettings {
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TokenUsageRetentionSettings {
+    pub retention_days: i64,
+    pub updated_at: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageDisplaySettings {
+    pub show_message_usage: bool,
+    pub updated_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateTokenUsageRetentionSettings {
+    pub retention_days: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateTokenUsageDisplaySettings {
+    pub show_message_usage: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NotificationTestSettings {
     pub title_zh: String,
     pub title_en: String,

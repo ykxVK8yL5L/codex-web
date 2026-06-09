@@ -1,6 +1,6 @@
 import type Database from "better-sqlite3";
 import { randomUUID } from "node:crypto";
-import type { MessageCardSummary, PreviewSummary, SessionMessage, SessionSummary } from "@codex-web/protocol";
+import type { MessageCardSummary, PreviewSummary, SessionMessage, SessionSummary, TokenUsageRecordSummary } from "@codex-web/protocol";
 
 type ProviderPlatformForwarder = {
   forwardAssistantMessageToFeishu?: (session: SessionSummary, message: SessionMessage) => void;
@@ -42,7 +42,35 @@ function messageFromRow(row: Record<string, unknown>): SessionMessage {
       content: String(row.reply_content),
     };
   }
+  if (row.usage_id) {
+    const inputTokens = numberValue(row.usage_input_tokens);
+    const cachedInputTokens = numberValue(row.usage_cached_input_tokens);
+    const usage: TokenUsageRecordSummary = {
+      id: String(row.usage_id),
+      sessionId: String(row.usage_session_id ?? row.session_id ?? ""),
+      sessionTitle: row.usage_session_title ? String(row.usage_session_title) : null,
+      messageId: row.usage_message_id ? String(row.usage_message_id) : null,
+      taskRunId: row.usage_task_run_id ? String(row.usage_task_run_id) : null,
+      providerId: row.usage_provider_id ? String(row.usage_provider_id) : null,
+      providerName: row.usage_provider_name ? String(row.usage_provider_name) : null,
+      model: row.usage_model ? String(row.usage_model) : null,
+      source: String(row.usage_source ?? "codex_json"),
+      inputTokens,
+      cachedInputTokens,
+      outputTokens: numberValue(row.usage_output_tokens),
+      reasoningOutputTokens: numberValue(row.usage_reasoning_output_tokens),
+      totalTokens: numberValue(row.usage_total_tokens),
+      billableInputTokens: Math.max(0, inputTokens - cachedInputTokens),
+      createdAt: String(row.usage_created_at),
+    };
+    message.usage = usage;
+  }
   return message;
+}
+
+function numberValue(value: unknown) {
+  const number = Number(value ?? 0);
+  return Number.isFinite(number) ? number : 0;
 }
 
 function syncRoomMessagesToSession(session: SessionSummary) {

@@ -11,8 +11,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     api::providers::{models::ProviderRecord, store as provider_store},
-    api::sessions::{models::SessionSummary, store as session_store},
+    api::sessions::{messages as session_messages, models::SessionSummary, store as session_store},
     api::settings::load_session_compaction,
+    api::usage::{self, CodexUsage},
     db::Db,
     state::AppState,
 };
@@ -76,6 +77,12 @@ struct MessageRow {
     content: String,
     reply_to_message_id: Option<String>,
     created_at: String,
+}
+
+struct GeneratedSummary {
+    summary: String,
+    usage: Option<CodexUsage>,
+    raw: serde_json::Value,
 }
 
 pub fn get_latest_response(
@@ -332,7 +339,8 @@ async fn create_with_options(
 
     let prompt = compaction_prompt(session, &messages, &previous_summary);
     let prompt_hash = hash_prefix(&prompt);
-    let summary = generate_summary(&provider, &model, &prompt).await?;
+    let generated = generate_summary(&provider, &model, &prompt).await?;
+    let summary = generated.summary;
 
     let id = format!("compaction-{}", random_hex(16));
     let memory_root = session_memory_path(db, &session.id);
@@ -358,6 +366,31 @@ async fn create_with_options(
         &file_path.display().to_string(),
         previous.as_ref().map(|item| item.id.as_str()),
     )?;
+    let notice = compaction_notice(incremental, messages.len(), source_chars, generated.usage);
+    let notice_message = session_messages::append(
+        db,
+        &session.id,
+        crate::api::sessions::models::AppendSessionMessageRequest {
+            role: Some("system".to_string()),
+            content: Some(notice),
+            reply_to_message_id: None,
+        },
+    )
+    .ok();
+    if let Some(usage) = generated.usage {
+        let _ = usage::record_provider_usage(
+            db,
+            session,
+            Some(provider.summary.id.as_str()),
+            Some(provider.summary.name.as_str()),
+            Some(&model),
+            notice_message.as_ref().map(|message| message.id.as_str()),
+            "session_compaction",
+            &format!("{id}\n{prompt_hash}"),
+            &generated.raw,
+            usage,
+        );
+    }
     let compaction =
         latest(db, &session.id)?.ok_or_else(|| anyhow::anyhow!("session_compaction_not_found"))?;
     Ok(SessionCompactionResponse {
@@ -391,6 +424,41 @@ fn message_chars(messages: &[MessageRow]) -> i64 {
         .iter()
         .map(|message| message.content.chars().count() as i64)
         .sum()
+}
+
+fn compaction_notice(
+    incremental: bool,
+    message_count: usize,
+    source_chars: i64,
+    usage: Option<CodexUsage>,
+) -> String {
+    let mut lines = vec![
+        if incremental {
+            "会话记忆已自动压缩。".to_string()
+        } else {
+            "会话记忆已压缩。".to_string()
+        },
+        format!("压缩消息：{message_count} 条，字符：{source_chars}。"),
+    ];
+    if let Some(usage) = usage {
+        let mut usage_line = format!(
+            "Token：总 {}，输入 {}，输出 {}",
+            usage.input_tokens + usage.output_tokens,
+            usage.input_tokens,
+            usage.output_tokens
+        );
+        if usage.cached_input_tokens > 0 {
+            usage_line.push_str(&format!("，缓存输入 {}", usage.cached_input_tokens));
+        }
+        if usage.reasoning_output_tokens > 0 {
+            usage_line.push_str(&format!("，推理 {}", usage.reasoning_output_tokens));
+        }
+        usage_line.push('。');
+        lines.push(usage_line);
+    } else {
+        lines.push("Provider 未返回 usage。".to_string());
+    }
+    lines.join("\n")
 }
 
 pub fn latest_memory_markdown(db: &Db, session_id: &str) -> anyhow::Result<String> {
@@ -651,7 +719,7 @@ async fn generate_summary(
     provider: &ProviderRecord,
     model: &str,
     prompt: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<GeneratedSummary> {
     if provider.summary.kind == "local" {
         anyhow::bail!("provider_compaction_unsupported");
     }
@@ -703,7 +771,11 @@ async fn generate_summary(
         if content.is_empty() {
             anyhow::bail!("empty_compaction_summary");
         }
-        return Ok(content.to_string());
+        return Ok(GeneratedSummary {
+            summary: content.to_string(),
+            usage: usage::read_provider_usage(&payload),
+            raw: payload,
+        });
     }
     let base_url = provider
         .summary
@@ -731,7 +803,11 @@ async fn generate_summary(
     if content.is_empty() {
         anyhow::bail!("empty_compaction_summary");
     }
-    Ok(content)
+    Ok(GeneratedSummary {
+        summary: content,
+        usage: usage::read_provider_usage(&payload),
+        raw: payload,
+    })
 }
 
 fn response_output_text(payload: &serde_json::Value) -> String {

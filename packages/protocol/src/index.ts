@@ -99,9 +99,15 @@ export interface SessionSummary {
   model?: string | null;
   codexSessionId?: string | null;
   notificationsEnabled?: boolean;
+  showMessageUsage?: boolean;
   goal?: GoalSummary | null;
   status: "running" | "paused" | "done" | "interrupted";
   createdAt?: string;
+  updatedAt: string;
+}
+
+export interface TokenUsageDisplaySettings {
+  showMessageUsage: boolean;
   updatedAt: string;
 }
 
@@ -1047,6 +1053,7 @@ export interface CreateSessionRequest {
 export interface UpdateSessionRequest {
   title?: string;
   notificationsEnabled?: boolean;
+  showMessageUsage?: boolean;
 }
 
 export interface CreateGoalRequest {
@@ -1182,6 +1189,7 @@ export interface SessionMessage {
     role: "user" | "assistant" | "system";
     content: string;
   } | null;
+  usage?: TokenUsageRecordSummary | null;
   createdAt: string;
 }
 
@@ -1243,6 +1251,68 @@ export interface TaskRunSummary {
   promptChars?: number | null;
   promptHash?: string | null;
   contextPath?: string | null;
+}
+
+export interface TokenUsageSummary {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+  billableInputTokens: number;
+  records: number;
+}
+
+export interface TokenUsageRecordSummary {
+  id: string;
+  sessionId: string;
+  sessionTitle?: string | null;
+  messageId?: string | null;
+  taskRunId?: string | null;
+  providerId?: string | null;
+  providerName?: string | null;
+  model?: string | null;
+  source: "codex_json" | string;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+  billableInputTokens: number;
+  createdAt: string;
+}
+
+export interface TokenUsageBucket {
+  key: string;
+  label?: string | null;
+  deleted?: boolean;
+  providerId?: string | null;
+  model?: string | null;
+  sessionId?: string | null;
+  summary: TokenUsageSummary;
+  updatedAt?: string | null;
+}
+
+export interface TokenUsageResponse {
+  summary: TokenUsageSummary;
+  byProvider: TokenUsageBucket[];
+  byModel: TokenUsageBucket[];
+  bySession: TokenUsageBucket[];
+  recent: TokenUsageRecordSummary[];
+  recentNextCursor: string | null;
+  recentHasMore: boolean;
+  recentPage: number;
+  recentPageSize: number;
+  recentTotalPages: number;
+}
+
+export interface TokenUsageRetentionSettings {
+  retentionDays: number;
+  updatedAt: string;
+}
+
+export interface UpdateTokenUsageRetentionSettingsRequest {
+  retentionDays?: number;
 }
 
 export interface TaskLogResponse {

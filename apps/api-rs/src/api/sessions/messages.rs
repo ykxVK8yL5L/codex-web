@@ -3,8 +3,40 @@ use rusqlite::OptionalExtension;
 use crate::db::Db;
 
 use super::models::{
-    AppendSessionMessageRequest, SessionMessage, SessionMessageReply, SessionMessagesPage,
+    AppendSessionMessageRequest, SessionMessage, SessionMessageReply, SessionMessageUsage,
+    SessionMessagesPage,
 };
+
+const USAGE_JOIN_SQL: &str = "
+  left join token_usage_records usage on usage.id = (
+    select usage_by_message.id
+    from token_usage_records usage_by_message
+    where usage_by_message.session_id = messages.session_id
+      and usage_by_message.message_id = messages.id
+    order by usage_by_message.created_at desc, usage_by_message.id desc
+    limit 1
+  )
+";
+
+const MESSAGE_SELECT_SQL: &str = "
+  messages.id, messages.session_id, messages.role, messages.content, messages.reply_to_message_id, messages.created_at,
+  reply.id as reply_id, reply.role as reply_role, reply.content as reply_content,
+  usage.id as usage_id,
+  usage.session_id as usage_session_id,
+  usage.session_title as usage_session_title,
+  usage.message_id as usage_message_id,
+  usage.task_run_id as usage_task_run_id,
+  usage.provider_id as usage_provider_id,
+  usage.provider_name as usage_provider_name,
+  usage.model as usage_model,
+  usage.source as usage_source,
+  usage.input_tokens as usage_input_tokens,
+  usage.cached_input_tokens as usage_cached_input_tokens,
+  usage.output_tokens as usage_output_tokens,
+  usage.reasoning_output_tokens as usage_reasoning_output_tokens,
+  usage.total_tokens as usage_total_tokens,
+  usage.created_at as usage_created_at
+";
 
 pub fn list(
     db: &Db,
@@ -34,15 +66,15 @@ pub fn list(
         });
     let rows = if let Some((created_at, id)) = cursor {
         let mut statement = connection.prepare(
-            "
-            select messages.id, messages.role, messages.content, messages.reply_to_message_id, messages.created_at,
-              reply.id as reply_id, reply.role as reply_role, reply.content as reply_content
+            &format!("
+            select {MESSAGE_SELECT_SQL}
             from messages
             left join messages reply on reply.id = messages.reply_to_message_id and reply.session_id = messages.session_id
+            {USAGE_JOIN_SQL}
             where messages.session_id = ? and (messages.created_at < ? or (messages.created_at = ? and messages.id < ?))
             order by messages.created_at desc, messages.id desc
             limit ?
-            ",
+            "),
         )?;
         let items = statement
             .query_map(
@@ -59,15 +91,15 @@ pub fn list(
         items
     } else {
         let mut statement = connection.prepare(
-            "
-            select messages.id, messages.role, messages.content, messages.reply_to_message_id, messages.created_at,
-              reply.id as reply_id, reply.role as reply_role, reply.content as reply_content
+            &format!("
+            select {MESSAGE_SELECT_SQL}
             from messages
             left join messages reply on reply.id = messages.reply_to_message_id and reply.session_id = messages.session_id
+            {USAGE_JOIN_SQL}
             where messages.session_id = ?
             order by messages.created_at desc, messages.id desc
             limit ?
-            ",
+            "),
         )?;
         let items = statement
             .query_map((session_id, page_size as i64 + 1), message_from_row)?
@@ -123,8 +155,15 @@ fn get_message(
     connection
         .query_row(
             "
-            select messages.id, messages.role, messages.content, messages.reply_to_message_id, messages.created_at,
-              reply.id as reply_id, reply.role as reply_role, reply.content as reply_content
+            select messages.id, messages.session_id, messages.role, messages.content, messages.reply_to_message_id, messages.created_at,
+              reply.id as reply_id, reply.role as reply_role, reply.content as reply_content,
+              null as usage_id, null as usage_session_id, null as usage_session_title,
+              null as usage_message_id,
+              null as usage_task_run_id, null as usage_provider_id, null as usage_provider_name,
+              null as usage_model, null as usage_source, null as usage_input_tokens,
+              null as usage_cached_input_tokens, null as usage_output_tokens,
+              null as usage_reasoning_output_tokens, null as usage_total_tokens,
+              null as usage_created_at
             from messages
             left join messages reply on reply.id = messages.reply_to_message_id and reply.session_id = messages.session_id
             where messages.session_id = ? and messages.id = ?
@@ -137,17 +176,38 @@ fn get_message(
 }
 
 fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMessage> {
-    let reply_id: Option<String> = row.get(5)?;
+    let reply_id: Option<String> = row.get(6)?;
+    let usage_id: Option<String> = row.get(9)?;
+    let input_tokens: i64 = row.get(18).unwrap_or(0);
+    let cached_input_tokens: i64 = row.get(19).unwrap_or(0);
     Ok(SessionMessage {
         id: row.get(0)?,
-        role: row.get(1)?,
-        content: row.get(2)?,
-        reply_to_message_id: row.get(3)?,
-        created_at: row.get(4)?,
+        role: row.get(2)?,
+        content: row.get(3)?,
+        reply_to_message_id: row.get(4)?,
+        created_at: row.get(5)?,
         reply_to: reply_id.map(|id| SessionMessageReply {
             id,
-            role: row.get(6).unwrap_or_else(|_| "user".to_string()),
-            content: row.get(7).unwrap_or_default(),
+            role: row.get(7).unwrap_or_else(|_| "user".to_string()),
+            content: row.get(8).unwrap_or_default(),
+        }),
+        usage: usage_id.map(|id| SessionMessageUsage {
+            id,
+            session_id: row.get(10).unwrap_or_default(),
+            session_title: row.get(11).ok().flatten(),
+            message_id: row.get(12).ok().flatten(),
+            task_run_id: row.get(13).ok().flatten(),
+            provider_id: row.get(14).ok().flatten(),
+            provider_name: row.get(15).ok().flatten(),
+            model: row.get(16).ok().flatten(),
+            source: row.get(17).unwrap_or_else(|_| "codex_json".to_string()),
+            input_tokens,
+            cached_input_tokens,
+            output_tokens: row.get(20).unwrap_or(0),
+            reasoning_output_tokens: row.get(21).unwrap_or(0),
+            total_tokens: row.get(22).unwrap_or(0),
+            billable_input_tokens: (input_tokens - cached_input_tokens).max(0),
+            created_at: row.get(23).unwrap_or_default(),
         }),
     })
 }

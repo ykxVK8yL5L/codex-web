@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { Activity, History, MoreHorizontal, Pencil, Plus, RefreshCw, Save, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { FilterSearchInput, FilterToolbar } from "@/components/FilterControls";
@@ -6,9 +6,9 @@ import { IconText } from "@/components/IconText";
 import { PageHeader } from "@/components/PageHeader";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { useAppDialog } from "@/components/AppDialog";
-import { formatShortDate } from "@/lib/format";
+import { formatShortDate, formatTokens } from "@/lib/format";
 import type { TranslationKey } from "@/lib/i18n";
-import type { CreateProviderRequest, PageResponse, ProviderCapabilities, ProviderDetectionResponse, ProviderHealthCheck, ProviderModelsResponse, ProviderSummary, ProviderTestResponse, UpdateProviderRequest } from "@codex-web/protocol";
+import type { CreateProviderRequest, PageResponse, ProviderCapabilities, ProviderDetectionResponse, ProviderHealthCheck, ProviderModelsResponse, ProviderSummary, ProviderTestResponse, TokenUsageResponse, UpdateProviderRequest } from "@codex-web/protocol";
 
 type TFunction = (key: TranslationKey) => string;
 type ToastTone = "info" | "success" | "error";
@@ -81,6 +81,7 @@ export function ProvidersPage({
   const [createPanelOpen, setCreatePanelOpen] = useState(false);
   const [providerSearch, setProviderSearch] = useState("");
   const [providerKindFilter, setProviderKindFilter] = useState<ProviderSummary["kind"] | "all">("all");
+  const [providerUsage, setProviderUsage] = useState<Record<string, TokenUsageResponse>>({});
   const capabilityItems: Array<{ key: keyof ProviderCapabilities; label: string }> = [
     { key: "responsesApi", label: t("provider.capabilityResponses") },
     { key: "chatCompletions", label: t("provider.capabilityChat") },
@@ -103,6 +104,21 @@ export function ProvidersPage({
       provider.apiKeyConfigured ? t("provider.keyConfigured") : t("provider.keyMissing"),
     ].some((value) => value.toLowerCase().includes(providerSearchText));
   });
+  useEffect(() => {
+    let cancelled = false;
+    const headers = { authorization: `Bearer ${sessionToken}` };
+    Promise.all(providers.map(async (provider) => {
+      const response = await fetch(`/api/usage?providerId=${encodeURIComponent(provider.id)}&limit=3`, { headers });
+      if (!response.ok) return null;
+      return [provider.id, await response.json()] as const;
+    })).then((items) => {
+      if (cancelled) return;
+      setProviderUsage(Object.fromEntries(items.filter(Boolean) as Array<readonly [string, TokenUsageResponse]>));
+    }).catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [providers, sessionToken]);
 
   function showError(value: string) {
     setMessage(value);
@@ -761,6 +777,11 @@ export function ProvidersPage({
               <strong>{provider.name}</strong>
               <span>{provider.kind} · {provider.defaultModel}</span>
               <span>{provider.baseUrl ?? t("provider.defaultEndpoint")} · {t("provider.keyLabel")} {provider.apiKeyConfigured ? t("provider.keyConfigured") : t("provider.keyMissing")} · {provider.rpmLimitEnabled && provider.rpmLimit ? `${t("provider.rpmLimit")} ${provider.rpmLimit}` : t("provider.rpmDisabled")} · {provider.useProxy ? t("provider.proxyLocal") : t("provider.proxyDirect")}</span>
+              {providerUsage[provider.id]?.summary.records ? (
+                <span>{t("usage.title")} · {formatTokens(providerUsage[provider.id].summary.totalTokens)} {t("usage.totalTokens")} · {t("usage.inputTokens")} {formatTokens(providerUsage[provider.id].summary.inputTokens)} · {t("usage.outputTokens")} {formatTokens(providerUsage[provider.id].summary.outputTokens)}</span>
+              ) : (
+                <span>{t("usage.title")} · {t("usage.empty")}</span>
+              )}
               {provider.rpmLimit && (
                 <label className="checkbox-row">
                   <input name="provider-rpmlimitenabled" type="checkbox" checked={provider.rpmLimitEnabled ?? false} onChange={() => void toggleProviderRpmLimit(provider)} />

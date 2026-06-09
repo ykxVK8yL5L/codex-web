@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Check, Copy, MessageSquare } from "lucide-react";
 import type { SessionMessage } from "@codex-web/protocol";
 import { copyText } from "@/lib/clipboard";
+import { formatTokens } from "@/lib/format";
 import type { TFunction } from "@/features/sessions/utils";
 
 export function Bubble({
@@ -10,6 +11,7 @@ export function Bubble({
   user = false,
   t,
   replyTo,
+  usage,
   onReply,
 }: {
   who: string;
@@ -17,6 +19,7 @@ export function Bubble({
   user?: boolean;
   t?: TFunction;
   replyTo?: SessionMessage["replyTo"];
+  usage?: SessionMessage["usage"];
   onReply?: () => void;
 }) {
   const [copied, setCopied] = useState(false);
@@ -44,6 +47,14 @@ export function Bubble({
         </div>
         {replyTo && <div className="bubble-reply">{replyTo.role}: {replyTo.content}</div>}
         <div className="bubble-text">{text}</div>
+        {usage && (
+          <div className="bubble-usage" title={`${t?.("usage.inputTokens") ?? "Input"} ${formatTokens(usage.inputTokens)} · ${t?.("usage.cachedInputTokens") ?? "Cached"} ${formatTokens(usage.cachedInputTokens)} · ${t?.("usage.outputTokens") ?? "Output"} ${formatTokens(usage.outputTokens)} · ${t?.("usage.reasoningTokens") ?? "Reasoning"} ${formatTokens(usage.reasoningOutputTokens)}`}>
+            <span>{formatTokens(usage.totalTokens)} {t?.("usage.totalTokens") ?? "tokens"}</span>
+            <span>{t?.("usage.inputTokens") ?? "Input"} {formatTokens(usage.inputTokens)}</span>
+            <span>{t?.("usage.outputTokens") ?? "Output"} {formatTokens(usage.outputTokens)}</span>
+            {usage.cachedInputTokens > 0 && <span>{t?.("usage.cachedInputTokens") ?? "Cached"} {formatTokens(usage.cachedInputTokens)}</span>}
+          </div>
+        )}
       </div>
     </article>
   );

@@ -4,11 +4,13 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { CreateSessionCompactionRequest, ProviderSummary, SessionCompactionListResponse, SessionCompactionResponse, SessionCompactionSettings, SessionCompactionSummary, SessionMessage, SessionSummary } from "@codex-web/protocol";
 import type { TaskEvent } from "../tasks/events.js";
+import { readProviderUsage, recordTokenUsage } from "../usage.js";
 
 type ProviderRecord = ProviderSummary & { apiKey?: string };
 
 type SessionCompactionRuntimeDeps = {
   allSessionMessages: (sessionId: string) => SessionMessage[];
+  appendSessionMessage: (sessionId: string, role: SessionMessage["role"], content: string, replyToMessageId?: string | null) => SessionMessage;
   appendCodexErrorOutput: (session: SessionSummary, value: string) => void;
   appData: { providers: ProviderRecord[] };
   db: Database.Database;
@@ -53,7 +55,7 @@ function truncateContextText(value: string, limit = 1200) {
 }
 
 export function createSessionCompactionRuntime(deps: SessionCompactionRuntimeDeps) {
-  const { allSessionMessages, appendCodexErrorOutput, appData, db, getSessionCompactionSettings, joinUrl, publishTaskEvent, recordTaskActivity, sessionMemoryPath } = deps;
+  const { allSessionMessages, appendSessionMessage, appendCodexErrorOutput, appData, db, getSessionCompactionSettings, joinUrl, publishTaskEvent, recordTaskActivity, sessionMemoryPath } = deps;
 
 function sessionCompactionFromRow(row: Record<string, unknown>): SessionCompactionSummary {
   return {
@@ -206,7 +208,7 @@ async function generateSessionCompactionSummary(session: SessionSummary, provide
     const message = choice?.message && typeof choice.message === "object" ? choice.message as Record<string, unknown> : {};
     const content = typeof message.content === "string" ? message.content.trim() : "";
     if (!content) throw new Error("empty_compaction_summary");
-    return content;
+    return { summary: content, usage: readProviderUsage(payload), raw: payload };
   }
   const response = await fetch(joinUrl(provider.baseUrl || "https://api.openai.com/v1", "/responses"), {
     method: "POST",
@@ -221,7 +223,7 @@ async function generateSessionCompactionSummary(session: SessionSummary, provide
   const payload = await response.json() as Record<string, unknown>;
   const content = responseOutputText(payload);
   if (!content) throw new Error("empty_compaction_summary");
-  return content;
+  return { summary: content, usage: readProviderUsage(payload), raw: payload };
 }
 
 async function createSessionCompaction(session: SessionSummary, body?: CreateSessionCompactionRequest | null, options: { incremental?: boolean } = {}): Promise<SessionCompactionResponse> {
@@ -238,7 +240,8 @@ async function createSessionCompaction(session: SessionSummary, body?: CreateSes
   if (!model) throw new Error("model_required");
   const prompt = sessionCompactionPrompt(session, messages, previousSummary);
   const promptHash = createHash("sha256").update(prompt).digest("hex").slice(0, 16);
-  const summary = await generateSessionCompactionSummary(session, provider, model, prompt);
+  const generated = await generateSessionCompactionSummary(session, provider, model, prompt);
+  const summary = generated.summary;
   const id = `compaction-${randomUUID()}`;
   const now = new Date().toISOString();
   const memoryRoot = sessionMemoryPath(session.id);
@@ -268,6 +271,24 @@ async function createSessionCompaction(session: SessionSummary, body?: CreateSes
     previous?.id ?? null,
     now,
   );
+  const notice = appendSessionMessage(session.id, "system", [
+    options.incremental ? "会话记忆已自动压缩。" : "会话记忆已压缩。",
+    `压缩消息：${messages.length} 条，字符：${sourceChars}。`,
+    generated.usage ? `Token：总 ${generated.usage.inputTokens + generated.usage.outputTokens}，输入 ${generated.usage.inputTokens}，输出 ${generated.usage.outputTokens}${generated.usage.cachedInputTokens ? `，缓存输入 ${generated.usage.cachedInputTokens}` : ""}${generated.usage.reasoningOutputTokens ? `，推理 ${generated.usage.reasoningOutputTokens}` : ""}。` : "Provider 未返回 usage。",
+  ].join("\n"));
+  if (generated.usage) {
+    recordTokenUsage(db, {
+      session,
+      messageId: notice.id,
+      providerId: provider.id,
+      providerName: provider.name,
+      model,
+      source: "session_compaction",
+      rawUsage: generated.raw,
+      rawHashSeed: `${id}\n${promptHash}`,
+      usage: generated.usage,
+    });
+  }
   return { compaction: latestSessionCompaction(session.id)!, summary };
 }
 

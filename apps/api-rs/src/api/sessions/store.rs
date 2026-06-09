@@ -21,7 +21,7 @@ pub fn list_sessions(
     }
     let automation_session_ids = automation_session_ids(&connection)?;
     let mut statement = connection.prepare(
-        "select id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, status, created_at, updated_at from sessions order by updated_at desc",
+        "select id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, show_message_usage, status, created_at, updated_at from sessions order by updated_at desc",
     )?;
     let sessions = statement
         .query_map([], |row| {
@@ -41,9 +41,10 @@ pub fn list_sessions(
                 model: row.get(8)?,
                 codex_session_id: row.get(9)?,
                 notifications_enabled: row.get::<_, Option<i64>>(10)?.unwrap_or(1) != 0,
-                status: row.get(11)?,
-                created_at: row.get(12)?,
-                updated_at: row.get(13)?,
+                show_message_usage: row.get::<_, Option<i64>>(11)?.unwrap_or(0) != 0,
+                status: row.get(12)?,
+                created_at: row.get(13)?,
+                updated_at: row.get(14)?,
                 goal: None,
             })
         })?
@@ -105,7 +106,7 @@ pub fn create_session(db: &Db, input: CreateSessionRequest) -> anyhow::Result<Se
         .and_then(|project| project.workspace_path.clone())
         .unwrap_or_else(|| ensure_scratch_session_workspace(db, &id));
     connection.execute(
-        "insert into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, status, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, null, null, null, 1, 'paused', ?, ?)",
+        "insert into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, show_message_usage, status, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, null, null, null, 1, 0, 'paused', ?, ?)",
         (
             &id,
             kind,
@@ -159,14 +160,18 @@ pub fn update_session(
     if let Some(enabled) = input.notifications_enabled {
         session.notifications_enabled = enabled;
     }
+    if let Some(show) = input.show_message_usage {
+        session.show_message_usage = show;
+    }
     let now = crate::api::common::timestamp();
     let connection = db.open_read_write()?;
     ensure_session_schema(&connection)?;
     connection.execute(
-        "update sessions set title = ?, notifications_enabled = ?, updated_at = ? where id = ?",
+        "update sessions set title = ?, notifications_enabled = ?, show_message_usage = ?, updated_at = ? where id = ?",
         (
             &session.title,
             if session.notifications_enabled { 1 } else { 0 },
+            if session.show_message_usage { 1 } else { 0 },
             &now,
             id,
         ),
@@ -383,6 +388,22 @@ fn table_exists(connection: &rusqlite::Connection, table: &str) -> anyhow::Resul
         .is_some())
 }
 
+fn ensure_column(
+    connection: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    kind: &str,
+) -> anyhow::Result<()> {
+    let mut statement = connection.prepare(&format!("pragma table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|item| item == column) {
+        connection.execute(&format!("alter table {table} add column {column} {kind}"), [])?;
+    }
+    Ok(())
+}
+
 fn ensure_session_schema(connection: &rusqlite::Connection) -> anyhow::Result<()> {
     connection.execute_batch(
         "
@@ -398,6 +419,7 @@ fn ensure_session_schema(connection: &rusqlite::Connection) -> anyhow::Result<()
           model text,
           codex_session_id text,
           notifications_enabled integer not null default 1,
+          show_message_usage integer not null default 0,
           status text not null,
           created_at text,
           updated_at text not null
@@ -406,6 +428,7 @@ fn ensure_session_schema(connection: &rusqlite::Connection) -> anyhow::Result<()
         create index if not exists sessions_status_updated_idx on sessions(status, updated_at desc, id desc);
         ",
     )?;
+    ensure_column(connection, "sessions", "show_message_usage", "integer not null default 0")?;
     Ok(())
 }
 

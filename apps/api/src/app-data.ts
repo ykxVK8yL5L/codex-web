@@ -94,6 +94,7 @@ function sessionFromRow(row: Record<string, unknown>, projects: ProjectSummary[]
     model: row.model ? String(row.model) : null,
     codexSessionId: row.codex_session_id ? String(row.codex_session_id) : null,
     notificationsEnabled: row.notifications_enabled === undefined ? true : Boolean(row.notifications_enabled),
+    showMessageUsage: row.show_message_usage === undefined ? false : Boolean(row.show_message_usage),
     status: row.status as SessionSummary["status"],
     createdAt: row.created_at ? String(row.created_at) : undefined,
     updatedAt: String(row.updated_at),

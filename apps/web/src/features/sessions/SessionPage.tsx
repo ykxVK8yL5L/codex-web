@@ -33,6 +33,8 @@ import type {
   TaskContextResponse,
   TaskLogResponse,
   TaskRunSummary,
+  TokenUsageDisplaySettings,
+  TokenUsageResponse,
   UpdateSessionCompactionRequest,
   UpdateSessionRequest,
   UploadAttachmentInput,
@@ -45,7 +47,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSepara
 import { Switch } from "@/components/ui/switch";
 import { copyText } from "@/lib/clipboard";
 import { sessionInfoRequestedEvent, taskActivityChangedEvent, workspaceChangedEvent } from "@/lib/events";
-import { formatBytes, formatShortDate, renderPreviewCommand } from "@/lib/format";
+import { formatBytes, formatShortDate, formatTokens, renderPreviewCommand } from "@/lib/format";
 import { openPreviewUrl } from "@/lib/previews";
 import { AutomationNotifyRuleDialog } from "@/components/automations";
 import { FilesPage } from "@/features/files";
@@ -182,6 +184,8 @@ export function SessionPage({
   const [taskRuns, setTaskRuns] = useState<TaskRunSummary[]>([]);
   const [taskRunCursor, setTaskRunCursor] = useState<string | null>(null);
   const [taskRunHasMore, setTaskRunHasMore] = useState(false);
+  const [sessionUsage, setSessionUsage] = useState<TokenUsageResponse | null>(null);
+  const [usageDisplay, setUsageDisplay] = useState<TokenUsageDisplaySettings | null>(null);
   const [executionContexts, setExecutionContexts] = useState<ExecutionContextSummary[]>([]);
   const [messageCards, setMessageCards] = useState<MessageCardSummary[]>([]);
   const [workspacePanel, setWorkspacePanel] = useState<"files" | "terminal" | null>(null);
@@ -250,6 +254,18 @@ export function SessionPage({
     setRoomFileReferences([]);
     setFileReferencePicker(null);
   }, [draftProjectId, session?.id]);
+
+  useEffect(() => {
+    fetch("/api/settings/token-usage-display", {
+      headers: { authorization: `Bearer ${sessionToken}` },
+    })
+      .then((response) => response.ok ? response.json() : null)
+      .then((settings: TokenUsageDisplaySettings | null) => {
+        if (settings) setUsageDisplay(settings);
+      })
+      .catch(() => undefined);
+  }, [sessionToken]);
+
   const timelineRef = useRef<HTMLElement | null>(null);
   const skipNextTimelineScrollRef = useRef(false);
   const onQueueChangeRef = useRef(onQueueChange);
@@ -393,6 +409,7 @@ export function SessionPage({
     setTaskRuns([]);
     setTaskRunCursor(null);
     setTaskRunHasMore(false);
+    setSessionUsage(null);
     setExecutionContexts([]);
     setMessageCards([]);
     setEventStreamNotice("");
@@ -403,6 +420,7 @@ export function SessionPage({
     }
     void loadQueue();
     void loadTaskRuns();
+    void loadSessionUsage();
     void loadExecutionContexts();
     void loadMessageCards();
   }, [session?.id, sessionToken]);
@@ -566,6 +584,16 @@ export function SessionPage({
     setTaskRunHasMore(result.hasMore);
   }
 
+  async function loadSessionUsage() {
+    if (!session?.id) return;
+    const params = new URLSearchParams({ sessionId: session.id, limit: "5" });
+    const response = await fetch(`/api/usage?${params}`, {
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    if (!response.ok) return;
+    setSessionUsage((await response.json()) as TokenUsageResponse);
+  }
+
   async function loadExecutionContexts() {
     if (!session?.id) return;
     const params = new URLSearchParams({ sessionId: session.id, limit: "5" });
@@ -695,6 +723,7 @@ export function SessionPage({
         publishWorkspaceChanged(data.session.id);
         publishTaskActivityChanged(data.session.id);
         void loadTaskRuns();
+        void loadSessionUsage();
         void loadMessages(false, true);
         setSessionNotifyRules((items) => items.filter((rule) => rule.eventType !== (data.exitCode === 0 ? "task_completed" : "task_failed")));
         mergeDetail(data.session, [], data.exitCode);
@@ -703,6 +732,7 @@ export function SessionPage({
         setLiveStatus(`${t("session.failed")}：${data.error}`);
         publishTaskActivityChanged(data.session.id);
         void loadTaskRuns();
+        void loadSessionUsage();
         void loadMessages(false, true);
         setSessionNotifyRules((items) => items.filter((rule) => rule.eventType !== "task_failed"));
         mergeDetail(data.session);
@@ -1270,6 +1300,22 @@ export function SessionPage({
     notify(enabled ? t("session.notificationEnabled") : t("session.notificationDisabled"), "success");
   }
 
+  async function updateSessionShowMessageUsage(enabled: boolean) {
+    if (!session) return;
+    const body: UpdateSessionRequest = { showMessageUsage: enabled };
+    const response = await fetch(`/api/sessions/${session.id}`, {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      notify(t("session.showMessageUsageToggleFailed"), "error");
+      return;
+    }
+    const nextSession = (await response.json()) as SessionSummary;
+    onSessionUpdated(nextSession);
+  }
+
   async function submitTask(event: React.FormEvent) {
     event.preventDefault();
     if (!prompt.trim() && !promptAttachments.length && !promptFileReferences.length) return;
@@ -1652,6 +1698,7 @@ export function SessionPage({
                 user={message.role === "user"}
                 t={t}
                 replyTo={message.replyTo}
+                usage={usageDisplay?.showMessageUsage === true || session?.showMessageUsage === true ? message.usage : null}
                 onReply={() => startReply(message)}
                 key={message.id}
               />
@@ -1926,6 +1973,11 @@ export function SessionPage({
                   <Switch checked={session.notificationsEnabled !== false} onCheckedChange={(checked) => void updateSessionNotifications(checked)} />
                 </label>
                 <span className="subtle">{t("session.notificationsHelp")}</span>
+                <label className="room-setting-row">
+                  <span>{t("session.showMessageUsage")}</span>
+                  <Switch checked={session.showMessageUsage === true} onCheckedChange={(checked) => void updateSessionShowMessageUsage(checked)} />
+                </label>
+                <span className="subtle">{t("session.showMessageUsageHelp")}</span>
               </div>
             )}
             {session && goalOwnerId && (
@@ -1956,6 +2008,22 @@ export function SessionPage({
                 <span className="subtle">{t("room.messageModeHelp")}</span>
               </div>
             )}
+            <div className="session-run-list">
+              <div className="item-row">
+                <strong>{t("usage.title")}</strong>
+                <button className="ghost-button icon-only" type="button" title={t("action.refresh")} aria-label={t("action.refresh")} disabled={!session} onClick={() => void loadSessionUsage()}><IconText icon={RefreshCw}>{t("action.refresh")}</IconText></button>
+              </div>
+              {sessionUsage && sessionUsage.summary.records > 0 ? (
+                <div className="session-info-grid">
+                  <div className="session-info-row"><span>{t("usage.totalTokens")}</span><strong>{formatTokens(sessionUsage.summary.totalTokens)}</strong></div>
+                  <div className="session-info-row"><span>{t("usage.inputTokens")}</span><strong>{formatTokens(sessionUsage.summary.inputTokens)}</strong></div>
+                  <div className="session-info-row"><span>{t("usage.outputTokens")}</span><strong>{formatTokens(sessionUsage.summary.outputTokens)}</strong></div>
+                  <div className="session-info-row"><span>{t("usage.cachedInputTokens")}</span><strong>{formatTokens(sessionUsage.summary.cachedInputTokens)}</strong></div>
+                  <div className="session-info-row"><span>{t("usage.reasoningTokens")}</span><strong>{formatTokens(sessionUsage.summary.reasoningOutputTokens)}</strong></div>
+                  <div className="session-info-row"><span>{t("usage.records")}</span><strong>{sessionUsage.summary.records}</strong></div>
+                </div>
+              ) : <div className="empty-state">{t("usage.empty")}</div>}
+            </div>
             <div className="session-run-list">
               <div className="item-row">
                 <strong>{t("session.runHistory")}</strong>

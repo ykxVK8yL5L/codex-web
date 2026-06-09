@@ -15,6 +15,7 @@ pub struct SessionSummary {
     pub model: Option<String>,
     pub codex_session_id: Option<String>,
     pub notifications_enabled: bool,
+    pub show_message_usage: bool,
     pub status: String,
     pub created_at: Option<String>,
     pub updated_at: String,
@@ -37,6 +38,7 @@ pub struct SessionMessage {
     pub content: String,
     pub reply_to_message_id: Option<String>,
     pub reply_to: Option<SessionMessageReply>,
+    pub usage: Option<SessionMessageUsage>,
     pub created_at: String,
 }
 
@@ -45,6 +47,27 @@ pub struct SessionMessageReply {
     pub id: String,
     pub role: String,
     pub content: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMessageUsage {
+    pub id: String,
+    pub session_id: String,
+    pub session_title: Option<String>,
+    pub message_id: Option<String>,
+    pub task_run_id: Option<String>,
+    pub provider_id: Option<String>,
+    pub provider_name: Option<String>,
+    pub model: Option<String>,
+    pub source: String,
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_output_tokens: i64,
+    pub total_tokens: i64,
+    pub billable_input_tokens: i64,
+    pub created_at: String,
 }
 
 #[derive(Deserialize)]
@@ -70,6 +93,7 @@ pub struct CreateSessionRequest {
 pub struct UpdateSessionRequest {
     pub title: Option<String>,
     pub notifications_enabled: Option<bool>,
+    pub show_message_usage: Option<bool>,
 }
 
 #[derive(Default)]
