@@ -1146,8 +1146,6 @@ function App() {
             projects={projects}
             providers={providers}
             unreadSessionIds={unreadSessionNotificationIds}
-            selectedProviderId={selectedProviderId}
-            onSelectProvider={setSelectedProviderId}
             activeSessionId={activeSessionId}
             onSelectSession={navigateSession}
             onNewTask={newTask}

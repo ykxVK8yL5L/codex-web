@@ -8,8 +8,6 @@ export function Threads({
   projects,
   providers,
   unreadSessionIds,
-  selectedProviderId,
-  onSelectProvider,
   activeSessionId,
   onSelectSession,
   onNewTask,
@@ -28,8 +26,6 @@ export function Threads({
   projects: ProjectSummary[];
   providers: ProviderSummary[];
   unreadSessionIds?: Set<string>;
-  selectedProviderId: string;
-  onSelectProvider: (providerId: string) => void;
   activeSessionId: string;
   onSelectSession: (sessionId: string) => void;
   onNewTask: () => void;
@@ -118,13 +114,6 @@ export function Threads({
         </button>
       ))}
       {hasMore && <button className="ghost-button load-more" type="button" onClick={onLoadMore}>{t("session.loadMore")}</button>}
-      <div className="thread-group-title">{t("session.providers")}</div>
-      <select name="selectedproviderid" className="provider-select" value={selectedProviderId} onChange={(event) => onSelectProvider(event.target.value)}>
-        {providers.map((provider) => (
-          <option key={provider.id} value={provider.id}>{provider.name}</option>
-        ))}
-      </select>
-      <div className="provider-hint">{providers.find((provider) => provider.id === selectedProviderId)?.kind ?? t("session.providerNotConfigured")}</div>
     </aside>
   );
 }

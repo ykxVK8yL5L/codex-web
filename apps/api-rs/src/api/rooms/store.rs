@@ -704,7 +704,7 @@ pub fn create_room(db: &Db, body: super::models::CreateRoomRequest) -> RoomResul
           model text,
           codex_session_id text,
           notifications_enabled integer not null default 1,
-          show_message_usage integer not null default 0,
+          show_message_usage integer,
           status text not null,
           created_at text not null,
           updated_at text not null
@@ -712,7 +712,7 @@ pub fn create_room(db: &Db, body: super::models::CreateRoomRequest) -> RoomResul
         ",
     )?;
     connection.execute(
-        "insert or ignore into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, show_message_usage, status, created_at, updated_at) values (?, ?, 'room', ?, ?, ?, ?, null, null, null, 1, 0, 'paused', ?, ?)",
+        "insert or ignore into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, show_message_usage, status, created_at, updated_at) values (?, ?, 'room', ?, ?, ?, ?, null, null, null, 1, null, 'paused', ?, ?)",
         params![session_id, if project_id.is_some() { "project" } else { "scratch" }, id, name, project_id.as_deref(), workspace_path, now, now],
     )?;
     let shared_context = body
@@ -2739,7 +2739,7 @@ pub fn start_room_task(db: &Db, room_id: &str, task_id: &str) -> RoomResult<Room
         return Err(RoomError::new(500, "sessions_table_missing"));
     }
     connection.execute(
-        "insert into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, show_message_usage, status, created_at, updated_at) values (?, ?, 'agent', ?, ?, ?, ?, ?, ?, ?, 1, 0, 'running', ?, ?)",
+        "insert into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, show_message_usage, status, created_at, updated_at) values (?, ?, 'agent', ?, ?, ?, ?, ?, ?, ?, 1, null, 'running', ?, ?)",
         params![
             session_id,
             kind,
@@ -2864,7 +2864,7 @@ pub fn start_room_task(db: &Db, room_id: &str, task_id: &str) -> RoomResult<Room
         model: run.model.clone(),
         codex_session_id: existing_thread_id.clone(),
         notifications_enabled: true,
-        show_message_usage: false,
+        show_message_usage: None,
         status: "running".to_string(),
         created_at: Some(now.clone()),
         updated_at: now,
@@ -4690,7 +4690,7 @@ fn ensure_session_show_message_usage_column(connection: &rusqlite::Connection) -
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<Result<Vec<_>, _>>()?;
     if !columns.iter().any(|item| item == "show_message_usage") {
-        connection.execute("alter table sessions add column show_message_usage integer not null default 0", [])?;
+        connection.execute("alter table sessions add column show_message_usage integer", [])?;
     }
     Ok(())
 }

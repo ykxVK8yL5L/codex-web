@@ -6,17 +6,20 @@ use futures_util::{StreamExt, TryStreamExt};
 use reqwest::Client;
 
 use super::models::ProviderRecord;
+use super::payload_rules::apply_payload_rewrite_rules;
+use crate::api::settings::models::PayloadRewriteRule;
 
 pub async fn proxy_responses(
     provider: &ProviderRecord,
     headers: &HeaderMap,
     body: serde_json::Value,
+    rules: &[PayloadRewriteRule],
 ) -> Result<Response<Body>, (StatusCode, serde_json::Value)> {
     authorize(provider, headers)?;
     match provider.summary.kind.as_str() {
-        "openai-compatible-chat" => proxy_chat(provider, body).await,
+        "openai-compatible-chat" => proxy_chat(provider, body, rules).await,
         "openai-responses" if provider.summary.use_proxy => {
-            proxy_responses_api(provider, body).await
+            proxy_responses_api(provider, body, rules).await
         }
         _ => Err((
             StatusCode::BAD_REQUEST,
@@ -28,6 +31,7 @@ pub async fn proxy_responses(
 async fn proxy_chat(
     provider: &ProviderRecord,
     body: serde_json::Value,
+    rules: &[PayloadRewriteRule],
 ) -> Result<Response<Body>, (StatusCode, serde_json::Value)> {
     let base_url = provider.summary.base_url.as_deref().ok_or_else(|| {
         (
@@ -35,7 +39,7 @@ async fn proxy_chat(
             serde_json::json!({ "error": "base_url_required" }),
         )
     })?;
-    let chat_request = responses_to_chat_request(provider, &body);
+    let chat_request = apply_payload_rewrite_rules(provider, responses_to_chat_request(provider, &body), &rules);
     let mut request = Client::new()
         .post(join_url(base_url, "/chat/completions"))
         .json(&chat_request);
@@ -81,6 +85,7 @@ async fn proxy_chat(
 async fn proxy_responses_api(
     provider: &ProviderRecord,
     body: serde_json::Value,
+    rules: &[PayloadRewriteRule],
 ) -> Result<Response<Body>, (StatusCode, serde_json::Value)> {
     let base_url = provider
         .summary
@@ -89,7 +94,7 @@ async fn proxy_responses_api(
         .unwrap_or("https://api.openai.com/v1");
     let mut request = Client::new()
         .post(join_url(base_url, "/responses"))
-        .json(&body);
+        .json(&apply_payload_rewrite_rules(provider, body.clone(), &rules));
     if let Some(api_key) = provider
         .api_key
         .as_deref()
@@ -166,6 +171,7 @@ async fn stream_chat_as_responses(
         let mut text_output_index: usize = 0;
         let mut next_output_index: usize = 0;
         let mut function_calls: BTreeMap<usize, FunctionCallState> = BTreeMap::new();
+        let mut usage = serde_json::Value::Null;
         let mut upstream_stream = upstream.bytes_stream();
 
         while let Some(chunk) = upstream_stream.next().await {
@@ -183,6 +189,9 @@ async fn stream_chat_as_responses(
                 for data in sse_data_payloads(&event) {
                     if data.is_empty() || data == "[DONE]" {
                         continue;
+                    }
+                    if let Some(next_usage) = chat_stream_usage(&data) {
+                        usage = next_usage;
                     }
                     let Some((text, tool_calls)) = chat_stream_delta(&data) else {
                         continue;
@@ -262,6 +271,9 @@ async fn stream_chat_as_responses(
             for event in events.into_iter().chain(if rest.trim().is_empty() { Vec::new() } else { vec![rest] }) {
                 for data in sse_data_payloads(&event) {
                     if data.is_empty() || data == "[DONE]" { continue; }
+                    if let Some(next_usage) = chat_stream_usage(&data) {
+                        usage = next_usage;
+                    }
                     let Some((text, tool_calls)) = chat_stream_delta(&data) else { continue; };
                     if !text.is_empty() {
                         if !item_started {
@@ -384,7 +396,7 @@ async fn stream_chat_as_responses(
         }
         yield Ok(sse_bytes("response.completed", serde_json::json!({
             "type": "response.completed",
-            "response": { "id": response_id, "status": "completed", "model": model, "output": output }
+            "response": { "id": response_id, "status": "completed", "model": model, "output": output, "usage": usage }
         })));
         yield Ok(bytes::Bytes::from("data: [DONE]\n\n"));
     };
@@ -454,6 +466,12 @@ fn responses_to_chat_request(
     // stream, and stream_chat_as_responses then parses nothing → empty response ("no response").
     if let Some(value) = body.get("stream") {
         request.insert("stream".to_string(), value.clone());
+        if value.as_bool().unwrap_or(false) {
+            request.insert(
+                "stream_options".to_string(),
+                serde_json::json!({ "include_usage": true }),
+            );
+        }
     }
     // Convert Responses-format tools → Chat tools so codex's tool calls (shell, apply_patch, …)
     // survive the proxy. Drop anything that doesn't map cleanly.
@@ -572,7 +590,7 @@ fn chat_to_response(provider: &ProviderRecord, payload: serde_json::Value) -> se
             "content": [{ "type": "output_text", "text": text, "annotations": [] }]
         }],
         "output_text": text,
-        "usage": payload.get("usage").cloned().unwrap_or(serde_json::Value::Null)
+        "usage": chat_usage_to_response_usage(payload.get("usage"))
     })
 }
 
@@ -666,6 +684,50 @@ struct ChatToolCallDelta {
     call_id: Option<String>,
     name: Option<String>,
     arguments: Option<String>,
+}
+
+fn chat_stream_usage(data: &str) -> Option<serde_json::Value> {
+    let chunk = serde_json::from_str::<serde_json::Value>(data).ok()?;
+    let usage = chat_usage_to_response_usage(chunk.get("usage"));
+    if usage.is_object() {
+        Some(usage)
+    } else {
+        None
+    }
+}
+
+fn chat_usage_to_response_usage(value: Option<&serde_json::Value>) -> serde_json::Value {
+    let Some(usage) = value.and_then(|value| value.as_object()) else {
+        return serde_json::Value::Null;
+    };
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(|value| value.as_i64())
+        .or_else(|| usage.get("prompt_tokens").and_then(|value| value.as_i64()))
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(|value| value.as_i64())
+        .or_else(|| usage.get("completion_tokens").and_then(|value| value.as_i64()))
+        .unwrap_or(0);
+    let mut output = serde_json::Map::new();
+    for (key, value) in usage {
+        output.insert(key.clone(), value.clone());
+    }
+    output.insert("input_tokens".to_string(), serde_json::json!(input_tokens));
+    output.insert("output_tokens".to_string(), serde_json::json!(output_tokens));
+    output.entry("total_tokens".to_string()).or_insert_with(|| serde_json::json!(input_tokens + output_tokens));
+    output.entry("input_tokens_details".to_string()).or_insert_with(|| {
+        usage.get("prompt_tokens_details")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    });
+    output.entry("output_tokens_details".to_string()).or_insert_with(|| {
+        usage.get("completion_tokens_details")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    });
+    serde_json::Value::Object(output)
 }
 
 fn chat_stream_delta(data: &str) -> Option<(String, Vec<ChatToolCallDelta>)> {

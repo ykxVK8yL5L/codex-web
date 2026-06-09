@@ -1,7 +1,7 @@
 mod backup;
 mod environment;
 mod maintenance;
-mod models;
+pub(crate) mod models;
 mod storage;
 pub(crate) mod store;
 
@@ -54,6 +54,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/token-usage-display",
             get(token_usage_display).patch(update_token_usage_display),
+        )
+        .route(
+            "/payload-rewrite",
+            get(payload_rewrite).patch(update_payload_rewrite),
         )
         .route("/rate-limit", get(rate_limit).patch(update_rate_limit))
         .route(
@@ -203,6 +207,21 @@ async fn update_token_usage_display(
 ) -> Result<Json<models::TokenUsageDisplaySettings>, (StatusCode, Json<serde_json::Value>)> {
     Ok(Json(
         store::save_token_usage_display(&state.db, body).map_err(api_error)?,
+    ))
+}
+
+async fn payload_rewrite(
+    State(state): State<AppState>,
+) -> Result<Json<models::PayloadRewriteSettings>, (StatusCode, Json<serde_json::Value>)> {
+    Ok(Json(store::payload_rewrite(&state.db).map_err(api_error)?))
+}
+
+async fn update_payload_rewrite(
+    State(state): State<AppState>,
+    Json(body): Json<models::UpdatePayloadRewriteSettings>,
+) -> Result<Json<models::PayloadRewriteSettings>, (StatusCode, Json<serde_json::Value>)> {
+    Ok(Json(
+        store::save_payload_rewrite(&state.db, body).map_err(api_error)?,
     ))
 }
 

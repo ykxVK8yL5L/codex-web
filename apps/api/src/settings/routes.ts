@@ -3,6 +3,7 @@ import type {
   ApprovalDecisionResponse,
   CodexRuntimeSettings,
   PreviewAccessSettings,
+  PayloadRewriteSettings,
   PreviewSummary,
   ProjectGitOperationSummary,
   ProjectGitOperationType,
@@ -14,6 +15,7 @@ import type {
   TokenUsageRetentionSettings,
   UpdateCodexRuntimeSettingsRequest,
   UpdateNotificationTestSettingsRequest,
+  UpdatePayloadRewriteSettingsRequest,
   UpdateSessionCompactionSettingsRequest,
   UpdateSystemBackupSettingsRequest,
 } from "@codex-web/protocol";
@@ -105,6 +107,7 @@ export function registerSettingsRoutes(app: Hono, deps: SettingsRoutesDeps) {
   let sessionCompactionSettings = getSessionCompactionSettings();
   let tokenUsageRetentionSettings = deps.getTokenUsageRetentionSettings() as TokenUsageRetentionSettings;
   let tokenUsageDisplaySettings = deps.getTokenUsageDisplaySettings() as TokenUsageDisplaySettings;
+  let payloadRewriteSettings = deps.getPayloadRewriteSettings() as PayloadRewriteSettings;
   let systemBackupSettings = getSystemBackupSettings();
   let notificationTestSettings = deps.getNotificationTestSettings();
   const appNotificationRouteDeps = deps.getAppNotificationRouteDeps();
@@ -198,6 +201,21 @@ export function registerSettingsRoutes(app: Hono, deps: SettingsRoutesDeps) {
     tokenUsageDisplaySettings = next;
     deps.setTokenUsageDisplaySettings(next);
     runtimeSettingsStore.tokenUsageDisplay.save(next);
+    return c.json(next);
+  });
+
+  app.get("/api/settings/payload-rewrite", (c) => c.json(payloadRewriteSettings));
+
+  app.patch("/api/settings/payload-rewrite", async (c) => {
+    const body = await c.req.json<UpdatePayloadRewriteSettingsRequest>().catch(() => null);
+    const next = runtimeSettingsStore.payloadRewrite.sanitize({
+      ...payloadRewriteSettings,
+      ...(body ?? {}),
+      updatedAt: new Date().toISOString(),
+    });
+    payloadRewriteSettings = next;
+    deps.setPayloadRewriteSettings(next);
+    runtimeSettingsStore.payloadRewrite.save(next);
     return c.json(next);
   });
   

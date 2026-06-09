@@ -307,23 +307,31 @@ export async function filesToAttachmentInputs(files: File[]): Promise<UploadAtta
 }
 
 export function mergeMessages(...groups: SessionMessage[][]) {
-  const seenIds = new Set<string>();
+  const byId = new Map<string, SessionMessage>();
   const seenPersistedContent = new Set<string>();
-  return groups
-    .flat()
-    .filter((message) => {
+  for (const message of groups.flat()) {
       const contentKey = `${message.role}:${message.content}`;
       if (message.id.startsWith("local-")) {
-        if (seenPersistedContent.has(contentKey)) return false;
+        if (seenPersistedContent.has(contentKey)) continue;
         seenPersistedContent.add(contentKey);
-        return true;
+        byId.set(message.id, message);
+        continue;
       }
-      if (seenIds.has(message.id)) return false;
-      seenIds.add(message.id);
+      const current = byId.get(message.id);
+      byId.set(message.id, current ? mergeMessage(current, message) : message);
       seenPersistedContent.add(contentKey);
-      return true;
-    })
+  }
+  return Array.from(byId.values())
     .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+}
+
+function mergeMessage(current: SessionMessage, next: SessionMessage): SessionMessage {
+  return {
+    ...current,
+    ...next,
+    replyTo: next.replyTo ?? current.replyTo,
+    usage: next.usage ?? current.usage,
+  };
 }
 
 export function readableActivityStatus(status: string | undefined, kind: string, t: TFunction) {

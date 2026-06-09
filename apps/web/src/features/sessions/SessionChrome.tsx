@@ -13,12 +13,15 @@ export function MobileMainToggle({ label, onClick }: { label: string; onClick?: 
   );
 }
 
-export function MobileSessionToggle({ label, onClick }: { label: string; onClick?: () => void }) {
+export function MobileSessionToggle({ label, meta, onClick }: { label: string; meta?: string | null; onClick?: () => void }) {
   if (!onClick) return null;
   return (
     <button className="mobile-session-toggle" type="button" onClick={onClick}>
       <Menu size={16} />
-      <span>{label}</span>
+      <span className="mobile-session-toggle-text">
+        <strong>{label}</strong>
+        {meta && <small>{meta}</small>}
+      </span>
     </button>
   );
 }

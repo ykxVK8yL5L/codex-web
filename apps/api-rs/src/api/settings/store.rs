@@ -4,10 +4,12 @@ use serde::{de::DeserializeOwned, Serialize};
 use crate::db::Db;
 
 use super::models::{
-    CodexRuntimeSettings, NotificationTestSettings, PreviewAccessSettings, RateLimitSettings,
-    SessionCompactionSettings, TokenUsageDisplaySettings, TokenUsageRetentionSettings,
-    UpdateCodexRuntimeSettings, UpdateNotificationTestSettings, UpdateSessionCompactionSettings,
-    UpdateTokenUsageDisplaySettings, UpdateTokenUsageRetentionSettings,
+    CodexRuntimeSettings, NotificationTestSettings, PayloadRewriteSettings,
+    PreviewAccessSettings, RateLimitSettings, SessionCompactionSettings,
+    TokenUsageDisplaySettings, TokenUsageRetentionSettings, UpdateCodexRuntimeSettings,
+    UpdateNotificationTestSettings, UpdatePayloadRewriteSettings,
+    UpdateSessionCompactionSettings, UpdateTokenUsageDisplaySettings,
+    UpdateTokenUsageRetentionSettings,
 };
 
 pub fn preview_access(db: &Db) -> anyhow::Result<PreviewAccessSettings> {
@@ -129,6 +131,25 @@ pub fn save_token_usage_display(
         updated_at: crate::api::common::timestamp(),
     });
     save_json(db, "token_usage_display", &next)?;
+    Ok(next)
+}
+
+pub fn payload_rewrite(db: &Db) -> anyhow::Result<PayloadRewriteSettings> {
+    Ok(load_json(db, "payload_rewrite")?
+        .map(sanitize_payload_rewrite)
+        .unwrap_or_else(default_payload_rewrite))
+}
+
+pub fn save_payload_rewrite(
+    db: &Db,
+    input: UpdatePayloadRewriteSettings,
+) -> anyhow::Result<PayloadRewriteSettings> {
+    let current = payload_rewrite(db)?;
+    let next = sanitize_payload_rewrite(PayloadRewriteSettings {
+        rules: input.rules.unwrap_or(current.rules),
+        updated_at: crate::api::common::timestamp(),
+    });
+    save_json(db, "payload_rewrite", &next)?;
     Ok(next)
 }
 
@@ -349,6 +370,20 @@ fn default_token_usage_display() -> TokenUsageDisplaySettings {
 fn sanitize_token_usage_display(input: TokenUsageDisplaySettings) -> TokenUsageDisplaySettings {
     TokenUsageDisplaySettings {
         show_message_usage: input.show_message_usage,
+        updated_at: input.updated_at,
+    }
+}
+
+fn default_payload_rewrite() -> PayloadRewriteSettings {
+    PayloadRewriteSettings {
+        rules: Vec::new(),
+        updated_at: crate::api::common::timestamp(),
+    }
+}
+
+fn sanitize_payload_rewrite(input: PayloadRewriteSettings) -> PayloadRewriteSettings {
+    PayloadRewriteSettings {
+        rules: crate::api::providers::payload_rules::sanitize_payload_rewrite_rules(input.rules),
         updated_at: input.updated_at,
     }
 }

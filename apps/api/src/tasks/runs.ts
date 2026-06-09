@@ -63,13 +63,13 @@ export function taskActivityFromRow(row: Record<string, unknown>): TaskActivityS
   };
 }
 
-export function createTaskRun(sessionId: string, pid?: number, metadata?: { promptChars?: number; promptHash?: string; contextPath?: string }) {
+export function createTaskRun(sessionId: string, pid?: number, metadata?: { promptChars?: number; promptHash?: string; contextPath?: string; messageId?: string | null }) {
   const { db } = deps();
   const id = `task-run-${randomUUID()}`;
   db.prepare(`
-    insert into task_runs (id, session_id, status, pid, started_at, stop_requested, prompt_chars, prompt_hash, context_path)
-    values (?, ?, 'running', ?, ?, 0, ?, ?, ?)
-  `).run(id, sessionId, pid ?? null, new Date().toISOString(), metadata?.promptChars ?? null, metadata?.promptHash ?? null, metadata?.contextPath ?? null);
+    insert into task_runs (id, session_id, status, pid, started_at, stop_requested, prompt_chars, prompt_hash, context_path, message_id)
+    values (?, ?, 'running', ?, ?, 0, ?, ?, ?, ?)
+  `).run(id, sessionId, pid ?? null, new Date().toISOString(), metadata?.promptChars ?? null, metadata?.promptHash ?? null, metadata?.contextPath ?? null, metadata?.messageId ?? null);
   return id;
 }
 

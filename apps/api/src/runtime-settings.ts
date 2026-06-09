@@ -4,10 +4,12 @@ import type {
   CodexRuntimeSettings,
   CodexSandboxMode,
   PreviewAccessSettings,
+  PayloadRewriteSettings,
   SessionCompactionSettings,
   TokenUsageDisplaySettings,
   TokenUsageRetentionSettings,
 } from "@codex-web/protocol";
+import { sanitizePayloadRewriteRules } from "./providers/payload-rules.js";
 
 type RuntimeSettingsDefaults = {
   codexSandboxMode: string;
@@ -192,6 +194,36 @@ export function createRuntimeSettingsStore(db: Database.Database, defaultsInput:
     `).run(JSON.stringify(settings), settings.updatedAt);
   }
 
+  function defaultPayloadRewriteSettings(): PayloadRewriteSettings {
+    return { rules: [], updatedAt: new Date().toISOString() };
+  }
+
+  function sanitizePayloadRewriteSettings(value?: Partial<PayloadRewriteSettings>): PayloadRewriteSettings {
+    const defaults = defaultPayloadRewriteSettings();
+    return {
+      rules: sanitizePayloadRewriteRules(value?.rules),
+      updatedAt: typeof value?.updatedAt === "string" ? value.updatedAt : defaults.updatedAt,
+    };
+  }
+
+  function loadPayloadRewriteSettings(): PayloadRewriteSettings {
+    const row = db.prepare("select value from app_settings where key = 'payload_rewrite'").get() as { value: string } | undefined;
+    if (!row) return defaultPayloadRewriteSettings();
+    try {
+      return sanitizePayloadRewriteSettings(JSON.parse(row.value) as Partial<PayloadRewriteSettings>);
+    } catch {
+      return defaultPayloadRewriteSettings();
+    }
+  }
+
+  function savePayloadRewriteSettings(settings: PayloadRewriteSettings) {
+    db.prepare(`
+      insert into app_settings (key, value, updated_at)
+      values ('payload_rewrite', ?, ?)
+      on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at
+    `).run(JSON.stringify(settings), settings.updatedAt);
+  }
+
   return {
     codexRuntime: {
       load: loadCodexRuntimeSettings,
@@ -217,6 +249,11 @@ export function createRuntimeSettingsStore(db: Database.Database, defaultsInput:
       load: loadTokenUsageDisplaySettings,
       save: saveTokenUsageDisplaySettings,
       sanitize: sanitizeTokenUsageDisplaySettings,
+    },
+    payloadRewrite: {
+      load: loadPayloadRewriteSettings,
+      save: savePayloadRewriteSettings,
+      sanitize: sanitizePayloadRewriteSettings,
     },
   };
 }

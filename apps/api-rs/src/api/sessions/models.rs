@@ -15,7 +15,7 @@ pub struct SessionSummary {
     pub model: Option<String>,
     pub codex_session_id: Option<String>,
     pub notifications_enabled: bool,
-    pub show_message_usage: bool,
+    pub show_message_usage: Option<bool>,
     pub status: String,
     pub created_at: Option<String>,
     pub updated_at: String,
@@ -93,7 +93,8 @@ pub struct CreateSessionRequest {
 pub struct UpdateSessionRequest {
     pub title: Option<String>,
     pub notifications_enabled: Option<bool>,
-    pub show_message_usage: Option<bool>,
+    #[serde(default, deserialize_with = "crate::api::goals::models::double_option")]
+    pub show_message_usage: Option<Option<bool>>,
 }
 
 #[derive(Default)]

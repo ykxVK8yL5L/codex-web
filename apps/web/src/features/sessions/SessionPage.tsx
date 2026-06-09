@@ -231,6 +231,7 @@ export function SessionPage({
   const [taskTemplateTarget, setTaskTemplateTarget] = useState<ComposerTarget | null>(null);
   const [agentPickerOpen, setAgentPickerOpen] = useState(false);
   const [notifyBuilderOpen, setNotifyBuilderOpen] = useState(false);
+  const [mobileModelPickerOpen, setMobileModelPickerOpen] = useState(false);
   const [notifySettings, setNotifySettings] = useState<NotificationSettingsResponse | null>(null);
   const [notifyEventType, setNotifyEventType] = useState<NotificationEventType>("task_completed");
   const [notifyChannelKind, setNotifyChannelKind] = useState<NotificationRecipientSummary["kind"]>("email");
@@ -276,6 +277,11 @@ export function SessionPage({
   const selectedComposerProject = projects.find((item) => item.id === composerProjectId);
   const fallbackSessionProjectId = session?.projectId && !selectedComposerProject ? session.projectId : "";
   const composerProjectName = project ? projectDisplayName(project, projects) : selectedComposerProject ? projectDisplayName(selectedComposerProject, projects) : (session?.projectId ? session.workspacePath || session.projectId : t("session.noProject"));
+  const sessionProviderModelLabel = session
+    ? `${sessionProvider?.name ?? (session.providerId ? session.providerId : t("session.noProvider"))} / ${session.model ?? t("session.noModel")}`
+    : selectedProvider
+      ? `${selectedProvider.name} / ${draftModel || selectedProvider.defaultModel || t("session.noModel")}`
+      : t("session.noProvider");
   const composerModels = draftModel && !draftModels.includes(draftModel) ? [draftModel, ...draftModels] : draftModels;
   const isRoomSession = session?.conversationType === "room";
   const roomHasActiveAgents = isRoomSession && roomActiveAgentIds.length > 0;
@@ -300,6 +306,7 @@ export function SessionPage({
   const visibleMessages = session
     ? mergeMessages(persistedMessages.length ? persistedMessages : fallbackMessages, optimisticMessages)
     : draftSubmittedMessages;
+  const messageUsageVisible = session?.showMessageUsage ?? (usageDisplay?.showMessageUsage === true);
   useEffect(() => {
     function handleSessionInfoRequested(event: Event) {
       const detail = (event as CustomEvent<{ sessionId?: string; expandGoal?: boolean }>).detail;
@@ -650,7 +657,7 @@ export function SessionPage({
       onTaskDetail(detail);
       setMessagePage((current) => {
         const merged = mergeMessages(current.items, detail.messages);
-        if (merged.length === current.items.length && merged.every((message, index) => message.id === current.items[index]?.id)) return current;
+        if (merged.length === current.items.length && merged.every((message, index) => message === current.items[index])) return current;
         return { ...current, items: merged };
       });
       if (detail.session.status === "running" && !stopped && !shouldConnectTaskEvents) {
@@ -1300,7 +1307,7 @@ export function SessionPage({
     notify(enabled ? t("session.notificationEnabled") : t("session.notificationDisabled"), "success");
   }
 
-  async function updateSessionShowMessageUsage(enabled: boolean) {
+  async function updateSessionShowMessageUsage(enabled: boolean | null) {
     if (!session) return;
     const body: UpdateSessionRequest = { showMessageUsage: enabled };
     const response = await fetch(`/api/sessions/${session.id}`, {
@@ -1643,7 +1650,7 @@ export function SessionPage({
                 {session && <span className={`session-type-badge ${session.conversationType ?? "codex"}`}>{readableSessionType(session, t)}</span>}
                 <h1 title={pageSessionTitle ?? t("session.untitled")}>{pageSessionTitle ?? t("session.untitled")}</h1>
               </div>
-              <div className="task-path">{session ? readableStatus(effectiveSessionStatus, t) : selectedComposerProject ? projectDisplayName(selectedComposerProject, projects) : t("session.noProject")}</div>
+              <div className="task-path">{session ? `${readableStatus(effectiveSessionStatus, t)} · ${sessionProviderModelLabel}` : selectedComposerProject ? projectDisplayName(selectedComposerProject, projects) : t("session.noProject")}</div>
             </div>
           </div>
           <div className="header-actions session-actions">
@@ -1670,7 +1677,7 @@ export function SessionPage({
           </div>
         </header>
         <div className="mobile-session-bar">
-          <MobileSessionToggle label={pageSessionTitle ?? t("session.sessionList")} onClick={onOpenSessionNav} />
+          <MobileSessionToggle label={pageSessionTitle ?? t("session.sessionList")} meta={sessionProviderModelLabel} onClick={onOpenSessionNav} />
         </div>
         <div className={`realtime-notice-slot ${realtimeNotice ? "active" : ""}`} aria-live="polite">
           {realtimeNotice && <><Info size={14} /><span>{realtimeNotice}</span></>}
@@ -1698,7 +1705,7 @@ export function SessionPage({
                 user={message.role === "user"}
                 t={t}
                 replyTo={message.replyTo}
-                usage={usageDisplay?.showMessageUsage === true || session?.showMessageUsage === true ? message.usage : null}
+                usage={messageUsageVisible ? message.usage : null}
                 onReply={() => startReply(message)}
                 key={message.id}
               />
@@ -1801,7 +1808,15 @@ export function SessionPage({
             {renderSlashCommandMenu("prompt")}
           </div>
           <div className="composer-actions">
-            <select name="draftmodel" className="model-select" value={draftModel} onChange={(event) => setDraftModel(event.target.value)}>
+            <button className="model-select mobile-model-picker-trigger" type="button" onClick={() => setMobileModelPickerOpen(true)} disabled={!providers.length} title={sessionProviderModelLabel}>
+              <span>{selectedProvider?.name ?? t("session.noProvider")}</span>
+              <small>{draftModel || selectedProvider?.defaultModel || t("session.noModel")}</small>
+            </button>
+            <select name="draftprovider" className="model-select desktop-composer-select" value={selectedProviderId} onChange={(event) => onSelectProvider(event.target.value)} disabled={!providers.length}>
+              {!providers.length && <option value="">{t("session.noProvider")}</option>}
+              {providers.map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}
+            </select>
+            <select name="draftmodel" className="model-select desktop-composer-select" value={draftModel} onChange={(event) => setDraftModel(event.target.value)}>
               {composerModels.map((model) => <option value={model} key={model}>{model}</option>)}
             </select>
             {session ? (
@@ -1816,6 +1831,31 @@ export function SessionPage({
           </div>
         </form>}
       </main>
+      {mobileModelPickerOpen && (
+        <div className="mobile-model-picker-layer" role="dialog" aria-modal="true">
+          <button className="drawer-backdrop" type="button" aria-label={t("action.close")} onClick={() => setMobileModelPickerOpen(false)} />
+          <div className="mobile-model-picker-card">
+            <div>
+              <strong>{t("session.infoProvider")}</strong>
+              <span>{selectedProvider?.name ?? t("session.noProvider")} / {draftModel || selectedProvider?.defaultModel || t("session.noModel")}</span>
+            </div>
+            <label>
+              <span>{t("session.infoProvider")}</span>
+              <select className="model-select" value={selectedProviderId} onChange={(event) => onSelectProvider(event.target.value)} disabled={!providers.length}>
+                {!providers.length && <option value="">{t("session.noProvider")}</option>}
+                {providers.map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}
+              </select>
+            </label>
+            <label>
+              <span>{t("session.infoModel")}</span>
+              <select className="model-select" value={draftModel} onChange={(event) => setDraftModel(event.target.value)}>
+                {composerModels.map((model) => <option value={model} key={model}>{model}</option>)}
+              </select>
+            </label>
+            <button className="dark-button" type="button" onClick={() => setMobileModelPickerOpen(false)}>{t("action.close")}</button>
+          </div>
+        </div>
+      )}
       {session && workspacePanel && (
         <div className="workspace-modal" role="dialog" aria-modal="true">
           <div className="workspace-modal-head">
@@ -1973,10 +2013,14 @@ export function SessionPage({
                   <Switch checked={session.notificationsEnabled !== false} onCheckedChange={(checked) => void updateSessionNotifications(checked)} />
                 </label>
                 <span className="subtle">{t("session.notificationsHelp")}</span>
-                <label className="room-setting-row">
+                <div className="room-setting-row">
                   <span>{t("session.showMessageUsage")}</span>
-                  <Switch checked={session.showMessageUsage === true} onCheckedChange={(checked) => void updateSessionShowMessageUsage(checked)} />
-                </label>
+                  <div className="settings-actions compact-actions">
+                    <button className={`ghost-button${session.showMessageUsage == null ? " active" : ""}`} type="button" onClick={() => void updateSessionShowMessageUsage(null)}>{t("session.showMessageUsageFollowGlobal")}</button>
+                    <button className={`ghost-button${session.showMessageUsage === true ? " active" : ""}`} type="button" onClick={() => void updateSessionShowMessageUsage(true)}>{t("action.on")}</button>
+                    <button className={`ghost-button${session.showMessageUsage === false ? " active" : ""}`} type="button" onClick={() => void updateSessionShowMessageUsage(false)}>{t("action.off")}</button>
+                  </div>
+                </div>
                 <span className="subtle">{t("session.showMessageUsageHelp")}</span>
               </div>
             )}

@@ -1,4 +1,5 @@
 pub(crate) mod models;
+pub(crate) mod payload_rules;
 mod proxy;
 mod runtime;
 pub(crate) mod store;
@@ -38,7 +39,10 @@ pub(crate) async fn proxy_responses_for_provider_id(
     else {
         return Err(error(StatusCode::NOT_FOUND, "provider_not_found"));
     };
-    proxy::proxy_responses(&provider, headers, body)
+    let rules = crate::api::settings::store::payload_rewrite(&state.db)
+        .map(|settings| settings.rules)
+        .unwrap_or_default();
+    proxy::proxy_responses(&provider, headers, body, &rules)
         .await
         .map_err(|(status, value)| (status, Json(value)))
 }
@@ -162,7 +166,10 @@ async fn test(
     else {
         return Err(error(StatusCode::NOT_FOUND, "provider_not_found"));
     };
-    let result = runtime::test_provider(&provider).await;
+    let rules = crate::api::settings::store::payload_rewrite(&state.db)
+        .map(|settings| settings.rules)
+        .unwrap_or_default();
+    let result = runtime::test_provider(&provider, &rules).await;
     let _ = store::record_health(
         &state.db,
         &id,
@@ -199,7 +206,10 @@ async fn detect(
     else {
         return Err(error(StatusCode::NOT_FOUND, "provider_not_found"));
     };
-    let detection = runtime::detect_provider(&provider).await;
+    let rules = crate::api::settings::store::payload_rewrite(&state.db)
+        .map(|settings| settings.rules)
+        .unwrap_or_default();
+    let detection = runtime::detect_provider(&provider, &rules).await;
     let status = if detection.checks.responses.ok {
         detection.checks.responses.status
     } else {
@@ -269,10 +279,14 @@ async fn draft_models(
 }
 
 async fn draft_detect(
+    State(state): State<AppState>,
     Json(body): Json<models::ProviderInput>,
 ) -> Json<models::ProviderDetectionResponse> {
     let provider = runtime::draft_provider(body);
-    Json(runtime::detect_provider(&provider).await)
+    let rules = crate::api::settings::store::payload_rewrite(&state.db)
+        .map(|settings| settings.rules)
+        .unwrap_or_default();
+    Json(runtime::detect_provider(&provider, &rules).await)
 }
 
 async fn proxy_responses(

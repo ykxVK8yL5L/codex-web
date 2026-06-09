@@ -38,6 +38,26 @@ const MESSAGE_SELECT_SQL: &str = "
   usage.created_at as usage_created_at
 ";
 
+const MESSAGE_SELECT_SQL_WITHOUT_USAGE: &str = "
+  messages.id, messages.session_id, messages.role, messages.content, messages.reply_to_message_id, messages.created_at,
+  reply.id as reply_id, reply.role as reply_role, reply.content as reply_content,
+  null as usage_id,
+  null as usage_session_id,
+  null as usage_session_title,
+  null as usage_message_id,
+  null as usage_task_run_id,
+  null as usage_provider_id,
+  null as usage_provider_name,
+  null as usage_model,
+  null as usage_source,
+  null as usage_input_tokens,
+  null as usage_cached_input_tokens,
+  null as usage_output_tokens,
+  null as usage_reasoning_output_tokens,
+  null as usage_total_tokens,
+  null as usage_created_at
+";
+
 pub fn list(
     db: &Db,
     session_id: &str,
@@ -50,6 +70,9 @@ pub fn list(
     if !table_exists(&connection, "messages")? {
         return Ok(empty_page());
     }
+    let has_usage_records = table_exists(&connection, "token_usage_records")?;
+    let select_sql = if has_usage_records { MESSAGE_SELECT_SQL } else { MESSAGE_SELECT_SQL_WITHOUT_USAGE };
+    let usage_join_sql = if has_usage_records { USAGE_JOIN_SQL } else { "" };
     let page_size = limit.clamp(1, 100);
     let cursor = before
         .filter(|value| !value.trim().is_empty())
@@ -67,10 +90,10 @@ pub fn list(
     let rows = if let Some((created_at, id)) = cursor {
         let mut statement = connection.prepare(
             &format!("
-            select {MESSAGE_SELECT_SQL}
+            select {select_sql}
             from messages
             left join messages reply on reply.id = messages.reply_to_message_id and reply.session_id = messages.session_id
-            {USAGE_JOIN_SQL}
+            {usage_join_sql}
             where messages.session_id = ? and (messages.created_at < ? or (messages.created_at = ? and messages.id < ?))
             order by messages.created_at desc, messages.id desc
             limit ?
@@ -92,10 +115,10 @@ pub fn list(
     } else {
         let mut statement = connection.prepare(
             &format!("
-            select {MESSAGE_SELECT_SQL}
+            select {select_sql}
             from messages
             left join messages reply on reply.id = messages.reply_to_message_id and reply.session_id = messages.session_id
-            {USAGE_JOIN_SQL}
+            {usage_join_sql}
             where messages.session_id = ?
             order by messages.created_at desc, messages.id desc
             limit ?

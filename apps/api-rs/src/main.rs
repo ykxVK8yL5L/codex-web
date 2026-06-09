@@ -17,6 +17,9 @@ async fn main() -> anyhow::Result<()> {
 
     let config = AppConfig::from_env();
     let state = AppState::new(config.clone());
+    if let Err(error) = ensure_startup_schemas(&state) {
+        tracing::warn!("failed to ensure startup schemas: {error}");
+    }
     // Materialize embedded role-templates to disk (no-op when the dir already exists), then seed
     // built-in multi-agent circles/roles. Best-effort.
     api::agents::role_templates::ensure_role_templates_on_disk(&state.db.data_dir);
@@ -40,6 +43,12 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("server failed")?;
 
+    Ok(())
+}
+
+fn ensure_startup_schemas(state: &AppState) -> anyhow::Result<()> {
+    let connection = state.db.open_read_write()?;
+    api::usage::ensure_schema(&connection)?;
     Ok(())
 }
 

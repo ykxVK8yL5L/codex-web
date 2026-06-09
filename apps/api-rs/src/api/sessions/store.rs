@@ -41,7 +41,7 @@ pub fn list_sessions(
                 model: row.get(8)?,
                 codex_session_id: row.get(9)?,
                 notifications_enabled: row.get::<_, Option<i64>>(10)?.unwrap_or(1) != 0,
-                show_message_usage: row.get::<_, Option<i64>>(11)?.unwrap_or(0) != 0,
+                show_message_usage: bool_override(row.get::<_, Option<i64>>(11)?),
                 status: row.get(12)?,
                 created_at: row.get(13)?,
                 updated_at: row.get(14)?,
@@ -106,7 +106,7 @@ pub fn create_session(db: &Db, input: CreateSessionRequest) -> anyhow::Result<Se
         .and_then(|project| project.workspace_path.clone())
         .unwrap_or_else(|| ensure_scratch_session_workspace(db, &id));
     connection.execute(
-        "insert into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, show_message_usage, status, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, null, null, null, 1, 0, 'paused', ?, ?)",
+        "insert into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, show_message_usage, status, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, null, null, null, 1, null, 'paused', ?, ?)",
         (
             &id,
             kind,
@@ -171,7 +171,7 @@ pub fn update_session(
         (
             &session.title,
             if session.notifications_enabled { 1 } else { 0 },
-            if session.show_message_usage { 1 } else { 0 },
+            session.show_message_usage.map(|value| if value { 1 } else { 0 }),
             &now,
             id,
         ),
@@ -419,7 +419,7 @@ fn ensure_session_schema(connection: &rusqlite::Connection) -> anyhow::Result<()
           model text,
           codex_session_id text,
           notifications_enabled integer not null default 1,
-          show_message_usage integer not null default 0,
+          show_message_usage integer,
           status text not null,
           created_at text,
           updated_at text not null
@@ -428,7 +428,57 @@ fn ensure_session_schema(connection: &rusqlite::Connection) -> anyhow::Result<()
         create index if not exists sessions_status_updated_idx on sessions(status, updated_at desc, id desc);
         ",
     )?;
-    ensure_column(connection, "sessions", "show_message_usage", "integer not null default 0")?;
+    ensure_column(connection, "sessions", "show_message_usage", "integer")?;
+    relax_show_message_usage_column(connection)?;
+    Ok(())
+}
+
+fn bool_override(value: Option<i64>) -> Option<bool> {
+    value.map(|item| item != 0)
+}
+
+fn relax_show_message_usage_column(connection: &rusqlite::Connection) -> anyhow::Result<()> {
+    let mut statement = connection.prepare("pragma table_info(sessions)")?;
+    let columns = statement
+        .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|(name, notnull)| name == "show_message_usage" && *notnull != 0) {
+        return Ok(());
+    }
+    connection.execute_batch(
+        "
+        create table if not exists sessions_next (
+          id text primary key,
+          kind text not null,
+          conversation_type text not null default 'codex',
+          room_id text,
+          title text not null,
+          project_id text,
+          workspace_path text,
+          provider_id text,
+          model text,
+          codex_session_id text,
+          notifications_enabled integer not null default 1,
+          show_message_usage integer,
+          status text not null,
+          created_at text,
+          updated_at text not null
+        );
+        insert into sessions_next (
+          id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id,
+          model, codex_session_id, notifications_enabled, show_message_usage, status, created_at, updated_at
+        )
+        select
+          id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id,
+          model, codex_session_id, notifications_enabled, case when show_message_usage = 1 then 1 else null end,
+          status, created_at, updated_at
+        from sessions;
+        drop table sessions;
+        alter table sessions_next rename to sessions;
+        create index if not exists sessions_project_updated_idx on sessions(project_id, updated_at desc, id desc);
+        create index if not exists sessions_status_updated_idx on sessions(status, updated_at desc, id desc);
+        ",
+    )?;
     Ok(())
 }
 

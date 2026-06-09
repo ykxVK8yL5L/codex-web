@@ -2,7 +2,8 @@ import type Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { CreateSessionCompactionRequest, ProviderSummary, SessionCompactionListResponse, SessionCompactionResponse, SessionCompactionSettings, SessionCompactionSummary, SessionMessage, SessionSummary } from "@codex-web/protocol";
+import type { CreateSessionCompactionRequest, PayloadRewriteRule, ProviderSummary, SessionCompactionListResponse, SessionCompactionResponse, SessionCompactionSettings, SessionCompactionSummary, SessionMessage, SessionSummary } from "@codex-web/protocol";
+import { applyPayloadRewriteRules } from "../providers/payload-rules.js";
 import type { TaskEvent } from "../tasks/events.js";
 import { readProviderUsage, recordTokenUsage } from "../usage.js";
 
@@ -15,6 +16,7 @@ type SessionCompactionRuntimeDeps = {
   appData: { providers: ProviderRecord[] };
   db: Database.Database;
   getSessionCompactionSettings: () => SessionCompactionSettings;
+  getPayloadRewriteRules?: () => PayloadRewriteRule[];
   joinUrl: (baseUrl: string, path: string) => string;
   publishTaskEvent: (sessionId: string, event: TaskEvent) => void;
   recordTaskActivity: (sessionId: string, activity: Extract<TaskEvent, { type: "activity" }>) => void;
@@ -55,7 +57,7 @@ function truncateContextText(value: string, limit = 1200) {
 }
 
 export function createSessionCompactionRuntime(deps: SessionCompactionRuntimeDeps) {
-  const { allSessionMessages, appendSessionMessage, appendCodexErrorOutput, appData, db, getSessionCompactionSettings, joinUrl, publishTaskEvent, recordTaskActivity, sessionMemoryPath } = deps;
+  const { allSessionMessages, appendSessionMessage, appendCodexErrorOutput, appData, db, getSessionCompactionSettings, getPayloadRewriteRules, joinUrl, publishTaskEvent, recordTaskActivity, sessionMemoryPath } = deps;
 
 function sessionCompactionFromRow(row: Record<string, unknown>): SessionCompactionSummary {
   return {
@@ -190,17 +192,18 @@ async function generateSessionCompactionSummary(session: SessionSummary, provide
   if (!provider.apiKey) throw new Error("api_key_missing");
   if (provider.kind === "openai-compatible-chat") {
     if (!provider.baseUrl) throw new Error("base_url_required");
+    const requestPayload = applyPayloadRewriteRules(provider, {
+      model,
+      messages: [
+        { role: "system", content: "You summarize software-development conversations into durable session memory." },
+        { role: "user", content: prompt },
+      ],
+      max_tokens: 1200,
+    }, getPayloadRewriteRules?.() ?? []);
     const response = await fetch(joinUrl(provider.baseUrl, "/chat/completions"), {
       method: "POST",
       headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: "You summarize software-development conversations into durable session memory." },
-          { role: "user", content: prompt },
-        ],
-        max_tokens: 1200,
-      }),
+      body: JSON.stringify(requestPayload),
     });
     if (!response.ok) throw new Error(await response.text() || `http_${response.status}`);
     const payload = await response.json() as Record<string, unknown>;
@@ -210,14 +213,15 @@ async function generateSessionCompactionSummary(session: SessionSummary, provide
     if (!content) throw new Error("empty_compaction_summary");
     return { summary: content, usage: readProviderUsage(payload), raw: payload };
   }
+  const requestPayload = applyPayloadRewriteRules(provider, {
+    model,
+    input: prompt,
+    max_output_tokens: 1600,
+  }, getPayloadRewriteRules?.() ?? []);
   const response = await fetch(joinUrl(provider.baseUrl || "https://api.openai.com/v1", "/responses"), {
     method: "POST",
     headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" },
-    body: JSON.stringify({
-      model,
-      input: prompt,
-      max_output_tokens: 1600,
-    }),
+    body: JSON.stringify(requestPayload),
   });
   if (!response.ok) throw new Error(await response.text() || `http_${response.status}`);
   const payload = await response.json() as Record<string, unknown>;

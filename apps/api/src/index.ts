@@ -282,6 +282,7 @@ import type {
   ProjectStatsSummary,
   ProjectSummary,
   PreviewAccessSettings,
+  PayloadRewriteSettings,
   PreviewSummary,
   ProviderCapabilities,
   ProviderDetectionResponse,
@@ -423,7 +424,7 @@ import { registerProviderRoutes } from "./providers/routes.js";
 import { createProviderRuntime } from "./providers/runtime.js";
 import { registerPreviewLogStreamRoute, registerPreviewRoutes } from "./previews/routes.js";
 import { createPreviewRuntime } from "./previews/runtime.js";
-import { cleanupTokenUsageRecords, ensureTokenUsageSchema, recordCodexUsage, registerUsageRoutes } from "./usage.js";
+import { cleanupTokenUsageRecords, ensureTokenUsageSchema, readCodexUsage, recordCodexUsage, registerUsageRoutes } from "./usage.js";
 import { createPreviewAccessService } from "./previews/access.js";
 import { createPreviewLogEventBus } from "./previews/events.js";
 import { createPreviewProcessRuntime } from "./previews/processes.js";
@@ -628,6 +629,7 @@ let previewAccessSettings = runtimeSettingsStore.previewAccess.load();
 let sessionCompactionSettings = runtimeSettingsStore.sessionCompaction.load();
 let tokenUsageRetentionSettings = runtimeSettingsStore.tokenUsageRetention.load();
 let tokenUsageDisplaySettings = runtimeSettingsStore.tokenUsageDisplay.load();
+let payloadRewriteSettings = runtimeSettingsStore.payloadRewrite.load();
 let rateLimitSettings = rateLimitStore.load();
 let systemBackupSettings = loadSystemBackupSettings();
 let notificationTestSettings: NotificationTestSettings;
@@ -826,6 +828,7 @@ const providerRuntime = createProviderRuntime({
   mergeProviderCapabilities,
   stableJson,
   stringifyReadable,
+  getPayloadRewriteRules: () => payloadRewriteSettings.rules,
 });
 const {
   clearProviderModelCache,
@@ -1263,6 +1266,7 @@ const sessionCompactionRuntime = createSessionCompactionRuntime({
   appData,
   db,
   getSessionCompactionSettings: () => sessionCompactionSettings,
+  getPayloadRewriteRules: () => payloadRewriteSettings.rules,
   joinUrl,
   publishTaskEvent: (sessionId, event) => publishTaskEvent(sessionId, event),
   recordTaskActivity: (sessionId, activity) => recordTaskActivity(sessionId, activity),
@@ -1584,6 +1588,7 @@ const settingsRouteDeps = {
   getSessionCompactionSettings: () => sessionCompactionSettings,
   getTokenUsageDisplaySettings: () => tokenUsageDisplaySettings,
   getTokenUsageRetentionSettings: () => tokenUsageRetentionSettings,
+  getPayloadRewriteSettings: () => payloadRewriteSettings,
   getSystemBackupSettings: () => systemBackupSettings,
   join,
   listApprovalGrants,
@@ -1641,6 +1646,9 @@ const settingsRouteDeps = {
   },
   setTokenUsageDisplaySettings: (next: TokenUsageDisplaySettings) => {
     tokenUsageDisplaySettings = next;
+  },
+  setPayloadRewriteSettings: (next: PayloadRewriteSettings) => {
+    payloadRewriteSettings = next;
   },
   setSystemBackupSettings: (next: SystemBackupSettings) => {
     systemBackupSettings = next;
@@ -1965,6 +1973,7 @@ const automationRouteDeps = {
 };
 const codexTaskStdoutBuffers = new Map<string, string>();
 const codexTaskCurrentMessageIds = new Map<string, string>();
+const codexTaskPendingUsageMessageIds = new Map<string, string>();
 const codexTaskLogOffsets = new Map<string, number>();
 const codexTaskTailers = new Map<string, NodeJS.Timeout>();
 const finalizedRecoveredTasks = new Set<string>();
@@ -2086,7 +2095,7 @@ function openDatabase() {
       model text,
       codex_session_id text,
       notifications_enabled integer not null default 1,
-      show_message_usage integer not null default 0,
+      show_message_usage integer,
       status text not null,
       created_at text,
       updated_at text not null
@@ -2378,7 +2387,8 @@ function openDatabase() {
       interrupted_reason text,
       prompt_chars integer,
       prompt_hash text,
-      context_path text
+      context_path text,
+      message_id text
     );
     create index if not exists task_runs_session_started_idx on task_runs(session_id, started_at desc, id desc);
     create index if not exists task_runs_status_started_idx on task_runs(status, started_at desc, id desc);
@@ -2771,11 +2781,12 @@ function openDatabase() {
   if (!taskRunColumns.some((column) => column.name === "prompt_chars")) database.prepare("alter table task_runs add column prompt_chars integer").run();
   if (!taskRunColumns.some((column) => column.name === "prompt_hash")) database.prepare("alter table task_runs add column prompt_hash text").run();
   if (!taskRunColumns.some((column) => column.name === "context_path")) database.prepare("alter table task_runs add column context_path text").run();
+  if (!taskRunColumns.some((column) => column.name === "message_id")) database.prepare("alter table task_runs add column message_id text").run();
   const approvalColumns = database.prepare("pragma table_info(approvals)").all() as Array<{ name: string }>;
   if (!approvalColumns.some((column) => column.name === "archived_at")) database.prepare("alter table approvals add column archived_at text").run();
   const approvalGrantColumns = database.prepare("pragma table_info(approval_grants)").all() as Array<{ name: string }>;
   if (!approvalGrantColumns.some((column) => column.name === "expires_at")) database.prepare("alter table approval_grants add column expires_at text").run();
-  const sessionColumns = database.prepare("pragma table_info(sessions)").all() as Array<{ name: string }>;
+  const sessionColumns = database.prepare("pragma table_info(sessions)").all() as Array<{ name: string; notnull?: number }>;
   if (!sessionColumns.some((column) => column.name === "workspace_path")) {
     database.prepare("alter table sessions add column workspace_path text").run();
   }
@@ -2789,8 +2800,9 @@ function openDatabase() {
     database.prepare("alter table sessions add column notifications_enabled integer not null default 1").run();
   }
   if (!sessionColumns.some((column) => column.name === "show_message_usage")) {
-    database.prepare("alter table sessions add column show_message_usage integer not null default 0").run();
+    database.prepare("alter table sessions add column show_message_usage integer").run();
   }
+  relaxSessionShowMessageUsageColumn(database);
   const roomColumns = database.prepare("pragma table_info(rooms)").all() as Array<{ name: string }>;
   if (!roomColumns.some((column) => column.name === "session_id")) {
     database.prepare("alter table rooms add column session_id text").run();
@@ -2914,6 +2926,44 @@ function openDatabase() {
   return database;
 }
 
+function relaxSessionShowMessageUsageColumn(database: Database.Database) {
+  const columns = database.prepare("pragma table_info(sessions)").all() as Array<{ name: string; notnull?: number }>;
+  const column = columns.find((item) => item.name === "show_message_usage");
+  if (!column?.notnull) return;
+  database.exec(`
+    create table if not exists sessions_next (
+      id text primary key,
+      kind text not null,
+      conversation_type text not null default 'codex',
+      room_id text,
+      title text not null,
+      project_id text,
+      workspace_path text,
+      provider_id text,
+      model text,
+      codex_session_id text,
+      notifications_enabled integer not null default 1,
+      show_message_usage integer,
+      status text not null,
+      created_at text,
+      updated_at text not null
+    );
+    insert into sessions_next (
+      id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model,
+      codex_session_id, notifications_enabled, show_message_usage, status, created_at, updated_at
+    )
+    select
+      id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model,
+      codex_session_id, notifications_enabled, case when show_message_usage = 1 then 1 else null end,
+      status, created_at, updated_at
+    from sessions;
+    drop table sessions;
+    alter table sessions_next rename to sessions;
+    create index if not exists sessions_project_updated_idx on sessions(project_id, updated_at desc, id desc);
+    create index if not exists sessions_status_updated_idx on sessions(status, updated_at desc, id desc);
+  `);
+}
+
 function upsertSession(session: SessionSummary) {
   db.prepare(`
     insert into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, show_message_usage, status, created_at, updated_at)
@@ -2945,7 +2995,7 @@ function upsertSession(session: SessionSummary) {
     session.model ?? null,
     session.codexSessionId ?? null,
     session.notificationsEnabled === false ? 0 : 1,
-    session.showMessageUsage === true ? 1 : 0,
+    session.showMessageUsage === null || session.showMessageUsage === undefined ? null : session.showMessageUsage === true ? 1 : 0,
     session.status,
     session.createdAt ?? null,
     session.updatedAt,
@@ -4255,7 +4305,6 @@ function processCodexLogChunk(session: SessionSummary, value: string) {
   codexTaskStdoutBuffers.set(session.id, lines.pop() ?? "");
   for (const line of lines) {
     rememberCodexSessionId(session, line);
-    recordCodexUsage({ db, sessions: appData.sessions, providers: appData.providers, parsePageLimit, latestRunningTaskRun }, session, line);
     const activity = line.trim() ? readActivityEvent(line) : null;
     if (activity && activity.type === "activity") {
       publishTaskEvent(session.id, activity);
@@ -4266,8 +4315,14 @@ function processCodexLogChunk(session: SessionSummary, value: string) {
     const assistantText = readAssistantText(line);
     if (assistantText) {
       const message = appendSessionMessage(session.id, "assistant", assistantText);
+      codexTaskPendingUsageMessageIds.set(session.id, message.id);
       ingestAssistantArtifacts(session, message, assistantText);
       publishTaskEvent(session.id, { type: "message", message, session });
+    }
+    if (readCodexUsage(line)) {
+      const preferredUsageMessageId = codexTaskPendingUsageMessageIds.get(session.id) ?? undefined;
+      recordCodexUsage({ db, sessions: appData.sessions, providers: appData.providers, parsePageLimit, latestRunningTaskRun }, session, line, preferredUsageMessageId);
+      codexTaskPendingUsageMessageIds.delete(session.id);
     }
   }
 }
@@ -4360,17 +4415,28 @@ function backfillTaskActivitiesFromLog(sessionId: string) {
 function backfillSessionFromTaskLog(session: SessionSummary) {
   const content = readTaskLogContent(session.id);
   if (!content) return;
+  let pendingUsageMessageId: string | null = null;
   for (const line of content.split(/\r?\n/)) {
     if (!line.trim()) continue;
     rememberCodexSessionId(session, line);
     const activity = readActivityEvent(line);
     if (activity?.type === "activity") recordTaskActivity(session.id, activity);
     const assistantText = readAssistantText(line);
-    if (!assistantText) continue;
-    const existing = db.prepare("select id from messages where session_id = ? and role = 'assistant' and content = ? limit 1").get(session.id, assistantText);
-    if (existing) continue;
-    const message = appendSessionMessage(session.id, "assistant", assistantText);
-    ingestAssistantArtifacts(session, message, assistantText);
+    if (assistantText) {
+      const existing = db.prepare("select id from messages where session_id = ? and role = 'assistant' and content = ? limit 1").get(session.id, assistantText) as { id?: string } | undefined;
+      if (existing?.id) {
+        pendingUsageMessageId = existing.id;
+      } else {
+        const message = appendSessionMessage(session.id, "assistant", assistantText);
+        pendingUsageMessageId = message.id;
+        ingestAssistantArtifacts(session, message, assistantText);
+      }
+      continue;
+    }
+    if (readCodexUsage(line)) {
+      recordCodexUsage({ db, sessions: appData.sessions, providers: appData.providers, parsePageLimit, latestRunningTaskRun }, session, line, pendingUsageMessageId);
+      pendingUsageMessageId = null;
+    }
   }
 }
 
@@ -4948,6 +5014,7 @@ function clearCodexTaskRuntime(sessionId: string, kill = false) {
   codexTaskStopRequested.delete(sessionId);
   codexTaskStdoutBuffers.delete(sessionId);
   codexTaskCurrentMessageIds.delete(sessionId);
+  codexTaskPendingUsageMessageIds.delete(sessionId);
   stopCodexTaskTailer(sessionId);
 }
 
@@ -4988,6 +5055,7 @@ function finalizeCodexRunnerTask(session: SessionSummary, exitCode: number | nul
   codexTaskProcesses.delete(session.id);
   codexTaskStdoutBuffers.delete(session.id);
   codexTaskCurrentMessageIds.delete(session.id);
+  codexTaskPendingUsageMessageIds.delete(session.id);
   stopCodexTaskTailer(session.id);
   const output = codexTaskOutputs.get(session.id);
   if (output) output.exitCode = exitCode;
@@ -5382,7 +5450,7 @@ function startCodexTask(
     stdio: ["ignore", "ignore", "ignore", "ipc"],
   });
   codexTaskProcesses.set(session.id, runner);
-  createTaskRun(session.id, runner.pid, { promptChars: managedPrompt.length, promptHash: managedPromptHash, contextPath: contextPackPath });
+  createTaskRun(session.id, runner.pid, { promptChars: managedPrompt.length, promptHash: managedPromptHash, contextPath: contextPackPath, messageId: contextInput?.currentMessageId ?? null });
   startCodexTaskTailer(session, { finalizeOnExit: true });
   publishTaskEvent(session.id, { type: "started", session });
   runner.send({
@@ -5582,7 +5650,18 @@ registerRoomRoutes(app, roomRouteDeps);
 registerProviderRoutes(app, providerRouteDeps);
 
 ensureTokenUsageSchema(db);
-registerUsageRoutes(app, { db, sessions: appData.sessions, providers: appData.providers, parsePageLimit, latestRunningTaskRun, getRetentionDays: () => tokenUsageRetentionSettings.retentionDays });
+registerUsageRoutes(app, {
+  db,
+  sessions: appData.sessions,
+  providers: appData.providers,
+  parsePageLimit,
+  latestRunningTaskRun,
+  getRetentionDays: () => tokenUsageRetentionSettings.retentionDays,
+  backfillSessionUsage: (sessionId) => {
+    const session = appData.sessions.find((item) => item.id === sessionId);
+    if (session) backfillSessionFromTaskLog(session);
+  },
+});
 
 registerExtensionRoutes(app, extensionRouteDeps);
 

@@ -99,7 +99,7 @@ export interface SessionSummary {
   model?: string | null;
   codexSessionId?: string | null;
   notificationsEnabled?: boolean;
-  showMessageUsage?: boolean;
+  showMessageUsage?: boolean | null;
   goal?: GoalSummary | null;
   status: "running" | "paused" | "done" | "interrupted";
   createdAt?: string;
@@ -238,6 +238,24 @@ export interface ProviderCapabilities {
   jsonMode: boolean;
   vision: boolean;
   streaming: boolean;
+}
+
+export interface PayloadRewriteRule {
+  id: string;
+  enabled?: boolean;
+  providerKind?: ProviderSummary["kind"] | "all";
+  modelPattern: string;
+  removeParams?: string[];
+  setParamsJson?: string;
+}
+
+export interface PayloadRewriteSettings {
+  rules: PayloadRewriteRule[];
+  updatedAt: string;
+}
+
+export interface UpdatePayloadRewriteSettingsRequest {
+  rules?: PayloadRewriteRule[];
 }
 
 export interface AuthState {
@@ -1053,7 +1071,7 @@ export interface CreateSessionRequest {
 export interface UpdateSessionRequest {
   title?: string;
   notificationsEnabled?: boolean;
-  showMessageUsage?: boolean;
+  showMessageUsage?: boolean | null;
 }
 
 export interface CreateGoalRequest {

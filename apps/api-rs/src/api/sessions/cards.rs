@@ -84,20 +84,18 @@ pub enum DeleteCardOutcome {
 
 pub fn delete(db: &Db, session_id: &str, card_id: &str) -> anyhow::Result<DeleteCardOutcome> {
     if let Some(preview_id) = card_id.strip_prefix("preview:") {
-        let preview = preview_store::get(db, preview_id)?;
-        let valid = preview
-            .map(|preview| preview.scope_type == "session" && preview.scope_id == session_id)
-            .unwrap_or(false);
-        if !valid {
+        let Some(preview) = preview_store::get(db, preview_id)? else {
+            return Ok(DeleteCardOutcome::NotFound);
+        };
+        if preview.scope_type != "session" || preview.scope_id != session_id {
             return Ok(DeleteCardOutcome::NotFound);
         }
         dismiss(
             db,
             session_id,
             "preview",
-            &serde_json::json!({ "id": preview_id }),
+            &serde_json::to_value(preview.public())?,
         )?;
-        let _ = preview_store::delete(db, preview_id);
         let connection = db.open_read_write()?;
         ensure_schema(&connection)?;
         let _ = connection.execute(

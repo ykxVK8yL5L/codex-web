@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { createHash, randomUUID } from "node:crypto";
-import type { ProviderCapabilities, ProviderDetectionResponse, ProviderHealthCheck, ProviderModelsResponse, ProviderSummary, ProviderTestResponse } from "@codex-web/protocol";
+import type { PayloadRewriteRule, ProviderCapabilities, ProviderDetectionResponse, ProviderHealthCheck, ProviderModelsResponse, ProviderSummary, ProviderTestResponse } from "@codex-web/protocol";
+import { applyPayloadRewriteRules } from "./payload-rules.js";
 
 type ProviderRecord = ProviderSummary & { apiKey?: string };
 
@@ -12,6 +13,7 @@ type ProviderRuntimeDeps = {
   mergeProviderCapabilities: (kind: ProviderSummary["kind"], value?: Partial<ProviderCapabilities>) => ProviderCapabilities;
   stableJson: (value: unknown) => string;
   stringifyReadable: (value: unknown) => string;
+  getPayloadRewriteRules?: () => PayloadRewriteRule[];
 };
 
 export function joinUrl(baseUrl: string, path: string) {
@@ -19,7 +21,7 @@ export function joinUrl(baseUrl: string, path: string) {
 }
 
 export function createProviderRuntime(deps: ProviderRuntimeDeps) {
-  const { db, providerTimeoutMs, providerModelsCacheTtlMs, defaultProviderCapabilities, mergeProviderCapabilities, stableJson, stringifyReadable } = deps;
+  const { db, providerTimeoutMs, providerModelsCacheTtlMs, defaultProviderCapabilities, mergeProviderCapabilities, stableJson, stringifyReadable, getPayloadRewriteRules } = deps;
 
 function publicProvider(provider: ProviderRecord): ProviderSummary {
   const cachedModels = readProviderModelCache(provider);
@@ -196,7 +198,7 @@ function chatCompletionToResponse(payload: Record<string, unknown>, fallbackMode
     model: typeof payload.model === "string" ? payload.model : fallbackModel,
     output,
     output_text: text,
-    usage: payload.usage ?? null,
+    usage: chatUsageToResponseUsage(payload.usage),
   };
 }
 
@@ -209,6 +211,7 @@ function responsesRequestToChatCompletion(body: Record<string, unknown>, provide
   if (body.temperature !== undefined) request.temperature = body.temperature;
   if (body.top_p !== undefined) request.top_p = body.top_p;
   if (body.stream !== undefined) request.stream = body.stream;
+  if (body.stream === true) request.stream_options = { include_usage: true };
   const tools = responseToolsToChatTools(body.tools);
   if (tools) request.tools = tools;
   if (body.tool_choice !== undefined) request.tool_choice = body.tool_choice;
@@ -217,6 +220,23 @@ function responsesRequestToChatCompletion(body: Record<string, unknown>, provide
 
 function sseEvent(event: string, data: unknown) {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function chatUsageToResponseUsage(value: unknown) {
+  if (!value || typeof value !== "object") return null;
+  const usage = value as Record<string, unknown>;
+  const inputTokens = typeof usage.input_tokens === "number" ? usage.input_tokens : usage.prompt_tokens;
+  const outputTokens = typeof usage.output_tokens === "number" ? usage.output_tokens : usage.completion_tokens;
+  const inputDetails = (usage.input_tokens_details ?? usage.prompt_tokens_details) as Record<string, unknown> | undefined;
+  const outputDetails = (usage.output_tokens_details ?? usage.completion_tokens_details) as Record<string, unknown> | undefined;
+  return {
+    ...usage,
+    input_tokens: inputTokens ?? 0,
+    output_tokens: outputTokens ?? 0,
+    total_tokens: usage.total_tokens ?? ((typeof inputTokens === "number" ? inputTokens : 0) + (typeof outputTokens === "number" ? outputTokens : 0)),
+    input_tokens_details: inputDetails ?? null,
+    output_tokens_details: outputDetails ?? null,
+  };
 }
 
 async function streamChatCompletionAsResponses(upstream: Response, model: string) {
@@ -229,6 +249,7 @@ async function streamChatCompletionAsResponses(upstream: Response, model: string
   let itemStarted = false;
   let textOutputIndex = 0;
   let nextOutputIndex = 0;
+  let usage: unknown = null;
   const functionCalls = new Map<number, { id: string; callId: string; name: string; arguments: string; outputIndex: number }>();
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -349,6 +370,7 @@ async function streamChatCompletionAsResponses(upstream: Response, model: string
         if (!data || data === "[DONE]") return;
         try {
           const chunk = JSON.parse(data) as Record<string, unknown>;
+          if (chunk.usage && typeof chunk.usage === "object") usage = chatUsageToResponseUsage(chunk.usage);
           const choice = Array.isArray(chunk.choices) ? chunk.choices[0] as Record<string, unknown> | undefined : undefined;
           const delta = choice?.delta && typeof choice.delta === "object" ? choice.delta as Record<string, unknown> : {};
           const content = delta.content;
@@ -395,7 +417,7 @@ async function streamChatCompletionAsResponses(upstream: Response, model: string
       const reader = upstream.body?.getReader();
       if (!reader) {
         const item = finishTextItem() ?? { id: itemId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: "", annotations: [] }] };
-        controller.enqueue(encoder.encode(sseEvent("response.completed", { type: "response.completed", response: { id: responseId, status: "completed", model, output: [item] } })));
+        controller.enqueue(encoder.encode(sseEvent("response.completed", { type: "response.completed", response: { id: responseId, status: "completed", model, output: [item], usage } })));
         controller.close();
         return;
       }
@@ -414,7 +436,7 @@ async function streamChatCompletionAsResponses(upstream: Response, model: string
       buffer = "";
       const output = [finishTextItem(), ...finishFunctionCalls()].filter(Boolean);
       if (!output.length) output.push({ id: itemId, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: "", annotations: [] }] });
-      controller.enqueue(encoder.encode(sseEvent("response.completed", { type: "response.completed", response: { id: responseId, status: "completed", model, output } })));
+      controller.enqueue(encoder.encode(sseEvent("response.completed", { type: "response.completed", response: { id: responseId, status: "completed", model, output, usage } })));
       controller.enqueue(encoder.encode("data: [DONE]\n\n"));
       controller.close();
     },
@@ -430,7 +452,7 @@ async function streamChatCompletionAsResponses(upstream: Response, model: string
 
 async function proxyResponsesToChatCompletions(provider: ProviderRecord, body: Record<string, unknown>) {
   if (!provider.baseUrl) return new Response(JSON.stringify({ error: "base_url_required" }), { status: 400, headers: { "content-type": "application/json" } });
-  const chatRequest = responsesRequestToChatCompletion(body, provider);
+  const chatRequest = applyPayloadRewriteRules(provider, responsesRequestToChatCompletion(body, provider), getPayloadRewriteRules?.() ?? []);
   const upstream = await fetch(joinUrl(provider.baseUrl, "/chat/completions"), {
     method: "POST",
     headers: {
@@ -449,13 +471,14 @@ async function proxyResponsesToChatCompletions(provider: ProviderRecord, body: R
 
 async function proxyResponsesToResponses(provider: ProviderRecord, body: Record<string, unknown>) {
   if (!provider.baseUrl) return new Response(JSON.stringify({ error: "base_url_required" }), { status: 400, headers: { "content-type": "application/json" } });
+  const payload = applyPayloadRewriteRules(provider, body, getPayloadRewriteRules?.() ?? []);
   const upstream = await fetch(joinUrl(provider.baseUrl, "/responses"), {
     method: "POST",
     headers: {
       "content-type": "application/json",
       ...(provider.apiKey ? { authorization: `Bearer ${provider.apiKey}` } : {}),
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload),
   });
   const headers = new Headers();
   headers.set("content-type", upstream.headers.get("content-type") ?? (body.stream === true ? "text/event-stream; charset=utf-8" : "application/json"));
@@ -472,20 +495,22 @@ async function probeProviderInterface(provider: ProviderRecord, kind: "responses
     if (provider.kind !== "local" && !provider.apiKey) return { ok: false, status: null, durationMs: 0, error: "api_key_missing" };
     if (kind === "responses") {
       const baseUrl = provider.baseUrl || "https://api.openai.com/v1";
+      const payload = applyPayloadRewriteRules(provider, { model: provider.defaultModel, input: "ping", max_output_tokens: 1 }, getPayloadRewriteRules?.() ?? []);
       const response = await fetch(joinUrl(baseUrl, "/responses"), {
         method: "POST",
         signal: controller.signal,
         headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" },
-        body: JSON.stringify({ model: provider.defaultModel, input: "ping", max_output_tokens: 1 }),
+        body: JSON.stringify(payload),
       });
       return { ok: response.ok, status: response.status, durationMs: Date.now() - startedAt, error: response.ok ? undefined : (await response.text()).slice(0, 240) };
     }
     if (!provider.baseUrl) return { ok: false, status: null, durationMs: 0, error: "base_url_required" };
+    const payload = applyPayloadRewriteRules(provider, { model: provider.defaultModel, messages: [{ role: "user", content: "ping" }], max_tokens: 1 }, getPayloadRewriteRules?.() ?? []);
     const response = await fetch(joinUrl(provider.baseUrl, "/chat/completions"), {
       method: "POST",
       signal: controller.signal,
       headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" },
-      body: JSON.stringify({ model: provider.defaultModel, messages: [{ role: "user", content: "ping" }], max_tokens: 1 }),
+      body: JSON.stringify(payload),
     });
     return { ok: response.ok, status: response.status, durationMs: Date.now() - startedAt, error: response.ok ? undefined : (await response.text()).slice(0, 240) };
   } catch (error) {
@@ -547,18 +572,20 @@ async function testProvider(provider: ProviderRecord): Promise<ProviderTestRespo
     }
     let response: Response;
     if (provider.kind === "openai-responses") {
+      const payload = applyPayloadRewriteRules(provider, { model: provider.defaultModel, input: "ping", max_output_tokens: 16 }, getPayloadRewriteRules?.() ?? []);
       response = await fetch(joinUrl(provider.baseUrl || "https://api.openai.com/v1", "/responses"), {
         method: "POST",
         headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" },
-        body: JSON.stringify({ model: provider.defaultModel, input: "ping", max_output_tokens: 16 }),
+        body: JSON.stringify(payload),
         signal: controller.signal,
       });
     } else if (provider.kind === "openai-compatible-chat") {
       if (!provider.baseUrl) throw new Error("base_url_required");
+      const payload = applyPayloadRewriteRules(provider, { model: provider.defaultModel, messages: [{ role: "user", content: "ping" }], max_tokens: 16 }, getPayloadRewriteRules?.() ?? []);
       response = await fetch(joinUrl(provider.baseUrl, "/chat/completions"), {
         method: "POST",
         headers: { authorization: `Bearer ${provider.apiKey}`, "content-type": "application/json" },
-        body: JSON.stringify({ model: provider.defaultModel, messages: [{ role: "user", content: "ping" }], max_tokens: 16 }),
+        body: JSON.stringify(payload),
         signal: controller.signal,
       });
     } else {

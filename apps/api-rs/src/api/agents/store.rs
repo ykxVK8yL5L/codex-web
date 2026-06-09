@@ -1117,7 +1117,7 @@ pub fn create_agent_session(
     let project_db_id = project.as_ref().map(|p| p.id.clone());
     let model = agent.model.clone();
     connection.execute(
-        "insert into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, show_message_usage, status, created_at, updated_at) values (?, ?, 'agent', null, ?, ?, ?, ?, ?, null, 1, 0, 'paused', ?, ?)",
+        "insert into sessions (id, kind, conversation_type, room_id, title, project_id, workspace_path, provider_id, model, codex_session_id, notifications_enabled, show_message_usage, status, created_at, updated_at) values (?, ?, 'agent', null, ?, ?, ?, ?, ?, null, 1, null, 'paused', ?, ?)",
         params![
             &id,
             kind,
@@ -1703,7 +1703,7 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary>
         model: row.get(8)?,
         codex_session_id: row.get(9)?,
         notifications_enabled: row.get::<_, Option<i64>>(10)?.unwrap_or(1) != 0,
-        show_message_usage: row.get::<_, Option<i64>>(11)?.unwrap_or(0) != 0,
+        show_message_usage: row.get::<_, Option<i64>>(11)?.map(|value| value != 0),
         status: row.get(12)?,
         created_at: row.get(13)?,
         updated_at: row.get(14)?,

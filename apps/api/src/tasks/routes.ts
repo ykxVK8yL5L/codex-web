@@ -179,7 +179,7 @@ export function registerTaskRoutes(app: Hono, deps: TaskRoutesDeps) {
     if (!body) return c.json({ error: "invalid_session_update" }, 400);
     if (body.title !== undefined) session.title = body.title.trim() || session.title;
     if (body.notificationsEnabled !== undefined) session.notificationsEnabled = body.notificationsEnabled !== false;
-    if (body.showMessageUsage !== undefined) session.showMessageUsage = body.showMessageUsage === true;
+    if (body.showMessageUsage !== undefined) session.showMessageUsage = body.showMessageUsage === null ? null : body.showMessageUsage === true;
     session.updatedAt = new Date().toISOString();
     upsertSession(session);
     return c.json(session);
@@ -404,7 +404,6 @@ export function registerTaskRoutes(app: Hono, deps: TaskRoutesDeps) {
       const preview = previews.get(previewId);
       if (!preview || preview.scopeType !== "session" || preview.scopeId !== session.id) return c.json({ error: "card_not_found" }, 404);
       dismissMessageCard(session.id, "preview", publicPreview(preview));
-      deletePreview(previewId);
       db.prepare("delete from message_cards where session_id = ? and json_extract(payload, '$.previewId') = ?").run(session.id, previewId);
       return c.json({ ok: true, id: cardId });
     }

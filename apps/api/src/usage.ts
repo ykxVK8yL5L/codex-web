@@ -11,6 +11,7 @@ type UsageDeps = {
   parsePageLimit: (value: string) => number;
   latestRunningTaskRun: (sessionId: string) => Record<string, unknown> | undefined;
   getRetentionDays?: () => number;
+  backfillSessionUsage?: (sessionId: string) => void;
 };
 
 type UsagePayload = {
@@ -72,6 +73,7 @@ export function ensureTokenUsageSchema(db: Database.Database) {
   if (!columns.some((column) => column.name === "session_title")) db.prepare("alter table token_usage_records add column session_title text").run();
   if (!columns.some((column) => column.name === "provider_name")) db.prepare("alter table token_usage_records add column provider_name text").run();
   if (!columns.some((column) => column.name === "message_id")) db.prepare("alter table token_usage_records add column message_id text").run();
+  if (!columns.some((column) => column.name === "task_run_id")) db.prepare("alter table token_usage_records add column task_run_id text").run();
 }
 
 export function readCodexUsage(line: string): UsagePayload | null {
@@ -93,16 +95,19 @@ export function readCodexUsage(line: string): UsagePayload | null {
   return { inputTokens, cachedInputTokens, outputTokens, reasoningOutputTokens };
 }
 
-export function recordCodexUsage(deps: UsageDeps, session: SessionSummary, line: string) {
+export function recordCodexUsage(deps: UsageDeps, session: SessionSummary, line: string, preferredMessageId?: string | null) {
   const usage = readCodexUsage(line);
   if (!usage) return;
   const run = deps.latestRunningTaskRun(session.id);
   const provider = session.providerId ? deps.providers.find((item) => item.id === session.providerId) : null;
-  const messageId = latestUnboundAssistantMessageId(
-    deps.db,
-    session.id,
-    run?.started_at ? String(run.started_at) : null,
-  );
+  const messageId = preferredMessageId !== undefined
+    ? preferredMessageId
+    : latestUnboundAssistantMessageId(
+      deps.db,
+      session.id,
+      run?.message_id ? String(run.message_id) : null,
+      run?.started_at ? String(run.started_at) : null,
+    );
   recordTokenUsage(deps.db, {
     session,
     providerId: session.providerId ?? null,
@@ -117,9 +122,30 @@ export function recordCodexUsage(deps: UsageDeps, session: SessionSummary, line:
   });
 }
 
-function latestUnboundAssistantMessageId(db: Database.Database, sessionId: string, runStartedAt?: string | null) {
+function latestUnboundAssistantMessageId(db: Database.Database, sessionId: string, sourceMessageId?: string | null, runStartedAt?: string | null) {
   ensureTokenUsageSchema(db);
   if (!tableExists(db, "messages")) return null;
+  if (sourceMessageId) {
+    const source = db.prepare("select created_at, id from messages where id = ? and session_id = ?").get(sourceMessageId, sessionId) as { created_at?: string; id?: string } | undefined;
+    if (source?.created_at && source.id) {
+      const row = db.prepare(`
+        select messages.id
+        from messages
+        where messages.session_id = ?
+          and messages.role = 'assistant'
+          and (messages.created_at > ? or (messages.created_at = ? and messages.id > ?))
+          and not exists (
+            select 1
+            from token_usage_records usage
+            where usage.session_id = messages.session_id
+              and usage.message_id = messages.id
+          )
+        order by messages.created_at desc, messages.id desc
+        limit 1
+      `).get(sessionId, source.created_at, source.created_at, source.id) as { id?: string } | undefined;
+      if (row?.id) return row.id;
+    }
+  }
   if (runStartedAt) {
     const row = db.prepare(`
       select messages.id
@@ -209,8 +235,10 @@ export function readProviderUsage(payload: Record<string, unknown>): UsagePayloa
 
 export function registerUsageRoutes(app: Hono, deps: UsageDeps) {
   app.get("/api/usage", (c) => {
+    const sessionId = c.req.query("sessionId");
+    if (sessionId) deps.backfillSessionUsage?.(sessionId);
     const response = buildUsageResponse(deps, {
-      sessionId: c.req.query("sessionId"),
+      sessionId,
       providerId: c.req.query("providerId"),
       createdFrom: isoDateFilter(c.req.query("createdFrom")),
       createdTo: isoDateFilter(c.req.query("createdTo")),

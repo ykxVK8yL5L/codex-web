@@ -553,6 +553,7 @@ pub fn ensure_schema(connection: &rusqlite::Connection) -> anyhow::Result<()> {
     ensure_column(connection, "token_usage_records", "session_title", "text")?;
     ensure_column(connection, "token_usage_records", "provider_name", "text")?;
     ensure_column(connection, "token_usage_records", "message_id", "text")?;
+    ensure_column(connection, "token_usage_records", "task_run_id", "text")?;
     Ok(())
 }
 

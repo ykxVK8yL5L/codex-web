@@ -56,6 +56,31 @@ pub struct TokenUsageDisplaySettings {
     pub updated_at: String,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayloadRewriteSettings {
+    pub rules: Vec<PayloadRewriteRule>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayloadRewriteRule {
+    pub id: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub provider_kind: Option<String>,
+    pub model_pattern: String,
+    #[serde(default)]
+    pub remove_params: Vec<String>,
+    #[serde(default)]
+    pub set_params_json: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateTokenUsageRetentionSettings {
@@ -66,6 +91,12 @@ pub struct UpdateTokenUsageRetentionSettings {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateTokenUsageDisplaySettings {
     pub show_message_usage: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatePayloadRewriteSettings {
+    pub rules: Option<Vec<PayloadRewriteRule>>,
 }
 
 #[derive(Serialize, Deserialize)]

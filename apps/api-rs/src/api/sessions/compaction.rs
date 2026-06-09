@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    api::providers::{models::ProviderRecord, store as provider_store},
+    api::providers::{
+        models::ProviderRecord, payload_rules::apply_payload_rewrite_rules,
+        store as provider_store,
+    },
     api::sessions::{messages as session_messages, models::SessionSummary, store as session_store},
     api::settings::load_session_compaction,
     api::usage::{self, CodexUsage},
@@ -339,7 +342,7 @@ async fn create_with_options(
 
     let prompt = compaction_prompt(session, &messages, &previous_summary);
     let prompt_hash = hash_prefix(&prompt);
-    let generated = generate_summary(&provider, &model, &prompt).await?;
+    let generated = generate_summary(db, &provider, &model, &prompt).await?;
     let summary = generated.summary;
 
     let id = format!("compaction-{}", random_hex(16));
@@ -716,6 +719,7 @@ fn select_provider(
 }
 
 async fn generate_summary(
+    db: &Db,
     provider: &ProviderRecord,
     model: &str,
     prompt: &str,
@@ -736,17 +740,21 @@ async fn generate_summary(
             .as_deref()
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow::anyhow!("base_url_required"))?;
+        let rules = crate::api::settings::store::payload_rewrite(db)
+            .map(|settings| settings.rules)
+            .unwrap_or_default();
+        let payload = apply_payload_rewrite_rules(provider, serde_json::json!({
+            "model": model,
+            "messages": [
+                { "role": "system", "content": "You summarize software-development conversations into durable session memory." },
+                { "role": "user", "content": prompt },
+            ],
+            "max_tokens": 1200,
+        }), &rules);
         let response = client
             .post(join_url(base_url, "/chat/completions"))
             .bearer_auth(api_key)
-            .json(&serde_json::json!({
-                "model": model,
-                "messages": [
-                    { "role": "system", "content": "You summarize software-development conversations into durable session memory." },
-                    { "role": "user", "content": prompt },
-                ],
-                "max_tokens": 1200,
-            }))
+            .json(&payload)
             .send()
             .await?;
         let status = response.status();
@@ -783,10 +791,18 @@ async fn generate_summary(
         .as_deref()
         .filter(|value| !value.is_empty())
         .unwrap_or("https://api.openai.com/v1");
+    let rules = crate::api::settings::store::payload_rewrite(db)
+        .map(|settings| settings.rules)
+        .unwrap_or_default();
+    let payload = apply_payload_rewrite_rules(
+        provider,
+        serde_json::json!({ "model": model, "input": prompt, "max_output_tokens": 1600 }),
+        &rules,
+    );
     let response = client
         .post(join_url(base_url, "/responses"))
         .bearer_auth(api_key)
-        .json(&serde_json::json!({ "model": model, "input": prompt, "max_output_tokens": 1600 }))
+        .json(&payload)
         .send()
         .await?;
     let status = response.status();

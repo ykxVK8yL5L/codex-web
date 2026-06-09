@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Activity, History, MoreHorizontal, Pencil, Plus, RefreshCw, Save, Trash2, X } from "lucide-react";
+import { Activity, History, MoreHorizontal, Pencil, Plus, RefreshCw, Save, SlidersHorizontal, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { FilterSearchInput, FilterToolbar } from "@/components/FilterControls";
 import { IconText } from "@/components/IconText";
@@ -8,10 +8,11 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSepara
 import { useAppDialog } from "@/components/AppDialog";
 import { formatShortDate, formatTokens } from "@/lib/format";
 import type { TranslationKey } from "@/lib/i18n";
-import type { CreateProviderRequest, PageResponse, ProviderCapabilities, ProviderDetectionResponse, ProviderHealthCheck, ProviderModelsResponse, ProviderSummary, ProviderTestResponse, TokenUsageResponse, UpdateProviderRequest } from "@codex-web/protocol";
+import type { CreateProviderRequest, PageResponse, PayloadRewriteRule, PayloadRewriteSettings, ProviderCapabilities, ProviderDetectionResponse, ProviderHealthCheck, ProviderModelsResponse, ProviderSummary, ProviderTestResponse, TokenUsageResponse, UpdateProviderRequest } from "@codex-web/protocol";
 
 type TFunction = (key: TranslationKey) => string;
 type ToastTone = "info" | "success" | "error";
+type PayloadRuleDraft = PayloadRewriteRule & { removeParamsText: string };
 
 export function ProvidersPage({
   sessionToken,
@@ -82,6 +83,10 @@ export function ProvidersPage({
   const [providerSearch, setProviderSearch] = useState("");
   const [providerKindFilter, setProviderKindFilter] = useState<ProviderSummary["kind"] | "all">("all");
   const [providerUsage, setProviderUsage] = useState<Record<string, TokenUsageResponse>>({});
+  const [payloadRulesOpen, setPayloadRulesOpen] = useState(false);
+  const [payloadRewriteSettings, setPayloadRewriteSettings] = useState<PayloadRewriteSettings | null>(null);
+  const [payloadRuleDrafts, setPayloadRuleDrafts] = useState<PayloadRuleDraft[]>([]);
+  const [savingPayloadRules, setSavingPayloadRules] = useState(false);
   const capabilityItems: Array<{ key: keyof ProviderCapabilities; label: string }> = [
     { key: "responsesApi", label: t("provider.capabilityResponses") },
     { key: "chatCompletions", label: t("provider.capabilityChat") },
@@ -120,9 +125,110 @@ export function ProvidersPage({
     };
   }, [providers, sessionToken]);
 
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/settings/payload-rewrite", { headers: { authorization: `Bearer ${sessionToken}` } })
+      .then((response) => response.ok ? response.json() : null)
+      .then((settings: PayloadRewriteSettings | null) => {
+        if (cancelled || !settings) return;
+        setPayloadRewriteSettings(settings);
+        setPayloadRuleDrafts(payloadRulesToDraft(settings.rules));
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionToken]);
+
   function showError(value: string) {
     setMessage(value);
     notify(value, "error");
+  }
+
+  function payloadRulesToDraft(rules?: PayloadRewriteRule[]): PayloadRuleDraft[] {
+    return (rules ?? []).map((rule, index) => ({
+      id: rule.id || `payload-rule-${index + 1}`,
+      enabled: rule.enabled !== false,
+      providerKind: rule.providerKind ?? "all",
+      modelPattern: rule.modelPattern,
+      removeParams: rule.removeParams ?? [],
+      removeParamsText: (rule.removeParams ?? []).join(", "),
+      setParamsJson: rule.setParamsJson ?? "",
+    }));
+  }
+
+  function payloadRulesFromDraft(rules: PayloadRuleDraft[]) {
+    return rules.map((rule, index): PayloadRewriteRule => ({
+      id: rule.id || `payload-rule-${index + 1}`,
+      enabled: rule.enabled !== false,
+      providerKind: rule.providerKind ?? "all",
+      modelPattern: rule.modelPattern.trim(),
+      removeParams: rule.removeParamsText.split(",").map((item) => item.trim()).filter(Boolean),
+      setParamsJson: rule.setParamsJson?.trim() ?? "",
+    })).filter((rule) => rule.modelPattern);
+  }
+
+  function addPayloadRule() {
+    setPayloadRuleDrafts((current) => [
+      ...current,
+      {
+        id: `payload-rule-${Date.now()}`,
+        enabled: true,
+        providerKind: "all",
+        modelPattern: "",
+        removeParams: [],
+        removeParamsText: "",
+        setParamsJson: "",
+      },
+    ]);
+  }
+
+  function updatePayloadRule(index: number, patch: Partial<PayloadRuleDraft>) {
+    setPayloadRuleDrafts((current) => current.map((rule, ruleIndex) => ruleIndex === index ? { ...rule, ...patch } : rule));
+  }
+
+  function removePayloadRule(index: number) {
+    setPayloadRuleDrafts((current) => current.filter((_, ruleIndex) => ruleIndex !== index));
+  }
+
+  async function savePayloadRewriteSettings(event: React.FormEvent) {
+    event.preventDefault();
+    const rules = payloadRulesFromDraft(payloadRuleDrafts);
+    for (const rule of rules) {
+      try {
+        new RegExp(rule.modelPattern);
+      } catch {
+        notify(t("settings.payloadRuleInvalidRegex"), "error");
+        return;
+      }
+      if (rule.setParamsJson?.trim()) {
+        try {
+          const parsed = JSON.parse(rule.setParamsJson) as unknown;
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid_payload_rule");
+        } catch {
+          notify(t("settings.payloadRuleInvalidJson"), "error");
+          return;
+        }
+      }
+    }
+    setSavingPayloadRules(true);
+    try {
+      const response = await fetch("/api/settings/payload-rewrite", {
+        method: "PATCH",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify({ rules }),
+      });
+      if (!response.ok) throw new Error("payload_rewrite_save_failed");
+      const settings = (await response.json()) as PayloadRewriteSettings;
+      setPayloadRewriteSettings(settings);
+      setPayloadRuleDrafts(payloadRulesToDraft(settings.rules));
+      notify(t("settings.payloadRewriteSaved"), "success");
+      setPayloadRulesOpen(false);
+    } catch {
+      notify(t("settings.payloadRewriteSaveFailed"), "error");
+    } finally {
+      setSavingPayloadRules(false);
+    }
   }
 
   async function providerError(response: Response, fallback: string) {
@@ -771,6 +877,7 @@ export function ProvidersPage({
               <option value="local">{t("provider.kindLocal")}</option>
             </select>
             <Button className="icon-only" variant="outline" size="sm" type="button" title={t("action.refresh")} aria-label={t("action.refresh")} onClick={() => void onChange()}><IconText icon={RefreshCw}>{t("action.refresh")}</IconText></Button>
+            <Button className="icon-only" variant="outline" size="sm" type="button" title={t("settings.payloadRewriteTitle")} aria-label={t("settings.payloadRewriteTitle")} onClick={() => setPayloadRulesOpen(true)}><IconText icon={SlidersHorizontal}>{t("settings.payloadRewriteTitle")}</IconText></Button>
           </FilterToolbar>
           {visibleProviders.map((provider) => (
             <div className="provider-card" key={provider.id}>
@@ -904,6 +1011,46 @@ export function ProvidersPage({
               selectProviderModelFromDialog,
             )}
           </div>
+        </div>
+      )}
+      {payloadRulesOpen && (
+        <div className="workspace-modal compact-modal provider-create-modal" role="dialog" aria-modal="true">
+          <div className="workspace-modal-head">
+            <div>
+              <strong>{t("settings.payloadRewriteTitle")}</strong>
+              <span>{t("settings.payloadRewriteHelp")}</span>
+            </div>
+            <button className="ghost-button icon-only" type="button" onClick={() => setPayloadRulesOpen(false)} title={t("action.close")} aria-label={t("action.close")}><X size={16} /></button>
+          </div>
+          <form className="management-form" onSubmit={savePayloadRewriteSettings}>
+            <div className="payload-rule-editor">
+              <div className="payload-rule-editor-head">
+                <strong>{t("settings.payloadRules")}</strong>
+                <button className="ghost-button" type="button" onClick={addPayloadRule}><IconText icon={Plus}>{t("settings.payloadRuleAdd")}</IconText></button>
+              </div>
+              {payloadRuleDrafts.map((rule, index) => (
+                <div className="payload-rule-row" key={rule.id}>
+                  <label className="checkbox-row">
+                    <input name={`payload-rule-enabled-${rule.id}`} type="checkbox" checked={rule.enabled !== false} onChange={(event) => updatePayloadRule(index, { enabled: event.target.checked })} />
+                    <span>{t("settings.payloadRuleEnabled")}</span>
+                  </label>
+                  <select name={`payload-rule-kind-${rule.id}`} value={rule.providerKind ?? "all"} onChange={(event) => updatePayloadRule(index, { providerKind: event.target.value as PayloadRewriteRule["providerKind"] })}>
+                    <option value="all">{t("settings.payloadRuleKindAll")}</option>
+                    <option value="openai-compatible-chat">{t("settings.payloadRuleKindChat")}</option>
+                    <option value="openai-responses">{t("settings.payloadRuleKindResponses")}</option>
+                    <option value="local">{t("settings.payloadRuleKindLocal")}</option>
+                  </select>
+                  <input name={`payload-rule-model-${rule.id}`} value={rule.modelPattern} onChange={(event) => updatePayloadRule(index, { modelPattern: event.target.value })} placeholder={t("settings.payloadRuleModelPattern")} />
+                  <input name={`payload-rule-remove-${rule.id}`} value={rule.removeParamsText} onChange={(event) => updatePayloadRule(index, { removeParamsText: event.target.value })} placeholder={t("settings.payloadRuleRemoveParams")} />
+                  <textarea name={`payload-rule-set-${rule.id}`} value={rule.setParamsJson ?? ""} onChange={(event) => updatePayloadRule(index, { setParamsJson: event.target.value })} placeholder={t("settings.payloadRuleSetParams")} rows={3} />
+                  <button className="ghost-button danger-button" type="button" onClick={() => removePayloadRule(index)}><IconText icon={Trash2}>{t("action.delete")}</IconText></button>
+                </div>
+              ))}
+              {!payloadRuleDrafts.length && <span className="subtle">{t("settings.payloadRulesEmpty")}</span>}
+            </div>
+            {payloadRewriteSettings && <code>{payloadRewriteSettings.rules.length} rules · {formatShortDate(payloadRewriteSettings.updatedAt)}</code>}
+            <button className="dark-button" disabled={savingPayloadRules}><IconText icon={Save}>{savingPayloadRules ? t("provider.detecting") : t("action.save")}</IconText></button>
+          </form>
         </div>
       )}
       {editPanel && (

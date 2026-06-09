@@ -6,10 +6,12 @@ use super::models::{
     ProviderDetectionCheck, ProviderDetectionChecks, ProviderDetectionResponse, ProviderInput,
     ProviderModelsResponse, ProviderRecord, ProviderTestResponse,
 };
+use super::payload_rules::apply_payload_rewrite_rules;
+use crate::api::settings::models::PayloadRewriteRule;
 
 const PROVIDER_TIMEOUT_MS: u64 = 30_000;
 
-pub async fn test_provider(provider: &ProviderRecord) -> ProviderTestResponse {
+pub async fn test_provider(provider: &ProviderRecord, rules: &[PayloadRewriteRule]) -> ProviderTestResponse {
     let started = Instant::now();
     let client = client();
     let result = async {
@@ -24,14 +26,19 @@ pub async fn test_provider(provider: &ProviderRecord) -> ProviderTestResponse {
                     .base_url
                     .as_deref()
                     .unwrap_or("https://api.openai.com/v1");
-                client
-                    .post(join_url(base_url, "/responses"))
-                    .bearer_auth(provider.api_key.as_deref().unwrap_or(""))
-                    .json(&serde_json::json!({
+                let payload = apply_payload_rewrite_rules(
+                    provider,
+                    serde_json::json!({
                         "model": provider.summary.default_model,
                         "input": "ping",
                         "max_output_tokens": 16,
-                    }))
+                    }),
+                    rules,
+                );
+                client
+                    .post(join_url(base_url, "/responses"))
+                    .bearer_auth(provider.api_key.as_deref().unwrap_or(""))
+                    .json(&payload)
                     .send()
                     .await?
             }
@@ -41,14 +48,19 @@ pub async fn test_provider(provider: &ProviderRecord) -> ProviderTestResponse {
                     .base_url
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("base_url_required"))?;
-                client
-                    .post(join_url(base_url, "/chat/completions"))
-                    .bearer_auth(provider.api_key.as_deref().unwrap_or(""))
-                    .json(&serde_json::json!({
+                let payload = apply_payload_rewrite_rules(
+                    provider,
+                    serde_json::json!({
                         "model": provider.summary.default_model,
                         "messages": [{ "role": "user", "content": "ping" }],
                         "max_tokens": 16,
-                    }))
+                    }),
+                    rules,
+                );
+                client
+                    .post(join_url(base_url, "/chat/completions"))
+                    .bearer_auth(provider.api_key.as_deref().unwrap_or(""))
+                    .json(&payload)
                     .send()
                     .await?
             }
@@ -153,7 +165,7 @@ pub async fn discover_models(provider: &ProviderRecord) -> ProviderModelsRespons
     }
 }
 
-pub async fn detect_provider(provider: &ProviderRecord) -> ProviderDetectionResponse {
+pub async fn detect_provider(provider: &ProviderRecord, rules: &[PayloadRewriteRule]) -> ProviderDetectionResponse {
     let started = Instant::now();
     if provider.summary.default_model.trim().is_empty() {
         let check = ProviderDetectionCheck {
@@ -179,8 +191,8 @@ pub async fn detect_provider(provider: &ProviderRecord) -> ProviderDetectionResp
         };
     }
     let (responses, chat_completions) = tokio::join!(
-        probe_interface(provider, "responses"),
-        probe_interface(provider, "chatCompletions")
+        probe_interface(provider, "responses", rules),
+        probe_interface(provider, "chatCompletions", rules)
     );
     let detected_kind = if responses.ok {
         "openai-responses"
@@ -264,7 +276,7 @@ fn client() -> Client {
         .unwrap_or_else(|_| Client::new())
 }
 
-async fn probe_interface(provider: &ProviderRecord, interface: &str) -> ProviderDetectionCheck {
+async fn probe_interface(provider: &ProviderRecord, interface: &str, rules: &[PayloadRewriteRule]) -> ProviderDetectionCheck {
     let result = async {
         if provider.summary.kind != "local" && provider.api_key.as_deref().unwrap_or("").is_empty()
         {
@@ -282,21 +294,33 @@ async fn probe_interface(provider: &ProviderRecord, interface: &str) -> Provider
             .ok_or_else(|| anyhow::anyhow!("base_url_required"))?;
         let mut request = match interface {
             "responses" => {
-                client()
-                    .post(join_url(base_url, "/responses"))
-                    .json(&serde_json::json!({
+                let payload = apply_payload_rewrite_rules(
+                    provider,
+                    serde_json::json!({
                         "model": provider.summary.default_model,
                         "input": "ping",
                         "max_output_tokens": 16,
-                    }))
+                    }),
+                    rules,
+                );
+                client()
+                    .post(join_url(base_url, "/responses"))
+                    .json(&payload)
             }
-            _ => client()
-                .post(join_url(base_url, "/chat/completions"))
-                .json(&serde_json::json!({
+            _ => {
+                let payload = apply_payload_rewrite_rules(
+                    provider,
+                    serde_json::json!({
                     "model": provider.summary.default_model,
                     "messages": [{ "role": "user", "content": "ping" }],
                     "max_tokens": 16,
-                })),
+                    }),
+                    rules,
+                );
+                client()
+                    .post(join_url(base_url, "/chat/completions"))
+                    .json(&payload)
+            }
         };
         if let Some(api_key) = provider
             .api_key
