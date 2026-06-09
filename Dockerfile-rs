@@ -47,7 +47,7 @@ RUN apt-get update \
   && rm -f /etc/nginx/sites-enabled/default
 
 COPY --from=build /app/apps/api-rs/target/release/codex-web-rs /usr/local/bin/codex-web-rs
-COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
+COPY docker/nginx-rs.conf /etc/nginx/conf.d/default.conf
 COPY docker/start-rs.sh /usr/local/bin/codex-web-start-rs
 
 RUN chmod +x /usr/local/bin/codex-web-start-rs

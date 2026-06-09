@@ -181,7 +181,7 @@ The current API package does not yet provide a dedicated production start script
 
 ### Rust API Docker Deployment
 
-The Rust API can be deployed with `Dockerfile-rs`. The image builds the web frontend first, runs Nginx on `5173`, serves `/app/apps/web/dist`, and proxies `/api/*` and `/preview/*` to the Rust API on `127.0.0.1:8787` inside the container.
+The Rust API can be deployed with `Dockerfile-rs`. The image builds the web frontend first, embeds `apps/web/dist` into the Rust binary, runs Nginx on `5173`, and proxies all requests to the Rust API on `127.0.0.1:8787` inside the container. The runtime image does not need a separate frontend `dist` directory.
 
 Build the Rust image:
 
