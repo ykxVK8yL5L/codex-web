@@ -1812,11 +1812,12 @@ export function SessionPage({
               <span>{selectedProvider?.name ?? t("session.noProvider")}</span>
               <small>{draftModel || selectedProvider?.defaultModel || t("session.noModel")}</small>
             </button>
-            <select name="draftprovider" className="model-select desktop-composer-select" value={selectedProviderId} onChange={(event) => onSelectProvider(event.target.value)} disabled={!providers.length}>
-              {!providers.length && <option value="">{t("session.noProvider")}</option>}
+            <select name="draftprovider" className="model-select desktop-composer-select" value={selectedProviderId} onChange={(event) => onSelectProvider(event.target.value)}>
+              <option value="">{t("session.noProvider")}</option>
               {providers.map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}
             </select>
             <select name="draftmodel" className="model-select desktop-composer-select" value={draftModel} onChange={(event) => setDraftModel(event.target.value)}>
+              <option value="">{t("session.noModel")}</option>
               {composerModels.map((model) => <option value={model} key={model}>{model}</option>)}
             </select>
             {session ? (
@@ -1841,14 +1842,15 @@ export function SessionPage({
             </div>
             <label>
               <span>{t("session.infoProvider")}</span>
-              <select className="model-select" value={selectedProviderId} onChange={(event) => onSelectProvider(event.target.value)} disabled={!providers.length}>
-                {!providers.length && <option value="">{t("session.noProvider")}</option>}
+              <select className="model-select" value={selectedProviderId} onChange={(event) => onSelectProvider(event.target.value)}>
+                <option value="">{t("session.noProvider")}</option>
                 {providers.map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}
               </select>
             </label>
             <label>
               <span>{t("session.infoModel")}</span>
               <select className="model-select" value={draftModel} onChange={(event) => setDraftModel(event.target.value)}>
+                <option value="">{t("session.noModel")}</option>
                 {composerModels.map((model) => <option value={model} key={model}>{model}</option>)}
               </select>
             </label>
