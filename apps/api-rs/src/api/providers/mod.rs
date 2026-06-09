@@ -53,7 +53,34 @@ async fn create(
 ) -> Result<(StatusCode, Json<models::ProviderSummary>), (StatusCode, Json<serde_json::Value>)> {
     let provider = store::create_provider(&state.db, body)
         .map_err(|err| error(StatusCode::BAD_REQUEST, err.to_string()))?;
+    warm_provider_model_cache(&state, &provider.id).await;
+    let provider = store::get_provider_record(&state.db, &provider.id)
+        .map_err(|err| error(StatusCode::BAD_REQUEST, err.to_string()))?
+        .map(|record| record.summary)
+        .unwrap_or(provider);
     Ok((StatusCode::CREATED, Json(provider)))
+}
+
+async fn warm_provider_model_cache(state: &AppState, provider_id: &str) {
+    let Some(record) = store::get_provider_record(&state.db, provider_id)
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let result = runtime::discover_models(&record).await;
+    if result.ok {
+        let _ = store::save_model_cache(&state.db, provider_id, &result.models);
+    }
+    let _ = store::record_health(
+        &state.db,
+        provider_id,
+        "models",
+        result.ok,
+        result.status,
+        result.duration_ms,
+        result.error.as_deref(),
+    );
 }
 
 async fn update(

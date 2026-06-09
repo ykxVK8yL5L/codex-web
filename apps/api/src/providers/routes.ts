@@ -98,6 +98,13 @@ export function registerProviderRoutes(app: Hono, deps: ProviderRoutesDeps) {
     };
     deps.appData.providers.unshift(provider);
     deps.saveAppData();
+    try {
+      const models = await deps.discoverProviderModels(provider);
+      deps.recordProviderHealthCheck(provider.id, "models", models);
+      deps.saveProviderModelCache(provider, models);
+    } catch {
+      // Model discovery is a best-effort cache warm-up; provider creation must still succeed.
+    }
     return c.json(deps.publicProvider(provider), 201);
   });
 
