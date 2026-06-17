@@ -28,6 +28,7 @@ type PreviewRoutesDeps = {
   deletePreview: (previewId: string) => void;
   getBearerToken: (authorization?: string) => string | null;
   insertPreview: (preview: PreviewRecord) => void;
+  normalizePreviewProxyPaths: (value: unknown) => string[];
   previewAccess: (value: unknown, fallback?: PreviewAccess) => PreviewAccess;
   previewAccessCookie: (preview: PreviewRecord, ttlMs?: number) => string;
   previewCommandRisk: (preview: PreviewRecord) => ApprovalRisk | null;
@@ -127,6 +128,7 @@ export function registerPreviewRoutes(app: Hono, deps: PreviewRoutesDeps) {
     const requestedCommand = body.command?.trim() || undefined;
     const requestedCwd = body.cwd?.trim() || undefined;
     const requestedAccess = deps.previewAccess(body.access);
+    const requestedProxyPaths = deps.normalizePreviewProxyPaths(body.proxyPaths);
     const existing = Array.from(deps.previews.values()).find((preview) =>
       preview.scopeType === body.scopeType
       && preview.scopeId === body.scopeId
@@ -144,6 +146,10 @@ export function registerPreviewRoutes(app: Hono, deps: PreviewRoutesDeps) {
       }
       if (existing.access !== requestedAccess) {
         existing.access = requestedAccess;
+        deps.updatePreview(existing);
+      }
+      if (body.proxyPaths !== undefined) {
+        existing.proxyPaths = requestedProxyPaths;
         deps.updatePreview(existing);
       }
       if (body.autoStart && existing.command && existing.status !== "running" && existing.status !== "starting") {
@@ -176,6 +182,7 @@ export function registerPreviewRoutes(app: Hono, deps: PreviewRoutesDeps) {
       cwd: requestedCwd,
       status: "registered",
       access: requestedAccess,
+      proxyPaths: requestedProxyPaths,
       token: randomUUID(),
       createdAt: now,
       updatedAt: now,
@@ -239,6 +246,7 @@ export function registerPreviewRoutes(app: Hono, deps: PreviewRoutesDeps) {
     const body = await c.req.json<UpdatePreviewRequest>().catch(() => null);
     const label = String(body?.label ?? "").trim();
     if (label) preview.label = label;
+    if (body?.proxyPaths !== undefined) preview.proxyPaths = deps.normalizePreviewProxyPaths(body.proxyPaths);
     deps.updatePreview(preview);
     return c.json(deps.publicPreview(preview));
   });

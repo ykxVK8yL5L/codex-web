@@ -9,7 +9,7 @@ import { PreviewDetailRow } from "@/components/PreviewDetailRow";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { formatShortDate, newestTaskRunsFirst, projectDisplayName } from "@/lib/format";
 import type { TranslationKey } from "@/lib/i18n";
-import { openPreviewUrl } from "@/lib/previews";
+import { formatPreviewProxyPaths, openPreviewUrl, parsePreviewProxyPaths } from "@/lib/previews";
 import { copyText, downloadTextFile } from "@/lib/utils";
 import type { PageResponse, PreviewAccess, PreviewLogsResponse, PreviewSummary, ProjectSummary, SessionSummary } from "@codex-web/protocol";
 
@@ -243,6 +243,33 @@ export function PreviewsPage({
     notify(t("preview.renamed"), "success");
   }
 
+  async function editPreviewProxyPaths(preview: PreviewSummary) {
+    const value = await dialog.prompt({
+      title: t("preview.proxyPaths"),
+      message: t("preview.proxyPathsHelp"),
+      defaultValue: formatPreviewProxyPaths(preview.proxyPaths),
+      placeholder: "/api\n/trpc\n/graphql",
+      confirmLabel: t("action.save"),
+      multiline: true,
+    });
+    if (value === null) return;
+    const proxyPaths = parsePreviewProxyPaths(value);
+    const response = await fetch(`/api/previews/${preview.id}`, {
+      method: "PATCH",
+      headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ proxyPaths }),
+    });
+    if (!response.ok) {
+      setMessage(t("preview.proxyPathsUpdateFailed"));
+      notify(t("preview.proxyPathsUpdateFailed"), "error");
+      return;
+    }
+    const nextPreview = (await response.json()) as PreviewSummary;
+    setPreviews((items) => (items ?? []).map((item) => item.id === nextPreview.id ? nextPreview : item));
+    setDetailPreview((current) => current?.id === nextPreview.id ? nextPreview : current);
+    notify(t("preview.proxyPathsUpdated"), "success");
+  }
+
   async function copyPreviewUrl(preview: PreviewSummary) {
     const copied = await copyText(`${window.location.origin}${preview.url}`);
     setMessage(copied ? t("action.copied") : t("settings.copyFailed"));
@@ -308,6 +335,7 @@ export function PreviewsPage({
                 <DropdownMenuContent align="end">
                   <DropdownMenuItem disabled={preview.status !== "running"} onSelect={() => void openPreviewUrl(preview, sessionToken, notify, t)}><IconText icon={Globe}>{t("project.openPreview")}</IconText></DropdownMenuItem>
                   <DropdownMenuItem onSelect={() => void renamePreview(preview)}><IconText icon={Pencil}>{t("action.rename")}</IconText></DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => void editPreviewProxyPaths(preview)}><IconText icon={Globe}>{t("preview.proxyPaths")}</IconText></DropdownMenuItem>
                   <DropdownMenuItem onSelect={() => void copyPreviewUrl(preview)}><IconText icon={Copy}>{t("action.copy")}</IconText></DropdownMenuItem>
                   <DropdownMenuItem onSelect={() => void updatePreviewAccess(preview, preview.access === "private" ? "public" : "private")}>
                     <IconText icon={preview.access === "private" ? Unlock : Lock}>{preview.access === "private" ? t("preview.makePublic") : t("preview.makePrivate")}</IconText>
@@ -340,6 +368,7 @@ export function PreviewsPage({
             <PreviewDetailRow label={t("project.previewCommand")} value={detailPreview.command ?? "-"} />
             <PreviewDetailRow label={t("project.previewDirectory")} value={detailPreview.cwd ?? "-"} />
             <PreviewDetailRow label={t("preview.target")} value={`${detailPreview.targetHost}:${detailPreview.port}`} />
+            <PreviewDetailRow label={t("preview.proxyPaths")} value={detailPreview.proxyPaths?.length ? detailPreview.proxyPaths.join(", ") : "-"} />
             <PreviewDetailRow label={t("preview.createdAt")} value={formatShortDate(detailPreview.createdAt)} />
             <PreviewDetailRow label={t("preview.updatedAt")} value={formatShortDate(detailPreview.updatedAt)} />
             <div className="preview-detail-row">

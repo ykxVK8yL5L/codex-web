@@ -125,13 +125,11 @@ export function registerServerRoutes(app: Hono, deps: ServerRoutesDeps) {
     if (path === "/health" || path.startsWith("/preview/")) return next();
     const preview = previewFromReferer(c.req.header("referer"));
     if (!preview) return next();
+    if (!previewProxyPathMatches(preview, path)) return next();
     if (!requestHasPreviewAccess(preview, c.req.raw)) return c.req.method === "GET" || c.req.method === "HEAD"
       ? privatePreviewAccessResponse(preview, sourceUrl)
       : c.text("private preview requires Codex Web access", 401);
-    if (c.req.method !== "GET" && c.req.method !== "HEAD") {
-      return proxyPreviewHttpRequest(preview, path.replace(/^\/+/, ""), sourceUrl, c.req.raw);
-    }
-    return c.redirect(`${previewUrl(preview)}${path.replace(/^\/+/, "")}${sourceUrl.search}`, 307);
+    return proxyPreviewHttpRequest(preview, path.replace(/^\/+/, ""), sourceUrl, c.req.raw);
   });
   
   app.get("/health", (c) => c.json({ ok: true }));
@@ -245,4 +243,12 @@ export function registerServerRoutes(app: Hono, deps: ServerRoutesDeps) {
   });
   
   registerAppNotificationStreamRoute(app, appNotificationRouteDeps);
+}
+
+function previewProxyPathMatches(preview: { proxyPaths?: unknown }, path: string) {
+  const prefixes = Array.isArray(preview.proxyPaths) ? preview.proxyPaths : [];
+  return prefixes.some((prefix) => {
+    const normalized = String(prefix || "").trim().replace(/\/+$/g, "");
+    return normalized && (path === normalized || path.startsWith(`${normalized}/`));
+  });
 }

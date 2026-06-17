@@ -20,3 +20,26 @@ export async function openPreviewUrl(preview: PreviewSummary, sessionToken: stri
   }
   window.open(url, "_blank", "noopener,noreferrer");
 }
+
+export function parsePreviewProxyPaths(value: string) {
+  const seen = new Set<string>();
+  return value
+    .split(/\r?\n|,/)
+    .map((item) => normalizePreviewProxyPath(item))
+    .filter((item): item is string => {
+      if (!item || seen.has(item)) return false;
+      seen.add(item);
+      return true;
+    });
+}
+
+export function formatPreviewProxyPaths(paths?: string[]) {
+  return (paths ?? []).join("\n");
+}
+
+function normalizePreviewProxyPath(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed || /^[a-z][a-z0-9+.-]*:/i.test(trimmed) || trimmed.startsWith("//")) return "";
+  const path = `/${trimmed.replace(/^\/+/, "")}`.replace(/\/+$/g, "");
+  return path.length > 1 ? path : "";
+}

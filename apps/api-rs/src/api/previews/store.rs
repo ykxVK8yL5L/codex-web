@@ -8,6 +8,8 @@ use crate::db::Db;
 use super::models::{CreatePreviewRequest, PreviewRecord, PreviewSummary};
 use crate::api::common::PageCursor;
 
+const PREVIEW_SELECT: &str = "select id, scope_type, scope_id, label, target_host, port, token, command, cwd, status, access, proxy_paths_json, created_at, updated_at from previews";
+
 pub fn list(
     db: &Db,
     scope_type: Option<&str>,
@@ -22,7 +24,8 @@ pub fn list(
     let needle = q
         .map(|value| value.trim().to_lowercase())
         .filter(|value| !value.is_empty());
-    let mut statement = connection.prepare("select id, scope_type, scope_id, label, target_host, port, token, command, cwd, status, access, created_at, updated_at from previews order by updated_at desc, id desc")?;
+    let mut statement =
+        connection.prepare(&format!("{PREVIEW_SELECT} order by updated_at desc, id desc"))?;
     let mut items = statement
         .query_map([], preview_from_row)?
         .collect::<Result<Vec<_>, _>>()?
@@ -69,7 +72,7 @@ pub fn get(db: &Db, id: &str) -> anyhow::Result<Option<PreviewRecord>> {
     ensure_tables(&connection)?;
     connection
         .query_row(
-            "select id, scope_type, scope_id, label, target_host, port, token, command, cwd, status, access, created_at, updated_at from previews where id = ?",
+            &format!("{PREVIEW_SELECT} where id = ?"),
             [id],
             preview_from_row,
         )
@@ -106,6 +109,8 @@ pub fn create_with_status(
     let requested_command = non_empty(input.command.clone());
     let requested_cwd = non_empty(input.cwd.clone());
     let requested_access = normalize_access(input.access.as_deref());
+    let has_requested_proxy_paths = input.proxy_paths.is_some();
+    let requested_proxy_paths = normalize_proxy_paths(input.proxy_paths);
     if let Some(mut existing) =
         preview_for_scope_port(&connection, &scope_type, scope_id, target_host, input.port)?
     {
@@ -127,13 +132,17 @@ pub fn create_with_status(
         if existing.access != requested_access {
             existing.access = requested_access.to_string();
         }
+        if has_requested_proxy_paths {
+            existing.proxy_paths = requested_proxy_paths;
+        }
         existing.updated_at = timestamp();
         connection.execute(
-            "update previews set command = ?, cwd = ?, access = ?, updated_at = ? where id = ?",
+            "update previews set command = ?, cwd = ?, access = ?, proxy_paths_json = ?, updated_at = ? where id = ?",
             params![
                 existing.command,
                 existing.cwd,
                 existing.access,
+                serde_json::to_string(&existing.proxy_paths).unwrap_or_else(|_| "[]".to_string()),
                 existing.updated_at,
                 existing.id
             ],
@@ -162,11 +171,12 @@ pub fn create_with_status(
         cwd: requested_cwd,
         status: "registered".to_string(),
         access: requested_access.to_string(),
+        proxy_paths: requested_proxy_paths,
         created_at: now.clone(),
         updated_at: now,
     };
     connection.execute(
-        "insert into previews (id, scope_type, scope_id, label, target_host, port, token, command, cwd, status, access, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "insert into previews (id, scope_type, scope_id, label, target_host, port, token, command, cwd, status, access, proxy_paths_json, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             &record.id,
             &record.scope_type,
@@ -179,6 +189,7 @@ pub fn create_with_status(
             &record.cwd,
             &record.status,
             &record.access,
+            serde_json::to_string(&record.proxy_paths).unwrap_or_else(|_| "[]".to_string()),
             &record.created_at,
             &record.updated_at,
         ],
@@ -204,10 +215,18 @@ pub fn update(
     {
         record.label = label.to_string();
     }
+    if let Some(proxy_paths) = input.proxy_paths {
+        record.proxy_paths = normalize_proxy_paths(Some(proxy_paths));
+    }
     record.updated_at = timestamp();
     connection.execute(
-        "update previews set label = ?, updated_at = ? where id = ?",
-        params![record.label, record.updated_at, record.id],
+        "update previews set label = ?, proxy_paths_json = ?, updated_at = ? where id = ?",
+        params![
+            record.label,
+            serde_json::to_string(&record.proxy_paths).unwrap_or_else(|_| "[]".to_string()),
+            record.updated_at,
+            record.id
+        ],
     )?;
     Ok(Some(record))
 }
@@ -340,6 +359,7 @@ fn ensure_tables(connection: &rusqlite::Connection) -> anyhow::Result<()> {
           cwd text,
           status text not null default 'registered',
           access text not null default 'public',
+          proxy_paths_json text not null default '[]',
           created_at text not null,
           updated_at text
         );
@@ -363,12 +383,23 @@ fn ensure_tables(connection: &rusqlite::Connection) -> anyhow::Result<()> {
         update previews set updated_at = created_at where updated_at is null;
         ",
     )?;
+    let columns = connection
+        .prepare("pragma table_info(previews)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "proxy_paths_json") {
+        connection.execute(
+            "alter table previews add column proxy_paths_json text not null default '[]'",
+            [],
+        )?;
+    }
     Ok(())
 }
 
 fn preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PreviewRecord> {
-    let created_at: String = row.get(11)?;
-    let updated_at: Option<String> = row.get(12)?;
+    let proxy_paths_json: Option<String> = row.get(11)?;
+    let created_at: String = row.get(12)?;
+    let updated_at: Option<String> = row.get(13)?;
     Ok(PreviewRecord {
         id: row.get(0)?,
         scope_type: row.get(1)?,
@@ -381,6 +412,7 @@ fn preview_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PreviewRecord> 
         cwd: row.get(8)?,
         status: row.get(9)?,
         access: row.get(10)?,
+        proxy_paths: proxy_paths_from_json(proxy_paths_json.as_deref()),
         created_at: created_at.clone(),
         updated_at: updated_at.unwrap_or(created_at),
     })
@@ -392,7 +424,7 @@ fn get_with_connection(
 ) -> anyhow::Result<Option<PreviewRecord>> {
     connection
         .query_row(
-            "select id, scope_type, scope_id, label, target_host, port, token, command, cwd, status, access, created_at, updated_at from previews where id = ?",
+            &format!("{PREVIEW_SELECT} where id = ?"),
             [id],
             preview_from_row,
         )
@@ -409,7 +441,7 @@ fn preview_for_scope_port(
 ) -> anyhow::Result<Option<PreviewRecord>> {
     connection
         .query_row(
-            "select id, scope_type, scope_id, label, target_host, port, token, command, cwd, status, access, created_at, updated_at from previews where scope_type = ? and scope_id = ? and target_host = ? and port = ? limit 1",
+            &format!("{PREVIEW_SELECT} where scope_type = ? and scope_id = ? and target_host = ? and port = ? limit 1"),
             params![scope_type, scope_id, target_host, port],
             preview_from_row,
         )
@@ -437,12 +469,46 @@ fn preview_using_port_with_connection(
     let except_id = except_id.unwrap_or("");
     connection
         .query_row(
-            "select id, scope_type, scope_id, label, target_host, port, token, command, cwd, status, access, created_at, updated_at from previews where target_host = ? and port = ? and id != ? and status in ('running', 'starting') limit 1",
+            &format!("{PREVIEW_SELECT} where target_host = ? and port = ? and id != ? and status in ('running', 'starting') limit 1"),
             params![target_host, port, except_id],
             preview_from_row,
         )
         .optional()
         .context("failed to load preview")
+}
+
+pub fn proxy_path_matches(preview: &PreviewRecord, path: &str) -> bool {
+    preview.proxy_paths.iter().any(|prefix| {
+        path == prefix || path.starts_with(&format!("{prefix}/"))
+    })
+}
+
+fn proxy_paths_from_json(value: Option<&str>) -> Vec<String> {
+    value
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .map(|items| normalize_proxy_paths(Some(items)))
+        .unwrap_or_default()
+}
+
+fn normalize_proxy_paths(value: Option<Vec<String>>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    value
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| normalize_proxy_path(&item))
+        .filter(|item| seen.insert(item.clone()))
+        .collect()
+}
+
+fn normalize_proxy_path(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.contains("://") {
+        return None;
+    }
+    let path = format!("/{}", trimmed.trim_start_matches('/'))
+        .trim_end_matches('/')
+        .to_string();
+    (path.len() > 1).then_some(path)
 }
 
 fn scope_exists(

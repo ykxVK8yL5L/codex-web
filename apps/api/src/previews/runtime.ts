@@ -45,6 +45,7 @@ function previewFromRow(row: Record<string, unknown>): PreviewRecord {
     cwd: row.cwd ? String(row.cwd) : undefined,
     status: row.status === "starting" || row.status === "running" || row.status === "stopped" || row.status === "error" ? row.status : "registered",
     access: previewAccess(row.access, "public"),
+    proxyPaths: normalizePreviewProxyPaths(row.proxy_paths_json),
     token: String(row.token),
     createdAt: String(row.created_at),
     updatedAt: row.updated_at ? String(row.updated_at) : String(row.created_at),
@@ -67,6 +68,7 @@ function publicPreview(preview: PreviewRecord): PreviewSummary {
     cwd: preview.cwd,
     status: preview.status,
     access: preview.access,
+    proxyPaths: preview.proxyPaths,
     url: previewUrl(preview),
     createdAt: preview.createdAt,
     updatedAt: preview.updatedAt,
@@ -138,9 +140,9 @@ function expirePreviewAccessRequests() {
 
 function insertPreview(preview: PreviewRecord) {
   db.prepare(`
-    insert into previews (id, scope_type, scope_id, label, target_host, port, token, command, cwd, status, access, created_at, updated_at)
-    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(preview.id, preview.scopeType, preview.scopeId, preview.label, preview.targetHost, preview.port, preview.token, preview.command ?? null, preview.cwd ?? null, preview.status, preview.access, preview.createdAt, preview.updatedAt);
+    insert into previews (id, scope_type, scope_id, label, target_host, port, token, command, cwd, status, access, proxy_paths_json, created_at, updated_at)
+    values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(preview.id, preview.scopeType, preview.scopeId, preview.label, preview.targetHost, preview.port, preview.token, preview.command ?? null, preview.cwd ?? null, preview.status, preview.access, JSON.stringify(preview.proxyPaths ?? []), preview.createdAt, preview.updatedAt);
   previews.set(preview.id, preview);
 }
 
@@ -148,9 +150,9 @@ function updatePreview(preview: PreviewRecord) {
   preview.updatedAt = new Date().toISOString();
   db.prepare(`
     update previews
-    set label = ?, target_host = ?, port = ?, command = ?, cwd = ?, status = ?, access = ?, updated_at = ?
+    set label = ?, target_host = ?, port = ?, command = ?, cwd = ?, status = ?, access = ?, proxy_paths_json = ?, updated_at = ?
     where id = ?
-  `).run(preview.label, preview.targetHost, preview.port, preview.command ?? null, preview.cwd ?? null, preview.status, preview.access, preview.updatedAt, preview.id);
+  `).run(preview.label, preview.targetHost, preview.port, preview.command ?? null, preview.cwd ?? null, preview.status, preview.access, JSON.stringify(preview.proxyPaths ?? []), preview.updatedAt, preview.id);
   previews.set(preview.id, preview);
   publishPreviewLogEvent(preview.id, { type: "status", preview: publicPreview(preview) });
 }
@@ -206,6 +208,7 @@ function discoverPreviewUrls(session: SessionSummary, value: string) {
       cwd: session.workspacePath,
       status: "registered",
       access: "private",
+      proxyPaths: [],
       createdAt: now,
       updatedAt: now,
     };
@@ -214,6 +217,35 @@ function discoverPreviewUrls(session: SessionSummary, value: string) {
     appendMessageCard(session.id, "service", `Detected service on :${port}`, { previewId: preview.id, url: publicPreview(preview).url, port, source: match[0] });
     void markPreviewRunningIfReachable(preview);
   }
+}
+
+function normalizePreviewProxyPaths(value: unknown): string[] {
+  let raw = value;
+  if (typeof raw === "string") {
+    const text = raw;
+    try {
+      raw = JSON.parse(text);
+    } catch {
+      raw = text.split(/\r?\n|,/);
+    }
+  }
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  return raw
+    .map((item) => normalizePreviewProxyPath(String(item ?? "")))
+    .filter((item): item is string => {
+      if (!item || seen.has(item)) return false;
+      seen.add(item);
+      return true;
+    });
+}
+
+function normalizePreviewProxyPath(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  if (/^[a-z][a-z0-9+.-]*:/i.test(trimmed) || trimmed.startsWith("//")) return "";
+  const path = `/${trimmed.replace(/^\/+/, "")}`.replace(/\/+$/g, "") || "/";
+  return path.length > 1 ? path : "";
 }
 
 function shouldIgnoreDiscoveredPreviewUrl(value: string) {
@@ -267,6 +299,7 @@ function deletePreviewsForScope(scopeType: PreviewRecord["scopeType"], scopeId: 
     publicPreview,
     shouldIgnoreDiscoveredPreviewUrl,
     updatePreview,
+    normalizePreviewProxyPaths,
     upsertPreviewAccessRequest,
   };
 }

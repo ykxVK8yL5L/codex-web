@@ -13,6 +13,7 @@ pub struct PreviewSummary {
     pub cwd: Option<String>,
     pub status: String,
     pub access: String,
+    pub proxy_paths: Vec<String>,
     pub url: String,
     pub created_at: String,
     pub updated_at: String,
@@ -31,6 +32,7 @@ pub struct PreviewRecord {
     pub cwd: Option<String>,
     pub status: String,
     pub access: String,
+    pub proxy_paths: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -46,6 +48,7 @@ pub struct CreatePreviewRequest {
     pub command: Option<String>,
     pub cwd: Option<String>,
     pub access: Option<String>,
+    pub proxy_paths: Option<Vec<String>>,
     pub auto_start: Option<bool>,
 }
 
@@ -59,6 +62,7 @@ pub struct UpdatePreviewAccessRequest {
 #[serde(rename_all = "camelCase")]
 pub struct UpdatePreviewRequest {
     pub label: Option<String>,
+    pub proxy_paths: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -94,6 +98,7 @@ impl PreviewRecord {
             cwd: self.cwd.clone(),
             status: self.status.clone(),
             access: self.access.clone(),
+            proxy_paths: self.proxy_paths.clone(),
             url: preview_url(&self.id, &self.token),
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),

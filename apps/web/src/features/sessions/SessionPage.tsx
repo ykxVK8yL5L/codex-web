@@ -48,7 +48,7 @@ import { Switch } from "@/components/ui/switch";
 import { copyText } from "@/lib/clipboard";
 import { sessionInfoRequestedEvent, taskActivityChangedEvent, workspaceChangedEvent } from "@/lib/events";
 import { formatBytes, formatShortDate, formatTokens, renderPreviewCommand } from "@/lib/format";
-import { openPreviewUrl } from "@/lib/previews";
+import { openPreviewUrl, parsePreviewProxyPaths } from "@/lib/previews";
 import { AutomationNotifyRuleDialog } from "@/components/automations";
 import { FilesPage } from "@/features/files";
 import { TerminalPage } from "@/features/terminal";
@@ -202,6 +202,7 @@ export function SessionPage({
   const [previewPort, setPreviewPort] = useState("4179");
   const [previewDirectory, setPreviewDirectory] = useState(".");
   const [previewAccess, setPreviewAccess] = useState<PreviewAccess>("private");
+  const [previewProxyPaths, setPreviewProxyPaths] = useState("/api");
   const [roomMessage, setRoomMessage] = useState("");
   const [roomMentionAgents, setRoomMentionAgents] = useState<AgentSummary[]>([]);
   const [roomActiveAgentIds, setRoomActiveAgentIds] = useState<string[]>([]);
@@ -1415,6 +1416,7 @@ export function SessionPage({
       port: Number(previewPort),
       command: renderPreviewCommand(previewCommand, previewPort, previewDirectory),
       access: previewAccess,
+      proxyPaths: parsePreviewProxyPaths(previewProxyPaths),
       autoStart: true,
     };
     const response = await fetch("/api/previews", {
@@ -1914,6 +1916,10 @@ export function SessionPage({
                   <option value="private">{t("preview.private")}</option>
                   <option value="public">{t("preview.public")}</option>
                 </select>
+              </label>
+              <label>
+                <span>{t("preview.proxyPaths")}</span>
+                <textarea name="previewproxypaths" value={previewProxyPaths} onChange={(event) => setPreviewProxyPaths(event.target.value)} placeholder="/api&#10;/trpc" rows={3} />
               </label>
               <button className="ghost-button" type="submit"><IconText icon={Play}>{t("project.startPreview")}</IconText></button>
             </form>

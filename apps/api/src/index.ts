@@ -1194,6 +1194,7 @@ const {
   loadPreviewAccessRequests,
   loadPreviewLogs,
   loadPreviews,
+  normalizePreviewProxyPaths,
   previewAccessRequestFromRow,
   previewAccessRequests,
   previewFromRow,
@@ -1894,6 +1895,7 @@ const previewRouteDeps = {
   deletePreview,
   getBearerToken,
   insertPreview,
+  normalizePreviewProxyPaths,
   previewAccess,
   previewAccessCookie,
   previewCommandRisk,
@@ -2149,6 +2151,7 @@ function openDatabase() {
       cwd text,
       status text not null default 'registered',
       access text not null default 'public',
+      proxy_paths_json text not null default '[]',
       created_at text not null,
       updated_at text not null
     );
@@ -2859,6 +2862,7 @@ function openDatabase() {
   if (!previewColumns.some((column) => column.name === "cwd")) database.prepare("alter table previews add column cwd text").run();
   if (!previewColumns.some((column) => column.name === "status")) database.prepare("alter table previews add column status text not null default 'registered'").run();
   if (!previewColumns.some((column) => column.name === "access")) database.prepare("alter table previews add column access text not null default 'public'").run();
+  if (!previewColumns.some((column) => column.name === "proxy_paths_json")) database.prepare("alter table previews add column proxy_paths_json text not null default '[]'").run();
   if (!previewColumns.some((column) => column.name === "updated_at")) database.prepare("alter table previews add column updated_at text").run();
   const previewLogColumns = database.prepare("pragma table_info(preview_logs)").all() as Array<{ name: string }>;
   if (!previewLogColumns.some((column) => column.name === "label")) database.prepare("alter table preview_logs add column label text").run();
@@ -5541,6 +5545,7 @@ function startPreviewWebSocketProxy(server: ReturnType<typeof serve>) {
     let previewId = "";
     let token = "";
     let upstreamPath = `${url.pathname}${url.search}`;
+    let fromPreviewReferer = false;
     if (parts[0] === "preview") {
       previewId = parts[1] ? decodeURIComponent(parts[1]) : "";
       token = parts[2] ? decodeURIComponent(parts[2]) : "";
@@ -5553,9 +5558,10 @@ function startPreviewWebSocketProxy(server: ReturnType<typeof serve>) {
       if (refererParts[0] !== "preview") return;
       previewId = refererParts[1] ? decodeURIComponent(refererParts[1]) : "";
       token = refererParts[2] ? decodeURIComponent(refererParts[2]) : "";
+      fromPreviewReferer = true;
     }
     const preview = previews.get(previewId);
-    if (!preview || preview.token !== token || !requestHasPreviewAccess(preview, request)) {
+    if (!preview || preview.token !== token || (fromPreviewReferer && !previewProxyPathMatches(preview, url.pathname)) || !requestHasPreviewAccess(preview, request)) {
       socket.destroy();
       return;
     }
@@ -5582,6 +5588,14 @@ function startPreviewWebSocketProxy(server: ReturnType<typeof serve>) {
     });
   });
   return wss;
+}
+
+function previewProxyPathMatches(preview: { proxyPaths?: unknown }, path: string) {
+  const prefixes = Array.isArray(preview.proxyPaths) ? preview.proxyPaths : [];
+  return prefixes.some((prefix) => {
+    const normalized = String(prefix || "").trim().replace(/\/+$/g, "");
+    return normalized && (path === normalized || path.startsWith(`${normalized}/`));
+  });
 }
 
 async function proxyPreviewHttpRequest(preview: PreviewRecord, upstreamPath: string, sourceUrl: URL, request: Request) {

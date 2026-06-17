@@ -184,6 +184,7 @@ export interface PreviewSummary {
   cwd?: string;
   status: "registered" | "starting" | "running" | "stopped" | "error";
   access: PreviewAccess;
+  proxyPaths?: string[];
   url: string;
   createdAt: string;
   updatedAt: string;
@@ -209,11 +210,13 @@ export interface CreatePreviewRequest {
   command?: string;
   cwd?: string;
   access?: PreviewAccess;
+  proxyPaths?: string[];
   autoStart?: boolean;
 }
 
 export interface UpdatePreviewRequest {
   label?: string;
+  proxyPaths?: string[];
 }
 
 export interface ProviderSummary {

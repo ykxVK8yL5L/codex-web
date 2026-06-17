@@ -4,6 +4,7 @@ use axum::{
     body::Body,
     extract::{Path, Query, State},
     http::{header, HeaderMap, Method, Request, Response, StatusCode},
+    middleware::Next,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -46,6 +47,10 @@ pub fn router(state: AppState) -> Router {
         .merge(api::notifications::inbound_router())
         .merge(api::router(state.clone()))
         .fallback(preview_referer_or_static_handler)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            preview_referer_proxy_middleware,
+        ))
         .with_state(state)
 }
 
@@ -339,6 +344,40 @@ fn json_error(status: StatusCode, message: impl Into<String>) -> JsonError {
     (status, Json(serde_json::json!({ "error": message.into() })))
 }
 
+async fn preview_referer_proxy_middleware(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response<Body> {
+    let path = request.uri().path().to_string();
+    if path == "/health" || path.starts_with("/preview/") {
+        return next.run(request).await;
+    }
+    let referer = request
+        .headers()
+        .get(header::REFERER)
+        .and_then(|value| value.to_str().ok());
+    let Some(preview) = preview_from_referer(&state, referer) else {
+        return next.run(request).await;
+    };
+    if !api::previews::store::proxy_path_matches(&preview, &path) {
+        return next.run(request).await;
+    }
+    if preview.access == "private"
+        && !preview_request_has_access(&state, &preview.id, &preview.token, request.headers())
+    {
+        if request.method() == Method::GET || request.method() == Method::HEAD {
+            return private_preview_access_response(&preview, &request);
+        }
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(Body::from("private preview requires Codex Web access"))
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+    }
+    proxy_preview_response(state, preview, path.trim_start_matches('/').to_string(), request).await
+}
+
 /// Catch-all parity with apps/api/src/server/routes.ts `app.all("*")`:
 /// if an arbitrary same-origin request carries a Referer under `/preview/:id/:token/`,
 /// route it back to that preview.  GET/HEAD are redirected to the canonical preview URL
@@ -358,6 +397,9 @@ async fn preview_referer_or_static_handler(
     let Some(preview) = preview_from_referer(&state, referer) else {
         return web::static_handler(State(state), request).await;
     };
+    if !api::previews::store::proxy_path_matches(&preview, &path) {
+        return web::static_handler(State(state), request).await;
+    }
 
     if preview.access == "private"
         && !preview_request_has_access(&state, &preview.id, &preview.token, request.headers())
@@ -372,45 +414,28 @@ async fn preview_referer_or_static_handler(
             .unwrap_or_else(|_| Response::new(Body::empty()));
     }
 
-    if request.method() != Method::GET && request.method() != Method::HEAD {
-        let upstream_path = path.trim_start_matches('/').to_string();
-        return match api::previews::runtime::proxy(
-            state,
-            preview.id,
-            preview.token,
-            upstream_path,
-            request,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err((status, Json(value))) => {
-                let body = serde_json::to_vec(&value).unwrap_or_default();
-                Response::builder()
-                    .status(status)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(body))
-                    .unwrap_or_else(|_| Response::new(Body::empty()))
-            }
-        };
-    }
+    proxy_preview_response(state, preview, path.trim_start_matches('/').to_string(), request).await
+}
 
-    let query = request
-        .uri()
-        .query()
-        .map(|query| format!("?{query}"))
-        .unwrap_or_default();
-    let location = format!(
-        "{}{}{}",
-        api::previews::models::preview_url(&preview.id, &preview.token),
-        path.trim_start_matches('/'),
-        query,
-    );
-    Response::builder()
-        .status(StatusCode::TEMPORARY_REDIRECT)
-        .header(header::LOCATION, location)
-        .body(Body::empty())
-        .unwrap_or_else(|_| Response::new(Body::empty()))
+async fn proxy_preview_response(
+    state: AppState,
+    preview: api::previews::models::PreviewRecord,
+    upstream_path: String,
+    request: Request<Body>,
+) -> Response<Body> {
+    match api::previews::runtime::proxy(state, preview.id, preview.token, upstream_path, request)
+        .await
+    {
+        Ok(response) => response,
+        Err((status, Json(value))) => {
+            let body = serde_json::to_vec(&value).unwrap_or_default();
+            Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap_or_else(|_| Response::new(Body::empty()))
+        }
+    }
 }
 
 fn preview_from_referer(

@@ -8,7 +8,7 @@ import { PreviewDirectoryPicker } from "@/components/PreviewDirectoryPicker";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { formatBytes, prettyJson, renderPreviewCommand, rulesForArchiveTemplates } from "@/lib/format";
 import { workspaceChangedEvent } from "@/lib/events";
-import { openPreviewUrl } from "@/lib/previews";
+import { openPreviewUrl, parsePreviewProxyPaths } from "@/lib/previews";
 import type { TranslationKey } from "@/lib/i18n";
 import type { ArchiveIgnoreTemplate, CreateFileMountRequest, CreateFileRequest, CreatePreviewRequest, FileArchivePreviewResponse, FileArchiveRequest, FileContentResponse, FileEntry, FileListResponse, FileMount, PreviewAccess, PreviewSummary, RenameFileRequest, UpdateFileMountRequest } from "@codex-web/protocol";
 
@@ -62,6 +62,7 @@ export function FilesPage({
   const [folderPreviewCommand, setFolderPreviewCommand] = useState("python3 -m http.server {port} --bind 127.0.0.1 --directory {dir}");
   const [folderPreviewPort, setFolderPreviewPort] = useState("4179");
   const [folderPreviewAccess, setFolderPreviewAccess] = useState<PreviewAccess>("private");
+  const [folderPreviewProxyPaths, setFolderPreviewProxyPaths] = useState("/api");
   const [uploading, setUploading] = useState(false);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -485,6 +486,7 @@ export function FilesPage({
       command: renderPreviewCommand(folderPreviewCommand, folderPreviewPort, "."),
       cwd: ".",
       access: folderPreviewAccess,
+      proxyPaths: parsePreviewProxyPaths(folderPreviewProxyPaths),
       autoStart: true,
     };
     const response = await fetch("/api/previews", {
@@ -911,6 +913,10 @@ export function FilesPage({
                   <option value="private">{t("preview.private")}</option>
                   <option value="public">{t("preview.public")}</option>
                 </select>
+              </label>
+              <label>
+                <span>{t("preview.proxyPaths")}</span>
+                <textarea name="folder-preview-proxy-paths" value={folderPreviewProxyPaths} onChange={(event) => setFolderPreviewProxyPaths(event.target.value)} placeholder="/api&#10;/trpc" rows={3} />
               </label>
               <button className="ghost-button" type="submit"><IconText icon={Play}>{t("project.startPreview")}</IconText></button>
             </form>
