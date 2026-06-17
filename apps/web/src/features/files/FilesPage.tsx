@@ -13,6 +13,14 @@ import type { TranslationKey } from "@/lib/i18n";
 import type { ArchiveIgnoreTemplate, CreateFileMountRequest, CreateFileRequest, CreatePreviewRequest, FileArchivePreviewResponse, FileArchiveRequest, FileContentResponse, FileEntry, FileListResponse, FileMount, PreviewAccess, PreviewSummary, RenameFileRequest, UpdateFileMountRequest } from "@codex-web/protocol";
 
 type TFunction = (key: TranslationKey) => string;
+type UploadProgress = {
+  destinationPath: string;
+  fileCount: number;
+  loadedBytes: number;
+  totalBytes: number;
+  percent: number;
+  processing: boolean;
+};
 
 export function FilesPage({
   sessionToken,
@@ -64,6 +72,7 @@ export function FilesPage({
   const [folderPreviewAccess, setFolderPreviewAccess] = useState<PreviewAccess>("private");
   const [folderPreviewProxyPaths, setFolderPreviewProxyPaths] = useState("/api");
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);
 
   const authHeaders = { authorization: `Bearer ${sessionToken}` };
@@ -147,6 +156,16 @@ export function FilesPage({
     window.addEventListener(workspaceChangedEvent, handleWorkspaceChanged);
     return () => window.removeEventListener(workspaceChangedEvent, handleWorkspaceChanged);
   }, [dirty]);
+
+  useEffect(() => {
+    if (!uploading) return;
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [uploading]);
 
   function switchMount(mountId: string) {
     setTransientRootPath(null);
@@ -289,18 +308,39 @@ export function FilesPage({
     const selectedFiles = Array.from(files ?? []);
     if (!selectedFiles.length) return;
     const destinationPath = selectedDirectoryRelativePath();
+    const totalBytes = selectedFiles.reduce((total, file) => total + file.size, 0);
     setUploading(true);
+    setUploadProgress({
+      destinationPath,
+      fileCount: selectedFiles.length,
+      loadedBytes: 0,
+      totalBytes,
+      percent: 0,
+      processing: false,
+    });
     setMessage("");
     try {
       const form = new FormData();
       selectedFiles.forEach((file) => form.append("files", file, file.name));
-      const response = await fetch(`/api/files/upload?${fileQuery(destinationPath)}`, {
-        method: "POST",
-        headers: authHeaders,
-        body: form,
+      const response = await uploadFormData(`/api/files/upload?${fileQuery(destinationPath)}`, form, ({ loaded, total, processing }) => {
+        const denominator = total || totalBytes;
+        const loadedBytes = denominator > 0 && totalBytes > 0
+          ? Math.min(totalBytes, Math.round((loaded / denominator) * totalBytes))
+          : loaded;
+        const percent = denominator > 0
+          ? Math.min(processing ? 100 : 99, Math.round((loaded / denominator) * 100))
+          : 0;
+        setUploadProgress({
+          destinationPath,
+          fileCount: selectedFiles.length,
+          loadedBytes: processing ? totalBytes : loadedBytes,
+          totalBytes,
+          percent,
+          processing,
+        });
       });
       if (!response.ok) {
-        const error = await response.json().catch(() => null) as { error?: string } | null;
+        const error = parseJson<{ error?: string }>(response.text);
         setMessage(error?.error === "already_exists" ? t("file.uploadConflict") : t("file.uploadFailed"));
         return;
       }
@@ -311,8 +351,42 @@ export function FilesPage({
       setMessage(t("file.uploaded").replace("{count}", String(selectedFiles.length)));
       if ((fileList?.path ?? currentPath) !== destinationPath) setCurrentPath(destinationPath);
       else setReloadKey((key) => key + 1);
+    } catch {
+      setMessage(t("file.uploadFailed"));
     } finally {
       setUploading(false);
+      setUploadProgress(null);
+    }
+  }
+
+  function uploadFormData(url: string, form: FormData, onProgress: (progress: { loaded: number; total: number; processing: boolean }) => void) {
+    return new Promise<{ ok: boolean; status: number; text: string }>((resolve, reject) => {
+      const request = new XMLHttpRequest();
+      request.open("POST", url);
+      request.setRequestHeader("authorization", authHeaders.authorization);
+      request.upload.onprogress = (event) => {
+        onProgress({
+          loaded: event.loaded,
+          total: event.lengthComputable ? event.total : 0,
+          processing: false,
+        });
+      };
+      request.upload.onload = () => onProgress({ loaded: 1, total: 1, processing: true });
+      request.onload = () => {
+        onProgress({ loaded: 1, total: 1, processing: true });
+        resolve({ ok: request.status >= 200 && request.status < 300, status: request.status, text: request.responseText });
+      };
+      request.onerror = () => reject(new Error("upload_failed"));
+      request.onabort = () => reject(new Error("upload_aborted"));
+      request.send(form);
+    });
+  }
+
+  function parseJson<T>(text: string): T | null {
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      return null;
     }
   }
 
@@ -761,6 +835,18 @@ export function FilesPage({
               </DropdownMenu>
             </div>
           </div>
+          {uploadProgress && (
+            <div className="file-upload-progress" role="status" aria-live="polite">
+              <div className="file-upload-progress-head">
+                <strong>{uploadProgress.processing ? t("file.uploadProcessing") : t("file.uploading").replace("{count}", String(uploadProgress.fileCount)).replace("{path}", uploadProgress.destinationPath)}</strong>
+                <span>{t("file.uploadProgress").replace("{percent}", String(uploadProgress.percent)).replace("{loaded}", formatBytes(uploadProgress.loadedBytes)).replace("{total}", formatBytes(uploadProgress.totalBytes))}</span>
+              </div>
+              <div className="file-upload-progress-track" aria-hidden="true">
+                <span style={{ width: `${uploadProgress.percent}%` }} />
+              </div>
+              <div className="subtle">{t("file.uploadKeepPage")}</div>
+            </div>
+          )}
           <input name="filefilter" className="search-input file-search-input" value={fileFilter} onChange={(event) => setFileFilter(event.target.value)} placeholder={t("file.searchCurrentDirectory")} />
           {fileList?.parentPath && (
             <button className="file-list-item" onClick={() => setCurrentPath(fileList.parentPath ?? ".")}>

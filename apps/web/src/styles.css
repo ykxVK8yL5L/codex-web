@@ -2715,6 +2715,56 @@ button:disabled {
   min-width: 34px;
 }
 
+.file-upload-progress {
+  display: grid;
+  gap: 7px;
+  margin: 0 0 10px;
+  border: 1px solid #c2dacc;
+  border-radius: 8px;
+  background: var(--green-soft);
+  padding: 10px 12px;
+}
+
+.file-upload-progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  min-width: 0;
+}
+
+.file-upload-progress-head strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-upload-progress-head span {
+  flex: 0 1 auto;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.file-upload-progress-track {
+  overflow: hidden;
+  width: 100%;
+  height: 7px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.08);
+}
+
+.file-upload-progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--green);
+  transition: width 160ms ease;
+}
+
 .file-list-item {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
