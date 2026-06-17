@@ -6,7 +6,7 @@ pub(crate) mod store;
 use std::{fs, path::PathBuf};
 
 use axum::{
-    extract::{Query, State},
+    extract::{DefaultBodyLimit, Multipart, Query, State},
     http::{header, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{get, patch, post},
@@ -30,6 +30,10 @@ pub fn router() -> Router<AppState> {
                 .post(create_file)
                 .patch(rename_file)
                 .delete(delete_file),
+        )
+        .route(
+            "/files/upload",
+            post(upload_files).layer(DefaultBodyLimit::max(100 * 1024 * 1024)),
         )
         .route("/files/archive", post(archive_download))
         .route("/files/archive/preview", post(archive_preview))
@@ -283,6 +287,61 @@ async fn delete_file(
         fs::remove_file(&target).map_err(|err| bad_request(err.into()))?;
     }
     Ok(Json(serde_json::json!({ "ok": true, "path": name })))
+}
+
+async fn upload_files(
+    State(state): State<AppState>,
+    Query(query): Query<FileQuery>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<Vec<models::FileEntry>>), (StatusCode, Json<serde_json::Value>)> {
+    let mount = store::resolve_mount(
+        &state.db,
+        query.mount_id.as_deref(),
+        query.root_path.as_deref(),
+    )
+    .map_err(bad_request)?;
+    let root = paths::normalize_path(&PathBuf::from(&mount.root_path)).map_err(bad_request)?;
+    let parent = paths::resolve_inside_root(&root, query.path.as_deref()).map_err(bad_request)?;
+    if !parent.is_dir() {
+        return Err(error(StatusCode::BAD_REQUEST, "not_a_directory"));
+    }
+
+    let mut pending = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    while let Some(field) = multipart.next_field().await.map_err(|err| bad_request(err.into()))? {
+        if field.name() != Some("files") {
+            continue;
+        }
+        let Some(file_name) = field.file_name().map(|name| name.to_string()) else {
+            continue;
+        };
+        let clean_name = clean_child_name(&file_name).map_err(bad_request)?.to_string();
+        if !names.insert(clean_name.clone()) {
+            return Err(error(StatusCode::CONFLICT, "already_exists"));
+        }
+        let bytes = field.bytes().await.map_err(|err| bad_request(err.into()))?;
+        pending.push((clean_name, bytes));
+    }
+
+    if pending.is_empty() {
+        return Err(error(StatusCode::BAD_REQUEST, "no_files"));
+    }
+
+    let mut targets = Vec::new();
+    for (name, bytes) in pending {
+        let target = paths::resolve_child_path(&root, &parent.join(&name)).map_err(bad_request)?;
+        if target.exists() {
+            return Err(error(StatusCode::CONFLICT, "already_exists"));
+        }
+        targets.push((target, bytes));
+    }
+
+    let mut uploaded = Vec::new();
+    for (target, bytes) in targets {
+        fs::write(&target, bytes).map_err(|err| bad_request(err.into()))?;
+        uploaded.push(file_entry(target, &root).map_err(bad_request)?);
+    }
+    Ok((StatusCode::CREATED, Json(uploaded)))
 }
 
 async fn archive_preview(

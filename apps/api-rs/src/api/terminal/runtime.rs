@@ -108,6 +108,7 @@ pub async fn create_session(
     };
     let handle = TerminalHandle {
         summary: summary.clone(),
+        ephemeral,
         sender: sender.clone(),
         input: input_tx,
         resize: resize_tx,

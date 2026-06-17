@@ -27,6 +27,7 @@ pub async fn ws(
 }
 
 async fn handle_socket(state: AppState, query: TerminalWsQuery, socket: WebSocket) {
+    let mut created_ephemeral_id: Option<String> = None;
     let handle = if let Some(id) = query
         .session_id
         .as_deref()
@@ -47,6 +48,9 @@ async fn handle_socket(state: AppState, query: TerminalWsQuery, socket: WebSocke
         else {
             return;
         };
+        if ephemeral {
+            created_ephemeral_id = Some(summary.id.clone());
+        }
         let Some(handle) = state.terminals.get(&summary.id) else {
             return;
         };
@@ -117,4 +121,9 @@ async fn handle_socket(state: AppState, query: TerminalWsQuery, socket: WebSocke
         }
     }
     output_task.abort();
+    if let Some(id) = created_ephemeral_id {
+        if let Some(handle) = state.terminals.remove(&id) {
+            let _ = handle.kill.send(());
+        }
+    }
 }

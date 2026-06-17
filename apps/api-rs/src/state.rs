@@ -165,6 +165,7 @@ pub struct TerminalRuntimeState {
 #[derive(Clone)]
 pub struct TerminalHandle {
     pub summary: crate::api::terminal::models::TerminalSessionSummary,
+    pub ephemeral: bool,
     pub sender: broadcast::Sender<String>,
     pub input: tokio::sync::mpsc::UnboundedSender<String>,
     pub resize: tokio::sync::mpsc::UnboundedSender<(u16, u16)>,
@@ -233,6 +234,7 @@ impl TerminalRuntimeState {
             .map(|sessions| {
                 sessions
                     .values()
+                    .filter(|handle| !handle.ephemeral)
                     .map(|handle| handle.summary.clone())
                     .collect()
             })

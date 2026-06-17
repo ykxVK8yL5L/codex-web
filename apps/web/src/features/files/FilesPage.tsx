@@ -1,5 +1,5 @@
-import React, { useEffect, useState } from "react";
-import { Copy, Download, FilePlus2, FolderOpen, FolderPlus, Globe, MoreHorizontal, Pencil, Play, Save, Terminal as TerminalIcon, Trash2, X } from "lucide-react";
+import React, { useEffect, useRef, useState } from "react";
+import { Copy, Download, FilePlus2, FolderOpen, FolderPlus, Globe, MoreHorizontal, Pencil, Play, Save, Terminal as TerminalIcon, Trash2, Upload, X } from "lucide-react";
 import { useAppDialog } from "@/components/AppDialog";
 import { CodeEditor, preferredCodeEditorMode, type CodeEditorMode } from "@/components/CodeEditor";
 import { IconText } from "@/components/IconText";
@@ -62,6 +62,8 @@ export function FilesPage({
   const [folderPreviewCommand, setFolderPreviewCommand] = useState("python3 -m http.server {port} --bind 127.0.0.1 --directory {dir}");
   const [folderPreviewPort, setFolderPreviewPort] = useState("4179");
   const [folderPreviewAccess, setFolderPreviewAccess] = useState<PreviewAccess>("private");
+  const [uploading, setUploading] = useState(false);
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
 
   const authHeaders = { authorization: `Bearer ${sessionToken}` };
   const activeMount = mounts.find((mount) => mount.id === activeMountId) ?? mounts[0] ?? null;
@@ -280,6 +282,37 @@ export function FilesPage({
       return;
     }
     setReloadKey((key) => key + 1);
+  }
+
+  async function uploadFiles(files: FileList | null) {
+    const selectedFiles = Array.from(files ?? []);
+    if (!selectedFiles.length) return;
+    const destinationPath = selectedDirectoryRelativePath();
+    setUploading(true);
+    setMessage("");
+    try {
+      const form = new FormData();
+      selectedFiles.forEach((file) => form.append("files", file, file.name));
+      const response = await fetch(`/api/files/upload?${fileQuery(destinationPath)}`, {
+        method: "POST",
+        headers: authHeaders,
+        body: form,
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => null) as { error?: string } | null;
+        setMessage(error?.error === "already_exists" ? t("file.uploadConflict") : t("file.uploadFailed"));
+        return;
+      }
+      setSelectedEntry(null);
+      setSelectedFile(null);
+      setDraft("");
+      setDirty(false);
+      setMessage(t("file.uploaded").replace("{count}", String(selectedFiles.length)));
+      if ((fileList?.path ?? currentPath) !== destinationPath) setCurrentPath(destinationPath);
+      else setReloadKey((key) => key + 1);
+    } finally {
+      setUploading(false);
+    }
   }
 
   async function renameEntry() {
@@ -706,6 +739,8 @@ export function FilesPage({
             <div><strong>{transientMountName ? `${transientMountName} · ${fileList?.path ?? currentPath}` : fileList?.path ?? currentPath}</strong><span className="subtle"> · {fileCountText}</span></div>
             <div className="file-actions">
               {!activeRootPath && <button className="ghost-button icon-only file-mobile-mounts" type="button" title={t("file.mounts")} aria-label={t("file.mounts")} onClick={() => setMountsPanelOpen(true)}><IconText icon={FolderOpen}>{t("file.mounts")}</IconText></button>}
+              <button className="ghost-button icon-only" type="button" title={t("file.uploadFiles")} aria-label={t("file.uploadFiles")} disabled={!hasFileRoot || uploading} onClick={() => uploadInputRef.current?.click()}><IconText icon={Upload}>{t("file.uploadFiles")}</IconText></button>
+              <input ref={uploadInputRef} name="fileupload" type="file" multiple hidden onChange={(event) => { void uploadFiles(event.currentTarget.files); event.currentTarget.value = ""; }} />
               <button className="ghost-button icon-only" type="button" title={t("file.newFile")} aria-label={t("file.newFile")} disabled={!hasFileRoot} onClick={() => createEntry("file")}><IconText icon={FilePlus2}>{t("file.newFile")}</IconText></button>
               <button className="ghost-button icon-only" type="button" title={t("file.newDirectory")} aria-label={t("file.newDirectory")} disabled={!hasFileRoot} onClick={() => createEntry("directory")}><IconText icon={FolderPlus}>{t("file.newDirectory")}</IconText></button>
               {!embedded && <button className="ghost-button icon-only" type="button" title={t("file.openTerminal")} aria-label={t("file.openTerminal")} disabled={!hasFileRoot} onClick={openTerminalHere}><IconText icon={TerminalIcon}>{t("file.openTerminal")}</IconText></button>}

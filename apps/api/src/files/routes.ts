@@ -198,6 +198,37 @@ export function registerFileRoutes(app: Hono, deps: FileRoutesDeps) {
     }
   });
 
+  app.post("/api/files/upload", async (c) => {
+    try {
+      const mount = deps.resolveFileRequestMount(c.req.query("mountId"), c.req.query("rootPath"));
+      const parentPath = deps.resolveInsideMount(mount, c.req.query("path"));
+      if (!statSync(parentPath).isDirectory()) return c.json({ error: "not_a_directory" }, 400);
+      const form = await c.req.formData();
+      const files = form.getAll("files").filter((item): item is File => item instanceof File);
+      if (!files.length) return c.json({ error: "no_files" }, 400);
+      const pending: Array<{ targetPath: string; bytes: Buffer }> = [];
+      const names = new Set<string>();
+      for (const file of files) {
+        const cleanName = file.name.trim();
+        if (!cleanName || cleanName.includes("/") || cleanName.includes("\\")) throw new Error("invalid_name");
+        if (names.has(cleanName)) return c.json({ error: "already_exists" }, 409);
+        names.add(cleanName);
+        const targetPath = deps.resolveInsideMount(mount, join(deps.toRelativePath(parentPath, mount.rootPath), cleanName));
+        if (existsSync(targetPath)) return c.json({ error: "already_exists" }, 409);
+        const bytes = Buffer.from(await file.arrayBuffer());
+        pending.push({ targetPath, bytes });
+      }
+      const entries: FileEntry[] = [];
+      for (const { targetPath, bytes } of pending) {
+        writeFileSync(targetPath, bytes, { flag: "wx" });
+        entries.push(deps.toFileEntry(targetPath, mount.rootPath));
+      }
+      return c.json(entries, 201);
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : "file_upload_failed" }, 400);
+    }
+  });
+
   app.patch("/api/files", async (c) => {
     try {
       const body = await c.req.json<RenameFileRequest>().catch(() => null);
