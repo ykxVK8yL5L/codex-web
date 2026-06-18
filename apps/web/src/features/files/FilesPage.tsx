@@ -70,7 +70,7 @@ export function FilesPage({
   const [folderPreviewCommand, setFolderPreviewCommand] = useState("python3 -m http.server {port} --bind 127.0.0.1 --directory {dir}");
   const [folderPreviewPort, setFolderPreviewPort] = useState("4179");
   const [folderPreviewAccess, setFolderPreviewAccess] = useState<PreviewAccess>("private");
-  const [folderPreviewProxyPaths, setFolderPreviewProxyPaths] = useState("/api");
+  const [folderPreviewProxyPaths, setFolderPreviewProxyPaths] = useState("");
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
   const uploadInputRef = useRef<HTMLInputElement | null>(null);

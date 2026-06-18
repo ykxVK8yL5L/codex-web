@@ -125,7 +125,7 @@ export function registerServerRoutes(app: Hono, deps: ServerRoutesDeps) {
     if (path === "/health" || path.startsWith("/preview/")) return next();
     const preview = previewFromReferer(c.req.header("referer"));
     if (!preview) return next();
-    if (!previewProxyPathMatches(preview, path)) return next();
+    if (!shouldProxyPreviewRefererPath(preview, path)) return next();
     if (!requestHasPreviewAccess(preview, c.req.raw)) return c.req.method === "GET" || c.req.method === "HEAD"
       ? privatePreviewAccessResponse(preview, sourceUrl)
       : c.text("private preview requires Codex Web access", 401);
@@ -243,6 +243,16 @@ export function registerServerRoutes(app: Hono, deps: ServerRoutesDeps) {
   });
   
   registerAppNotificationStreamRoute(app, appNotificationRouteDeps);
+}
+
+function shouldProxyPreviewRefererPath(preview: { proxyPaths?: unknown }, path: string) {
+  if (isReservedPreviewShellPath(path)) return false;
+  if (!Array.isArray(preview.proxyPaths) || preview.proxyPaths.length === 0) return true;
+  return previewProxyPathMatches(preview, path);
+}
+
+function isReservedPreviewShellPath(path: string) {
+  return path === "/health" || path.startsWith("/preview/");
 }
 
 function previewProxyPathMatches(preview: { proxyPaths?: unknown }, path: string) {

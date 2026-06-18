@@ -5561,7 +5561,7 @@ function startPreviewWebSocketProxy(server: ReturnType<typeof serve>) {
       fromPreviewReferer = true;
     }
     const preview = previews.get(previewId);
-    if (!preview || preview.token !== token || (fromPreviewReferer && !previewProxyPathMatches(preview, url.pathname)) || !requestHasPreviewAccess(preview, request)) {
+    if (!preview || preview.token !== token || (fromPreviewReferer && !shouldProxyPreviewRefererPath(preview, url.pathname)) || !requestHasPreviewAccess(preview, request)) {
       socket.destroy();
       return;
     }
@@ -5588,6 +5588,16 @@ function startPreviewWebSocketProxy(server: ReturnType<typeof serve>) {
     });
   });
   return wss;
+}
+
+function shouldProxyPreviewRefererPath(preview: { proxyPaths?: unknown }, path: string) {
+  if (isReservedPreviewShellPath(path)) return false;
+  if (!Array.isArray(preview.proxyPaths) || preview.proxyPaths.length === 0) return true;
+  return previewProxyPathMatches(preview, path);
+}
+
+function isReservedPreviewShellPath(path: string) {
+  return path === "/health" || path.startsWith("/preview/");
 }
 
 function previewProxyPathMatches(preview: { proxyPaths?: unknown }, path: string) {

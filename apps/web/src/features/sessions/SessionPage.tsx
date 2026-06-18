@@ -202,7 +202,7 @@ export function SessionPage({
   const [previewPort, setPreviewPort] = useState("4179");
   const [previewDirectory, setPreviewDirectory] = useState(".");
   const [previewAccess, setPreviewAccess] = useState<PreviewAccess>("private");
-  const [previewProxyPaths, setPreviewProxyPaths] = useState("/api");
+  const [previewProxyPaths, setPreviewProxyPaths] = useState("");
   const [roomMessage, setRoomMessage] = useState("");
   const [roomMentionAgents, setRoomMentionAgents] = useState<AgentSummary[]>([]);
   const [roomActiveAgentIds, setRoomActiveAgentIds] = useState<string[]>([]);

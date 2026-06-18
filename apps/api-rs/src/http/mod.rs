@@ -360,7 +360,7 @@ async fn preview_referer_proxy_middleware(
     let Some(preview) = preview_from_referer(&state, referer) else {
         return next.run(request).await;
     };
-    if !api::previews::store::proxy_path_matches(&preview, &path) {
+    if !should_proxy_preview_referer_path(&preview, &path) {
         return next.run(request).await;
     }
     if preview.access == "private"
@@ -397,7 +397,7 @@ async fn preview_referer_or_static_handler(
     let Some(preview) = preview_from_referer(&state, referer) else {
         return web::static_handler(State(state), request).await;
     };
-    if !api::previews::store::proxy_path_matches(&preview, &path) {
+    if !should_proxy_preview_referer_path(&preview, &path) {
         return web::static_handler(State(state), request).await;
     }
 
@@ -461,6 +461,16 @@ fn preview_from_referer(
     let token = percent_decode(parts.next().unwrap_or_default());
     let preview = api::previews::store::get(&state.db, &id).ok().flatten()?;
     (preview.token == token).then_some(preview)
+}
+
+fn should_proxy_preview_referer_path(
+    preview: &api::previews::models::PreviewRecord,
+    path: &str,
+) -> bool {
+    if path == "/health" || path.starts_with("/preview/") {
+        return false;
+    }
+    preview.proxy_paths.is_empty() || api::previews::store::proxy_path_matches(preview, path)
 }
 
 fn percent_decode(value: &str) -> String {
