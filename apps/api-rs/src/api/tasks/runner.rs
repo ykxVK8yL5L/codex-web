@@ -24,7 +24,7 @@ use crate::{
             },
             store as session_store,
         },
-        settings::{load_codex_runtime, CodexRuntimeSettings},
+        settings::{load_codex_runtime, store as settings_store, CodexRuntimeSettings},
     },
     state::{AppState, TaskHandle},
 };
@@ -892,6 +892,12 @@ async fn start_runner(
     let mut command = Command::new("codex");
     command.args(&args);
     command.env("PATH", managed_child_path());
+    let secret_env = if session.conversation_type == "automation" {
+        settings_store::credential_env(&state.db).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    command.envs(secret_env.iter().map(|(key, value)| (key, value)));
     command.current_dir(&cwd);
     command
         .stdout(Stdio::piped())
@@ -921,7 +927,7 @@ async fn start_runner(
     }
     append_log(
         &log_path,
-        &format!(
+        &settings_store::redact_secrets(&format!(
             "[codex-web-rs] mode={} session={} codexThread={} promptChars={} promptHash={} cwd={}\n\n--- user ---\n{}\n\n--- agent ---\n$ codex {}\n",
             "exec",
             session.id,
@@ -931,7 +937,7 @@ async fn start_runner(
             cwd.display(),
             prompt,
             redact_args(&mut args, &prompt).join(" "),
-        ),
+        ), &secret_env),
     )
     .await?;
     let mut child = command.spawn()?;
@@ -949,13 +955,18 @@ async fn start_runner(
     let output_log = log_path.clone();
     let stdout_task = tokio::spawn(async move {
         if let Some(stdout) = stdout {
-            stream_lines(stdout, output_log, Some((output_state, output_session))).await;
+            stream_lines(stdout, output_log, Some((output_state, output_session)), secret_env).await;
         }
     });
     let error_log = log_path.clone();
+    let error_redactions = if session.conversation_type == "automation" {
+        settings_store::credential_env(&state.db).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let stderr_task = tokio::spawn(async move {
         if let Some(stderr) = stderr {
-            stream_lines(stderr, error_log, None).await;
+            stream_lines(stderr, error_log, None, error_redactions).await;
         }
     });
     tokio::spawn(async move {
@@ -1117,11 +1128,13 @@ async fn stream_lines<R>(
     reader: R,
     log_path: PathBuf,
     session_state: Option<(AppState, SessionSummary)>,
+    redactions: Vec<(String, String)>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        let line = settings_store::redact_secrets(&line, &redactions);
         let _ = append_log(&log_path, &(line.clone() + "\n")).await;
         if let Some((state, session)) = session_state.as_ref() {
             if let Ok(meta) = tokio::fs::metadata(&log_path).await {

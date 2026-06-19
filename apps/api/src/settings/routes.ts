@@ -24,6 +24,57 @@ import { parsePageLimit } from "../pagination.js";
 type PreviewRecord = Omit<PreviewSummary, "url"> & { token: string };
 
 type SettingsRoutesDeps = Record<string, any>;
+type StoredCredential = {
+  name: string;
+  description: string;
+  value: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+function normalizeCredentialName(value: unknown) {
+  const name = String(value ?? "").trim().toUpperCase();
+  if (!/^[A-Z_][A-Z0-9_]{0,99}$/.test(name)) throw new Error("invalid_credential_name");
+  return name;
+}
+
+function loadCredentials(db: any): StoredCredential[] {
+  const row = db.prepare("select value from app_settings where key = 'credentials'").get() as { value?: string } | undefined;
+  if (!row?.value) return [];
+  try {
+    const items = JSON.parse(row.value) as StoredCredential[];
+    return Array.isArray(items)
+      ? items.filter((item) => {
+        try {
+          return normalizeCredentialName(item.name) === item.name;
+        } catch {
+          return false;
+        }
+      }).sort((a, b) => a.name.localeCompare(b.name))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveCredentials(db: any, items: StoredCredential[]) {
+  const updatedAt = new Date().toISOString();
+  db.prepare(`
+    insert into app_settings (key, value, updated_at)
+    values ('credentials', ?, ?)
+    on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at
+  `).run(JSON.stringify(items), updatedAt);
+}
+
+function credentialSummary(item: StoredCredential) {
+  return {
+    name: item.name,
+    description: item.description,
+    configured: Boolean(item.value),
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+  };
+}
 
 export function registerSettingsRoutes(app: Hono, deps: SettingsRoutesDeps) {
   const {
@@ -262,6 +313,44 @@ export function registerSettingsRoutes(app: Hono, deps: SettingsRoutesDeps) {
   registerAppNotificationRoutes(app, appNotificationRouteDeps);
   
   registerStorageRoutes(app, storageRouteDeps);
+
+  app.get("/api/settings/credentials", (c) => c.json(loadCredentials(db).map(credentialSummary)));
+
+  app.post("/api/settings/credentials", async (c) => {
+    const body = await c.req.json<{ name?: unknown; description?: unknown; value?: unknown }>().catch(() => null);
+    try {
+      const name = normalizeCredentialName(body?.name);
+      const description = String(body?.description ?? "").trim().slice(0, 300);
+      const value = typeof body?.value === "string" ? body.value : "";
+      const now = new Date().toISOString();
+      const items = loadCredentials(db);
+      const index = items.findIndex((item) => item.name === name);
+      if (index === -1 && !value) return c.json({ error: "credential_value_required" }, 400);
+      const item = index === -1
+        ? { name, description, value, createdAt: now, updatedAt: now }
+        : { ...items[index], description, value: value || items[index].value, updatedAt: now };
+      if (index === -1) items.push(item);
+      else items[index] = item;
+      items.sort((a, b) => a.name.localeCompare(b.name));
+      saveCredentials(db, items);
+      return c.json(credentialSummary(item));
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : "credential_save_failed" }, 400);
+    }
+  });
+
+  app.delete("/api/settings/credentials/:name", (c) => {
+    try {
+      const name = normalizeCredentialName(c.req.param("name"));
+      const items = loadCredentials(db);
+      const next = items.filter((item) => item.name !== name);
+      if (next.length === items.length) return c.json({ error: "credential_not_found" }, 404);
+      saveCredentials(db, next);
+      return c.body(null, 204);
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : "credential_delete_failed" }, 400);
+    }
+  });
   
   app.get("/api/settings/backup", (c) => c.json(systemBackupSettings));
   

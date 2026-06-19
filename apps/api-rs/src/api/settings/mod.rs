@@ -75,6 +75,8 @@ pub fn router() -> Router<AppState> {
         .route("/storage", get(storage_scan))
         .route("/storage/delete", post(storage_delete))
         .route("/storage/delete-batch", post(storage_delete_batch))
+        .route("/credentials", get(credentials).post(upsert_credential))
+        .route("/credentials/:name", delete(delete_credential))
         .route("/environment", get(environment_overview))
         .route("/environment/scan", post(environment_overview))
         .route(
@@ -465,6 +467,29 @@ async fn storage_delete_batch(
         object.insert("deleted".to_string(), serde_json::json!(deleted));
     }
     Ok(Json(response))
+}
+
+async fn credentials(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<store::CredentialSummary>>, (StatusCode, Json<serde_json::Value>)> {
+    Ok(Json(store::credentials(&state.db).map_err(api_error)?))
+}
+
+async fn upsert_credential(
+    State(state): State<AppState>,
+    Json(body): Json<store::UpsertCredentialRequest>,
+) -> Result<Json<store::CredentialSummary>, (StatusCode, Json<serde_json::Value>)> {
+    store::upsert_credential(&state.db, body)
+        .map(Json)
+        .map_err(api_error)
+}
+
+async fn delete_credential(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    store::delete_credential(&state.db, &name).map_err(api_error)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn environment_overview(

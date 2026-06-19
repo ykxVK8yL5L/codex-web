@@ -1,14 +1,13 @@
 use rusqlite::OptionalExtension;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::db::Db;
 
 use super::models::{
-    CodexRuntimeSettings, NotificationTestSettings, PayloadRewriteSettings,
-    PreviewAccessSettings, RateLimitSettings, SessionCompactionSettings,
-    TokenUsageDisplaySettings, TokenUsageRetentionSettings, UpdateCodexRuntimeSettings,
-    UpdateNotificationTestSettings, UpdatePayloadRewriteSettings,
-    UpdateSessionCompactionSettings, UpdateTokenUsageDisplaySettings,
+    CodexRuntimeSettings, NotificationTestSettings, PayloadRewriteSettings, PreviewAccessSettings,
+    RateLimitSettings, SessionCompactionSettings, TokenUsageDisplaySettings,
+    TokenUsageRetentionSettings, UpdateCodexRuntimeSettings, UpdateNotificationTestSettings,
+    UpdatePayloadRewriteSettings, UpdateSessionCompactionSettings, UpdateTokenUsageDisplaySettings,
     UpdateTokenUsageRetentionSettings,
 };
 
@@ -127,7 +126,9 @@ pub fn save_token_usage_display(
 ) -> anyhow::Result<TokenUsageDisplaySettings> {
     let current = token_usage_display(db)?;
     let next = sanitize_token_usage_display(TokenUsageDisplaySettings {
-        show_message_usage: input.show_message_usage.unwrap_or(current.show_message_usage),
+        show_message_usage: input
+            .show_message_usage
+            .unwrap_or(current.show_message_usage),
         updated_at: crate::api::common::timestamp(),
     });
     save_json(db, "token_usage_display", &next)?;
@@ -174,6 +175,126 @@ pub fn save_notification_test(
     });
     save_json(db, "notification_test", &next)?;
     Ok(next)
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredCredential {
+    name: String,
+    description: String,
+    value: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialSummary {
+    pub name: String,
+    pub description: String,
+    pub configured: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpsertCredentialRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub value: Option<String>,
+}
+
+pub fn credentials(db: &Db) -> anyhow::Result<Vec<CredentialSummary>> {
+    Ok(load_credentials(db)?
+        .into_iter()
+        .map(|item| CredentialSummary {
+            name: item.name,
+            description: item.description,
+            configured: !item.value.is_empty(),
+            created_at: item.created_at,
+            updated_at: item.updated_at,
+        })
+        .collect())
+}
+
+pub fn upsert_credential(
+    db: &Db,
+    input: UpsertCredentialRequest,
+) -> anyhow::Result<CredentialSummary> {
+    let name = normalize_credential_name(&input.name)?;
+    let description = input
+        .description
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(300)
+        .collect::<String>();
+    let value = input.value.unwrap_or_default();
+    let now = crate::api::common::timestamp();
+    let mut items = load_credentials(db)?;
+    let existing_index = items.iter().position(|item| item.name == name);
+    if existing_index.is_none() && value.is_empty() {
+        anyhow::bail!("credential_value_required");
+    }
+    let item = if let Some(index) = existing_index {
+        let mut current = items[index].clone();
+        current.description = description;
+        if !value.is_empty() {
+            current.value = value;
+        }
+        current.updated_at = now;
+        items[index] = current.clone();
+        current
+    } else {
+        let item = StoredCredential {
+            name,
+            description,
+            value,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        items.push(item.clone());
+        item
+    };
+    items.sort_by(|a, b| a.name.cmp(&b.name));
+    save_json(db, "credentials", &items)?;
+    Ok(CredentialSummary {
+        name: item.name,
+        description: item.description,
+        configured: !item.value.is_empty(),
+        created_at: item.created_at,
+        updated_at: item.updated_at,
+    })
+}
+
+pub fn delete_credential(db: &Db, name: &str) -> anyhow::Result<()> {
+    let name = normalize_credential_name(name)?;
+    let mut items = load_credentials(db)?;
+    let before = items.len();
+    items.retain(|item| item.name != name);
+    if items.len() == before {
+        anyhow::bail!("credential_not_found");
+    }
+    save_json(db, "credentials", &items)
+}
+
+pub(crate) fn credential_env(db: &Db) -> anyhow::Result<Vec<(String, String)>> {
+    Ok(load_credentials(db)?
+        .into_iter()
+        .filter(|item| !item.value.is_empty())
+        .map(|item| (item.name, item.value))
+        .collect())
+}
+
+pub(crate) fn redact_secrets(value: &str, secrets: &[(String, String)]) -> String {
+    let mut output = value.to_string();
+    for (_, secret) in secrets {
+        if secret.len() >= 4 {
+            output = output.replace(secret, "********");
+        }
+    }
+    output
 }
 
 #[derive(serde::Deserialize)]
@@ -423,7 +544,9 @@ fn default_token_usage_retention() -> TokenUsageRetentionSettings {
     }
 }
 
-fn sanitize_token_usage_retention(input: TokenUsageRetentionSettings) -> TokenUsageRetentionSettings {
+fn sanitize_token_usage_retention(
+    input: TokenUsageRetentionSettings,
+) -> TokenUsageRetentionSettings {
     TokenUsageRetentionSettings {
         retention_days: clamp(input.retention_days, 0, 3650),
         updated_at: input.updated_at,
@@ -451,6 +574,30 @@ fn sanitize_notification_test(input: NotificationTestSettings) -> NotificationTe
         include_help: input.include_help,
         updated_at: input.updated_at,
     }
+}
+
+fn load_credentials(db: &Db) -> anyhow::Result<Vec<StoredCredential>> {
+    let mut items = load_json::<Vec<StoredCredential>>(db, "credentials")?.unwrap_or_default();
+    items.retain(|item| normalize_credential_name(&item.name).is_ok());
+    items.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(items)
+}
+
+fn normalize_credential_name(value: &str) -> anyhow::Result<String> {
+    let name = value.trim().to_uppercase();
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        anyhow::bail!("invalid_credential_name");
+    };
+    if !(first == '_' || first.is_ascii_uppercase()) {
+        anyhow::bail!("invalid_credential_name");
+    }
+    if name.len() > 100
+        || !chars.all(|ch| ch == '_' || ch.is_ascii_uppercase() || ch.is_ascii_digit())
+    {
+        anyhow::bail!("invalid_credential_name");
+    }
+    Ok(name)
 }
 
 fn clamp(value: i64, min: i64, max: i64) -> i64 {

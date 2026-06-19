@@ -20,6 +20,13 @@ import type { ApprovalSummary, ApiKeyDetailResponse, ApiKeyPermission, ApiKeyPer
 type TFunction = (key: TranslationKey) => string;
 type ToastTone = "info" | "success" | "error";
 const backupFilePageSize = 30;
+type CredentialSummary = {
+  name: string;
+  description: string;
+  configured: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
 
 export function SettingsPage({
   sessionToken,
@@ -90,8 +97,12 @@ export function SettingsPage({
   const [usageRetention, setUsageRetention] = useState<TokenUsageRetentionSettings | null>(null);
   const [usageDisplay, setUsageDisplay] = useState<TokenUsageDisplaySettings | null>(null);
   const [usageRetentionDays, setUsageRetentionDays] = useState("0");
-  const [settingsTab, setSettingsTab] = useState<"account" | "runtime" | "environment" | "network" | "notifications" | "maintenance" | "storage" | "backup">("account");
+  const [settingsTab, setSettingsTab] = useState<"account" | "runtime" | "credentials" | "environment" | "network" | "notifications" | "maintenance" | "storage" | "backup">("account");
   const [busy, setBusy] = useState("");
+  const [credentials, setCredentials] = useState<CredentialSummary[]>([]);
+  const [credentialForm, setCredentialForm] = useState({ name: "", description: "", value: "" });
+  const [editingCredentialName, setEditingCredentialName] = useState("");
+  const [credentialEditorOpen, setCredentialEditorOpen] = useState(false);
   const [codexRuntime, setCodexRuntime] = useState<CodexRuntimeSettings | null>(null);
   const [sandboxMode, setSandboxMode] = useState<CodexSandboxMode>("workspace-write");
   const [approvalPolicy, setApprovalPolicy] = useState<CodexApprovalPolicy>("never");
@@ -262,6 +273,12 @@ export function SettingsPage({
           providerProxyPerHour: String(settings.providerProxyPerHour),
           providerProxyMaxConcurrent: String(settings.providerProxyMaxConcurrent),
         });
+      })
+      .catch(() => undefined);
+    fetch("/api/settings/credentials", { headers })
+      .then((response) => response.ok ? response.json() : null)
+      .then((items: CredentialSummary[] | null) => {
+        if (Array.isArray(items)) setCredentials(items);
       })
       .catch(() => undefined);
     fetchNotificationTestSettings(sessionToken)
@@ -1622,6 +1639,94 @@ export function SettingsPage({
     }
   }
 
+  function editCredential(item: CredentialSummary) {
+    setEditingCredentialName(item.name);
+    setCredentialForm({ name: item.name, description: item.description, value: "" });
+    setCredentialEditorOpen(true);
+  }
+
+  function clearCredentialForm() {
+    setEditingCredentialName("");
+    setCredentialForm({ name: "", description: "", value: "" });
+    setCredentialEditorOpen(false);
+  }
+
+  function openCreateCredentialEditor() {
+    setEditingCredentialName("");
+    setCredentialForm({ name: "", description: "", value: "" });
+    setCredentialEditorOpen(true);
+  }
+
+  async function saveCredential(event: React.FormEvent) {
+    event.preventDefault();
+    const name = credentialForm.name.trim().toUpperCase();
+    if (!/^[A-Z_][A-Z0-9_]{0,99}$/.test(name)) {
+      notify(locale === "zh-CN" ? "凭证名称只能使用大写字母、数字和下划线，且不能以数字开头" : "Credential names can only use uppercase letters, numbers, and underscores, and cannot start with a number", "error");
+      return;
+    }
+    if (!editingCredentialName && !credentialForm.value) {
+      notify(locale === "zh-CN" ? "新凭证需要填写 Secret 值" : "New credentials need a secret value", "error");
+      return;
+    }
+    setBusy("credential-save");
+    try {
+      const response = await fetch("/api/settings/credentials", {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          name,
+          description: credentialForm.description,
+          value: credentialForm.value || undefined,
+        }),
+      });
+      const result = await response.json().catch(() => null) as CredentialSummary | null;
+      if (!response.ok || !result?.name) {
+        notify(locale === "zh-CN" ? "凭证保存失败" : "Failed to save credential", "error");
+        return;
+      }
+      setCredentials((current) => [result, ...current.filter((item) => item.name !== result.name)].sort((a, b) => a.name.localeCompare(b.name)));
+      clearCredentialForm();
+      notify(locale === "zh-CN" ? "凭证已保存" : "Credential saved", "success");
+    } catch {
+      notify(locale === "zh-CN" ? "凭证保存失败" : "Failed to save credential", "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function deleteCredential(item: CredentialSummary) {
+    const confirmed = await dialog.confirm({
+      title: locale === "zh-CN" ? "删除凭证" : "Delete credential",
+      message: `${item.name}\n${locale === "zh-CN" ? "删除后依赖它的任务将无法再读取该 Secret。" : "Tasks that depend on this secret will no longer be able to read it."}`,
+      confirmLabel: t("action.delete"),
+      danger: true,
+    });
+    if (!confirmed) return;
+    setBusy(`credential-delete:${item.name}`);
+    try {
+      const response = await fetch(`/api/settings/credentials/${encodeURIComponent(item.name)}`, {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) {
+        notify(locale === "zh-CN" ? "凭证删除失败" : "Failed to delete credential", "error");
+        return;
+      }
+      setCredentials((current) => current.filter((credential) => credential.name !== item.name));
+      if (editingCredentialName === item.name) clearCredentialForm();
+      notify(locale === "zh-CN" ? "凭证已删除" : "Credential deleted", "success");
+    } catch {
+      notify(locale === "zh-CN" ? "凭证删除失败" : "Failed to delete credential", "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function copyCredentialName(item: CredentialSummary) {
+    const copied = await copyText(item.name);
+    notify(copied ? t("action.copied") : t("settings.copyFailed"), copied ? "success" : "error");
+  }
+
   async function savePreviewAccessSettings(event: React.FormEvent) {
     event.preventDefault();
     setBusy("preview-access");
@@ -2300,6 +2405,7 @@ export function SettingsPage({
         <TabsList className="settings-tabs" aria-label={t("page.settings")}>
           <TabsTrigger className="settings-tab" value="account">{t("settings.tabAccount")}</TabsTrigger>
           <TabsTrigger className="settings-tab" value="runtime">{t("settings.tabRuntime")}</TabsTrigger>
+          <TabsTrigger className="settings-tab" value="credentials">{locale === "zh-CN" ? "凭证" : "Credentials"}</TabsTrigger>
           <TabsTrigger className="settings-tab" value="environment">{t("settings.tabEnvironment")}</TabsTrigger>
           <TabsTrigger className="settings-tab" value="network">{t("settings.tabNetwork")}</TabsTrigger>
           <TabsTrigger className="settings-tab" value="notifications">{t("settings.tabNotifications")}</TabsTrigger>
@@ -2494,6 +2600,90 @@ export function SettingsPage({
             <button className="ghost-button" type="submit" disabled={busy === "session-compaction"}><IconText icon={Save}>{t("action.save")}</IconText></button>
           </div>
           </form>
+        </TabsContent>
+        <TabsContent className="settings-list" value="credentials">
+          <section className="provider-card">
+            <div className="api-keys-head">
+              <div className="api-keys-head-copy">
+                <strong>{locale === "zh-CN" ? "已保存凭证" : "Saved Credentials"}</strong>
+                <span>{locale === "zh-CN" ? "页面只显示掩码，真实值不会从列表接口返回。" : "The page only shows a mask; real values are not returned by the list API."}</span>
+              </div>
+              <div className="settings-actions">
+                <span className="pill">{credentials.length}</span>
+                <button className="ghost-button" type="button" onClick={openCreateCredentialEditor}><IconText icon={Plus}>{locale === "zh-CN" ? "添加凭证" : "Add credential"}</IconText></button>
+              </div>
+            </div>
+            <div className="storage-list">
+              {!credentials.length && <div className="empty-state">{locale === "zh-CN" ? "暂无凭证" : "No credentials yet"}</div>}
+              {credentials.map((item) => (
+                <div className="storage-item" key={item.name}>
+                  <div>
+                    <strong>
+                      {item.name}
+                      <button className="icon-button-inline" type="button" title={t("action.copy")} aria-label={t("action.copy")} onClick={() => void copyCredentialName(item)}><Copy size={14} /></button>
+                    </strong>
+                    <span>{item.description || (locale === "zh-CN" ? "无说明" : "No description")}</span>
+                    <span>{locale === "zh-CN" ? "更新于" : "Updated"} {formatShortDate(item.updatedAt)}</span>
+                  </div>
+                  <div className="storage-actions">
+                    <span className="pill">{item.configured ? "••••••••" : (locale === "zh-CN" ? "未配置" : "Not configured")}</span>
+                    <button className="ghost-button" type="button" onClick={() => editCredential(item)}><IconText icon={Pencil}>{t("action.edit")}</IconText></button>
+                    <button className="ghost-button danger-button icon-only" type="button" disabled={busy === `credential-delete:${item.name}`} title={t("action.delete")} aria-label={t("action.delete")} onClick={() => void deleteCredential(item)}><IconText icon={Trash2}>{t("action.delete")}</IconText></button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+          {credentialEditorOpen && (
+            <div className="dialog-layer" role="presentation">
+              <button className="dialog-backdrop" type="button" aria-label={t("action.close")} onClick={clearCredentialForm} />
+              <form className="dialog-card api-key-editor-dialog" role="dialog" aria-modal="true" aria-label={editingCredentialName ? (locale === "zh-CN" ? "修改凭证" : "Edit credential") : (locale === "zh-CN" ? "创建凭证" : "Create credential")} onSubmit={saveCredential}>
+                <div className="dialog-head">
+                  <div>
+                    <strong>{editingCredentialName ? (locale === "zh-CN" ? "修改凭证" : "Edit Credential") : (locale === "zh-CN" ? "创建凭证" : "Create Credential")}</strong>
+                    <p>{locale === "zh-CN" ? "保存后不会回显真实值；修改时留空 Secret 值会保留原值。" : "Values are never shown after saving; leave the secret blank while editing to keep the current value."}</p>
+                  </div>
+                  <button className="drawer-close" type="button" aria-label={t("action.close")} onClick={clearCredentialForm}><X size={16} /></button>
+                </div>
+                <label>
+                  <span>{locale === "zh-CN" ? "名称" : "Name"}</span>
+                  <input
+                    name="credential-name"
+                    value={credentialForm.name}
+                    onChange={(event) => setCredentialForm((current) => ({ ...current, name: event.target.value.toUpperCase() }))}
+                    placeholder={locale === "zh-CN" ? "例如 OPENAI_API_KEY" : "e.g. OPENAI_API_KEY"}
+                    disabled={Boolean(editingCredentialName)}
+                    required
+                  />
+                </label>
+                <label>
+                  <span>{locale === "zh-CN" ? "说明" : "Description"}</span>
+                  <input
+                    name="credential-description"
+                    value={credentialForm.description}
+                    onChange={(event) => setCredentialForm((current) => ({ ...current, description: event.target.value }))}
+                    placeholder={locale === "zh-CN" ? "可选" : "Optional"}
+                  />
+                </label>
+                <label>
+                  <span>Secret</span>
+                  <input
+                    name="credential-value"
+                    type="password"
+                    autoComplete="new-password"
+                    value={credentialForm.value}
+                    onChange={(event) => setCredentialForm((current) => ({ ...current, value: event.target.value }))}
+                    placeholder={editingCredentialName ? (locale === "zh-CN" ? "新的 Secret 值，留空则不修改" : "New secret value, blank keeps current") : (locale === "zh-CN" ? "Secret 值" : "Secret value")}
+                    required={!editingCredentialName}
+                  />
+                </label>
+                <div className="dialog-actions">
+                  <button className="ghost-button" type="button" onClick={clearCredentialForm}>{t("action.cancel")}</button>
+                  <button className="ghost-button" type="submit" disabled={busy === "credential-save"}><IconText icon={editingCredentialName ? Save : Plus}>{editingCredentialName ? t("action.saveChanges") : (locale === "zh-CN" ? "创建凭证" : "Create credential")}</IconText></button>
+                </div>
+              </form>
+            </div>
+          )}
         </TabsContent>
         <TabsContent className="settings-list" value="environment">
           <section className="settings-feature-panel">

@@ -127,8 +127,8 @@ pub async fn mark_running_if_reachable(
     let Some(status) = is_preview_reachable(preview).await else {
         return Ok(None);
     };
-    let running = update_preview_status(state, &preview.id, "running")?
-        .unwrap_or_else(|| preview.clone());
+    let running =
+        update_preview_status(state, &preview.id, "running")?.unwrap_or_else(|| preview.clone());
     append_preview_log(
         state,
         &running,

@@ -15,6 +15,7 @@ use crate::{
             },
             store as session_store,
         },
+        settings::store as settings_store,
         tasks::runner,
     },
     state::AppState,
@@ -468,11 +469,13 @@ async fn start_command_run(
     let timeout = automation
         .command_timeout_seconds
         .map(|seconds| std::time::Duration::from_secs(seconds.max(1) as u64));
-    append_automation_log(&state, &session.id, &format!("[codex-web-rs] automation={} run={} cwd={}\n\n--- user ---\n{}\n\n--- agent ---\n$ {}\n", automation.id, run.id, cwd.display(), command, command)).await?;
+    let secret_env = settings_store::credential_env(&state.db).unwrap_or_default();
+    append_automation_log(&state, &session.id, &settings_store::redact_secrets(&format!("[codex-web-rs] automation={} run={} cwd={}\n\n--- user ---\n{}\n\n--- agent ---\n$ {}\n", automation.id, run.id, cwd.display(), command, command), &secret_env)).await?;
     let mut child = Command::new("/bin/sh")
         .arg("-lc")
         .arg(&command)
         .current_dir(&cwd)
+        .envs(secret_env.iter().map(|(key, value)| (key, value)))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
@@ -482,14 +485,16 @@ async fn start_command_run(
     let output = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
     if let Some(stdout) = stdout {
         let output = output.clone();
+        let redactions = secret_env.clone();
         tokio::spawn(async move {
-            collect_lines(stdout, output).await;
+            collect_lines(stdout, output, redactions).await;
         });
     }
     if let Some(stderr) = stderr {
         let output = output.clone();
+        let redactions = secret_env.clone();
         tokio::spawn(async move {
-            collect_lines(stderr, output).await;
+            collect_lines(stderr, output, redactions).await;
         });
     }
     let (kill_tx, mut kill_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
@@ -715,12 +720,17 @@ fn emit_automation_command_notification(
     );
 }
 
-async fn collect_lines<R>(reader: R, output: std::sync::Arc<tokio::sync::Mutex<String>>)
+async fn collect_lines<R>(
+    reader: R,
+    output: std::sync::Arc<tokio::sync::Mutex<String>>,
+    redactions: Vec<(String, String)>,
+)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        let line = settings_store::redact_secrets(&line, &redactions);
         let mut output = output.lock().await;
         output.push_str(&line);
         output.push('\n');

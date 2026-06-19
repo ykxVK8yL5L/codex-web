@@ -615,6 +615,23 @@ button:disabled {
   white-space: nowrap;
 }
 
+.icon-button-inline {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 6px;
+  padding: 2px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  vertical-align: middle;
+}
+
+.icon-button-inline:hover {
+  color: var(--accent);
+}
+
 .ghost-button > svg,
 .dark-button > svg,
 .ghost-button > span > svg,

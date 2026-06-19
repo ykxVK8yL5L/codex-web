@@ -3901,8 +3901,10 @@ app.use("*", createRateLimitMiddleware(
 async function runLoggedShellCommand(session: SessionSummary, command: string, cwd: string, options: { timeoutMs?: number | null; source?: string } = {}) {
   const promptHash = createHash("sha256").update(command).digest("hex").slice(0, 12);
   const runId = createTaskRun(session.id, undefined, { promptChars: command.length, promptHash });
+  const credentialEnv = options.source === "automation" ? automationCredentialEnv() : {};
+  const redactions = Object.values(credentialEnv).filter((value): value is string => typeof value === "string" && value.length >= 4);
   if (!codexTaskOutputs.has(session.id)) codexTaskOutputs.set(session.id, readCodexOutput(session.id));
-  appendCodexErrorOutput(session, "\n" + [
+  appendCodexErrorOutput(session, redactSecrets("\n" + [
     "[codex-web]",
     "mode=shell",
     `session=${session.id}`,
@@ -3910,11 +3912,13 @@ async function runLoggedShellCommand(session: SessionSummary, command: string, c
     `promptHash=${promptHash}`,
     `cwd=${cwd}`,
     `source=${options.source ?? "shell"}`,
-  ].join(" ") + "\n");
-  appendCodexErrorOutput(session, `$ /bin/zsh -lc ${JSON.stringify(command)}\n`);
+  ].join(" ") + "\n", redactions));
+  appendCodexErrorOutput(session, redactSecrets(`$ /bin/zsh -lc ${JSON.stringify(command)}\n`, redactions));
   try {
     const result = await runShellCommand(command, cwd, {
       timeoutMs: options.timeoutMs,
+      env: credentialEnv,
+      redactions,
       onChild: (child) => {
         shellTaskProcesses.set(session.id, child);
         updateTaskRunPid(runId, child.pid);
@@ -3922,17 +3926,45 @@ async function runLoggedShellCommand(session: SessionSummary, command: string, c
     });
     const stopped = shellTaskStopRequested.has(session.id) || Boolean((db.prepare("select stop_requested from task_runs where id = ?").get(runId) as { stop_requested?: number } | undefined)?.stop_requested);
     const timeoutSeconds = options.timeoutMs === null || options.timeoutMs === undefined ? null : Math.round(options.timeoutMs / 1000);
-    appendCodexErrorOutput(session, `${formatShellCommandOutput(result, timeoutSeconds)}${stopped ? "\nStopped: true" : ""}\n`);
+    const safeResult = redactShellCommandResult(result, redactions);
+    appendCodexErrorOutput(session, `${formatShellCommandOutput(safeResult, timeoutSeconds)}${stopped ? "\nStopped: true" : ""}\n`);
     const status: TaskRunSummary["status"] = stopped ? "stopped" : result.exitCode === 0 && !result.timedOut ? "done" : "failed";
     finishTaskRunById(runId, status, result.exitCode, stopped ? "user_stopped" : result.timedOut ? "shell_command_timed_out" : undefined);
     const output = codexTaskOutputs.get(session.id);
     if (output) output.exitCode = result.exitCode;
     writeTaskExitCode(session.id, result.exitCode);
-    return { ...result, stopped };
+    return { ...safeResult, stopped };
   } finally {
     shellTaskProcesses.delete(session.id);
     shellTaskStopRequested.delete(session.id);
   }
+}
+
+function automationCredentialEnv(): NodeJS.ProcessEnv {
+  const row = db.prepare("select value from app_settings where key = 'credentials'").get() as { value?: string } | undefined;
+  if (!row?.value) return {};
+  try {
+    const items = JSON.parse(row.value) as Array<{ name?: unknown; value?: unknown }>;
+    if (!Array.isArray(items)) return {};
+    return Object.fromEntries(items
+      .map((item) => [String(item.name ?? ""), typeof item.value === "string" ? item.value : ""] as const)
+      .filter(([name, value]) => /^[A-Z_][A-Z0-9_]{0,99}$/.test(name) && Boolean(value)));
+  } catch {
+    return {};
+  }
+}
+
+function redactSecrets(value: string, secrets: string[]) {
+  return secrets.reduce((text, secret) => secret.length >= 4 ? text.split(secret).join("********") : text, value);
+}
+
+function redactShellCommandResult<T extends { command: string; stdout: string; stderr: string }>(result: T, secrets: string[]): T {
+  return {
+    ...result,
+    command: redactSecrets(result.command, secrets),
+    stdout: redactSecrets(result.stdout, secrets),
+    stderr: redactSecrets(result.stderr, secrets),
+  };
 }
 
 function groupContextForRoom(roomRow: Record<string, unknown>) {
@@ -5434,9 +5466,13 @@ function startCodexTask(
   args.push("--");
   args.push(managedPrompt);
   const env = managedChildEnv();
+  const sourceType = contextInput?.sourceType ?? (session.conversationType === "agent" ? "agent-chat" : "session");
+  const credentialEnv = sourceType === "automation" || session.conversationType === "automation" ? automationCredentialEnv() : {};
+  const redactions = Object.values(credentialEnv).filter((value): value is string => typeof value === "string" && value.length >= 4);
+  Object.assign(env, credentialEnv);
   if (provider?.apiKey) env.OPENAI_API_KEY = provider.apiKey;
   if (provider?.baseUrl && provider.kind !== "openai-compatible-chat") env.OPENAI_BASE_URL = provider.baseUrl;
-  appendCodexErrorOutput(session, [
+  appendCodexErrorOutput(session, redactSecrets([
     "[codex-web]",
     `mode=${useResume ? "resume" : "exec"}`,
     `session=${session.id}`,
@@ -5445,11 +5481,11 @@ function startCodexTask(
     `promptChars=${managedPrompt.length}`,
     `promptHash=${managedPromptHash}`,
     `cwd=${cwd}`,
-    `source=${contextInput?.sourceType ?? (session.conversationType === "agent" ? "agent-chat" : "session")}`,
+    `source=${sourceType}`,
     agentId ? `agent=${agentId}` : "",
     (contextInput?.roomId ?? session.roomId) ? `room=${contextInput?.roomId ?? session.roomId}` : "",
-  ].filter(Boolean).join(" ") + "\n");
-  appendCodexErrorOutput(session, `$ codex ${redactCodexArgs(args, managedPrompt).map((arg) => JSON.stringify(arg)).join(" ")}\n`);
+  ].filter(Boolean).join(" ") + "\n", redactions));
+  appendCodexErrorOutput(session, redactSecrets(`$ codex ${redactCodexArgs(args, managedPrompt).map((arg) => JSON.stringify(arg)).join(" ")}\n`, redactions));
   const runner = fork(codexRunnerPath, [], {
     cwd,
     env,

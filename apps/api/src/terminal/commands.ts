@@ -9,20 +9,21 @@ type TerminalCommandRuntimeDeps = {
 export function createTerminalCommandRuntime(deps: TerminalCommandRuntimeDeps) {
   const { managedChildEnv, toTerminalPath } = deps;
 
-function runShellCommand(command: string, cwd: string, options: { timeoutMs?: number | null; onChild?: (child: ChildProcess) => void } = {}): Promise<TerminalCommandResponse> {
+function runShellCommand(command: string, cwd: string, options: { timeoutMs?: number | null; onChild?: (child: ChildProcess) => void; env?: NodeJS.ProcessEnv; redactions?: string[] } = {}): Promise<TerminalCommandResponse> {
   const startedAt = Date.now();
   return new Promise((resolveCommand) => {
     let stdout = "";
     let stderr = "";
     let timedOut = false;
-    const child = spawnProcess("/bin/zsh", ["-lc", command], { cwd, env: managedChildEnv() });
+    const child = spawnProcess("/bin/zsh", ["-lc", command], { cwd, env: { ...managedChildEnv(), ...(options.env ?? {}) } });
     options.onChild?.(child);
+    const redact = (value: string) => (options.redactions ?? []).reduce((text, secret) => secret.length >= 4 ? text.split(secret).join("********") : text, value);
     const trimOutput = (value: string) => value.slice(-64 * 1024);
     child.stdout?.on("data", (chunk: Buffer) => {
-      stdout = trimOutput(stdout + chunk.toString("utf8"));
+      stdout = trimOutput(stdout + redact(chunk.toString("utf8")));
     });
     child.stderr?.on("data", (chunk: Buffer) => {
-      stderr = trimOutput(stderr + chunk.toString("utf8"));
+      stderr = trimOutput(stderr + redact(chunk.toString("utf8")));
     });
     const timeoutMs = options.timeoutMs === undefined ? 30_000 : options.timeoutMs;
     const timeout = timeoutMs === null ? null : setTimeout(() => {
