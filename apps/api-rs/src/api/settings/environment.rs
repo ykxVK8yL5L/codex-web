@@ -320,24 +320,77 @@ pub fn restore_missing(
     let preview = restore_preview(db, input)?;
     let mut success = 0usize;
     let mut failed = 0usize;
+    let mut overview = overview(db)?;
+    let now = timestamp();
     for item in preview.items.iter().filter(|item| item.action == "install") {
-        let Some(command) = item
-            .command
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        else {
+        if item.kind == "package" {
+            let Some(package_id) = item.package_record_id.as_deref() else {
+                continue;
+            };
+            let Some(pkg) = overview
+                .package_records
+                .iter()
+                .find(|pkg| pkg.id == package_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let Some(command) = package_install_command(
+                &pkg.manager,
+                &pkg.package_name,
+                pkg.version_spec.as_deref(),
+            ) else {
+                continue;
+            };
+            let installed = matches!(run_package_command(&command), Ok(out) if out.status.success());
+            if let Some(record) = overview
+                .package_records
+                .iter_mut()
+                .find(|record| record.id == package_id)
+            {
+                record.status = Some(if installed { "installed" } else { "failed" }.to_string());
+                record.persisted = installed;
+                record.updated_at = Some(now.clone());
+            }
+            if installed {
+                success += 1;
+            } else {
+                failed += 1;
+            }
             continue;
-        };
-        let status = command_with_mise_env("/bin/sh")
-            .arg("-lc")
-            .arg(command)
-            .status();
-        match status {
-            Ok(status) if status.success() => success += 1,
-            _ => failed += 1,
+        }
+
+        if item.kind == "tool" {
+            if let Some(tool_id) = item.tool_record_id.as_deref() {
+                if let Some(tool) = overview.tools.iter_mut().find(|tool| tool.id == tool_id) {
+                    let target = format!("{}@{}", tool.tool, tool.requested_version);
+                    let installed =
+                        matches!(run_mise_use_global(&tool.tool, &target), Ok(out) if out.status.success());
+                    let detected_version = detect_tool_version(&tool.tool);
+                    tool.detected_version = detected_version.clone();
+                    tool.status = if installed {
+                        if detected_version
+                            .as_deref()
+                            .map(|value| !value.contains(&tool.requested_version))
+                            .unwrap_or(false)
+                        {
+                            "version_mismatch".to_string()
+                        } else {
+                            "installed".to_string()
+                        }
+                    } else {
+                        "missing".to_string()
+                    };
+                    tool.updated_at = now.clone();
+                    if installed {
+                        success += 1;
+                    } else {
+                        failed += 1;
+                    }
+                }
+            }
         }
     }
-    let mut overview = overview(db)?;
     let status = if failed == 0 {
         "success"
     } else if success > 0 {
@@ -354,11 +407,11 @@ pub fn restore_missing(
                 "Restored {success}/{} missing environment items.",
                 success + failed
             ),
-            created_at: timestamp(),
+            created_at: now.clone(),
         },
     );
     overview.restore_runs.truncate(20);
-    overview.updated_at = timestamp();
+    overview.updated_at = now;
     save_json(db, SETTING_KEY, &overview)?;
     Ok(overview)
 }
@@ -819,7 +872,7 @@ pub fn install_package(
     else {
         anyhow::bail!("environment_package_manager_not_supported");
     };
-    let result = run_mise_exec(&command.args);
+    let result = run_package_command(&command);
     let success = matches!(&result, Ok(out) if out.status.success());
     let now = timestamp();
     let record = EnvironmentPackageRecord {
@@ -893,7 +946,7 @@ pub fn uninstall_package(
     let Some(command) = package_uninstall_command(&manager, &pkg.package_name) else {
         anyhow::bail!("environment_package_manager_not_supported");
     };
-    let result = run_mise_exec(&command.args);
+    let result = run_package_command(&command);
     let success = matches!(&result, Ok(out) if out.status.success());
     let now = timestamp();
     if success {
@@ -1027,7 +1080,7 @@ pub fn bulk_action(
                 ) else {
                     continue;
                 };
-                if matches!(run_mise_exec(&command.args), Ok(out) if out.status.success()) {
+                if matches!(run_package_command(&command), Ok(out) if out.status.success()) {
                     success_count += 1;
                     if let Some(item) = overview
                         .package_records
@@ -1280,6 +1333,7 @@ fn random_hex(size: usize) -> String {
 // ---------------------------------------------------------------------------
 
 struct PackageCommand {
+    command: String,
     args: Vec<String>,
     text: String,
 }
@@ -1415,11 +1469,25 @@ fn is_mise_python_attestation_failure(output: &std::process::Output) -> bool {
         || text.contains("attestation verification")
 }
 
-/// Run `mise <args>` (args already include the `exec -- ...` prefix where needed).
-fn run_mise_exec(args: &[String]) -> std::io::Result<std::process::Output> {
-    command_with_mise_env(resolve_mise_command())
-        .args(args)
+fn run_package_command(command: &PackageCommand) -> std::io::Result<std::process::Output> {
+    command_with_mise_env(&command.command)
+        .args(&command.args)
         .output()
+}
+
+fn package_command_from_resolved(
+    resolved: ResolvedCommandOwned,
+    args: Vec<String>,
+) -> PackageCommand {
+    let command = resolved.command;
+    let mut args_prefix = resolved.args_prefix;
+    let text_prefix = resolved.text_prefix;
+    args_prefix.extend(args);
+    PackageCommand {
+        command,
+        text: format!("{text_prefix} {}", args_prefix.join(" ")),
+        args: args_prefix,
+    }
 }
 
 fn package_install_command(
@@ -1434,56 +1502,124 @@ fn package_install_command(
         Some(version) => format!("{package_name}@{version}"),
         None => package_name.to_string(),
     };
-    let args: Vec<&str> = match manager {
-        "uv" => vec!["exec", "--", "uv", "tool", "install", &spec],
-        "pip" => vec!["exec", "--", "python3", "-m", "pip", "install", &spec],
-        "bun" => vec!["exec", "--", "bun", "add", "-g", &spec],
-        "go-install" => vec!["exec", "--", "go", "install", &spec],
-        "cargo" => vec!["exec", "--", "cargo", "install", package_name],
-        "gem" => vec!["exec", "--", "gem", "install", &spec],
-        "composer" => vec!["exec", "--", "composer", "global", "require", &spec],
-        "pnpm" => vec!["exec", "--", "pnpm", "add", "-g", &spec],
-        "npm" => vec!["exec", "--", "npm", "install", "-g", &spec],
+    match manager {
+        "pip" => Some(package_command_from_resolved(
+            resolve_pip_command()?,
+            vec!["install".to_string(), spec],
+        )),
+        "uv" => Some(package_command_from_resolved(
+            resolve_tool_command("uv")?,
+            vec!["tool".to_string(), "install".to_string(), spec],
+        )),
+        "bun" => Some(package_command_from_resolved(
+            resolve_tool_command("bun")?,
+            vec!["add".to_string(), "-g".to_string(), spec],
+        )),
+        "go-install" => {
+            let go_spec = if version_spec
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some()
+            {
+                spec
+            } else {
+                format!("{package_name}@latest")
+            };
+            Some(package_command_from_resolved(
+                resolve_tool_command("go")?,
+                vec!["install".to_string(), go_spec],
+            ))
+        }
+        "cargo" => Some(package_command_from_resolved(
+            resolve_tool_command("cargo")?,
+            vec!["install".to_string(), package_name.to_string()],
+        )),
+        "gem" => Some(package_command_from_resolved(
+            resolve_tool_command("gem")?,
+            vec!["install".to_string(), spec],
+        )),
+        "composer" => Some(package_command_from_resolved(
+            resolve_tool_command("composer")?,
+            vec!["global".to_string(), "require".to_string(), spec],
+        )),
+        "pnpm" => Some(package_command_from_resolved(
+            resolve_tool_command("pnpm")?,
+            vec!["add".to_string(), "-g".to_string(), spec],
+        )),
+        "npm" => Some(package_command_from_resolved(
+            resolve_tool_command("npm")?,
+            vec!["install".to_string(), "-g".to_string(), spec],
+        )),
         _ => return None,
-    };
-    let args: Vec<String> = args.into_iter().map(ToString::to_string).collect();
-    let text = format!("mise {}", args.join(" "));
-    Some(PackageCommand { args, text })
+    }
 }
 
 fn package_uninstall_command(manager: &str, package_name: &str) -> Option<PackageCommand> {
-    let args: Vec<&str> = match manager {
-        "uv" => vec!["exec", "--", "uv", "tool", "uninstall", package_name],
-        "pip" => vec![
-            "exec",
-            "--",
-            "python3",
-            "-m",
-            "pip",
-            "uninstall",
-            "-y",
-            package_name,
-        ],
-        "bun" => vec!["exec", "--", "bun", "remove", "-g", package_name],
-        "cargo" => vec!["exec", "--", "cargo", "uninstall", package_name],
-        "gem" => vec![
-            "exec",
-            "--",
-            "gem",
-            "uninstall",
-            package_name,
-            "-a",
-            "-x",
-            "-I",
-        ],
-        "composer" => vec!["exec", "--", "composer", "global", "remove", package_name],
-        "pnpm" => vec!["exec", "--", "pnpm", "remove", "-g", package_name],
-        "npm" => vec!["exec", "--", "npm", "uninstall", "-g", package_name],
+    match manager {
+        "pip" => Some(package_command_from_resolved(
+            resolve_pip_command()?,
+            vec![
+                "uninstall".to_string(),
+                "-y".to_string(),
+                package_name.to_string(),
+            ],
+        )),
+        "uv" => Some(package_command_from_resolved(
+            resolve_tool_command("uv")?,
+            vec![
+                "tool".to_string(),
+                "uninstall".to_string(),
+                package_name.to_string(),
+            ],
+        )),
+        "bun" => Some(package_command_from_resolved(
+            resolve_tool_command("bun")?,
+            vec![
+                "remove".to_string(),
+                "-g".to_string(),
+                package_name.to_string(),
+            ],
+        )),
+        "cargo" => Some(package_command_from_resolved(
+            resolve_tool_command("cargo")?,
+            vec!["uninstall".to_string(), package_name.to_string()],
+        )),
+        "gem" => Some(package_command_from_resolved(
+            resolve_tool_command("gem")?,
+            vec![
+                "uninstall".to_string(),
+                package_name.to_string(),
+                "-a".to_string(),
+                "-x".to_string(),
+                "-I".to_string(),
+            ],
+        )),
+        "composer" => Some(package_command_from_resolved(
+            resolve_tool_command("composer")?,
+            vec![
+                "global".to_string(),
+                "remove".to_string(),
+                package_name.to_string(),
+            ],
+        )),
+        "pnpm" => Some(package_command_from_resolved(
+            resolve_tool_command("pnpm")?,
+            vec![
+                "remove".to_string(),
+                "-g".to_string(),
+                package_name.to_string(),
+            ],
+        )),
+        "npm" => Some(package_command_from_resolved(
+            resolve_tool_command("npm")?,
+            vec![
+                "uninstall".to_string(),
+                "-g".to_string(),
+                package_name.to_string(),
+            ],
+        )),
         _ => return None,
-    };
-    let args: Vec<String> = args.into_iter().map(ToString::to_string).collect();
-    let text = format!("mise {}", args.join(" "));
-    Some(PackageCommand { args, text })
+    }
 }
 
 /// Mirrors listEnvironmentPackageManagers, keyed by tool ecosystem. Detected version is resolved

@@ -2049,6 +2049,43 @@ export function SettingsPage({
     }
   }
 
+  async function reinstallEnvironmentTool(tool: EnvironmentToolRecord) {
+    if (tool.source !== "mise") return;
+    const confirmed = await dialog.confirm({
+      title: t("settings.environmentToolReinstallConfirm"),
+      message: `${tool.tool} ${tool.requestedVersion}\n${t("settings.environmentToolReinstallHint")}`,
+      confirmLabel: t("settings.environmentToolReinstall"),
+    });
+    if (!confirmed) return;
+    setBusy(`environment-tool-reinstall:${tool.id}`);
+    try {
+      const body: InstallEnvironmentToolRequest = {
+        tool: tool.tool,
+        version: tool.requestedVersion,
+        scope: tool.scope,
+        autoRestore: tool.autoRestore,
+        notes: tool.notes ?? "",
+      };
+      const response = await fetch("/api/settings/environment/tools/install", {
+        method: "POST",
+        headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const result = await response.json().catch(() => null) as EnvironmentOverview | { error?: string; detail?: string; overview?: EnvironmentOverview } | null;
+      if (!response.ok) {
+        if (result && "overview" in result && result.overview) setEnvironmentOverview(result.overview);
+        notify(t("settings.environmentToolReinstallFailed"), "error");
+        return;
+      }
+      setEnvironmentOverview(result as EnvironmentOverview);
+      notify(t("settings.environmentToolReinstalled").replace("{tool}", `${tool.tool}@${tool.requestedVersion}`), "success");
+    } catch {
+      notify(t("settings.environmentToolReinstallFailed"), "error");
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function setEnvironmentToolDefault(tool: EnvironmentToolRecord) {
     setBusy(`environment-tool-default:${tool.id}`);
     try {
@@ -2965,7 +3002,10 @@ export function SettingsPage({
                             )}
                             <button className="ghost-button icon-only" type="button" disabled={busy === `environment-packages:${tool.id}`} title={t("settings.environmentPackageManage")} aria-label={t("settings.environmentPackageManage")} onClick={() => void openEnvironmentPackagePanel(tool)}><IconText icon={Boxes}>{t("settings.environmentPackageManage")}</IconText></button>
                             {tool.source === "mise" && (
-                              <button className="ghost-button danger-button icon-only" type="button" disabled={busy === `environment-tool-uninstall:${tool.id}`} title={t("settings.environmentToolUninstall")} aria-label={t("settings.environmentToolUninstall")} onClick={() => void uninstallEnvironmentTool(tool)}><IconText icon={PackageX}>{t("settings.environmentToolUninstall")}</IconText></button>
+                              <>
+                                <button className="ghost-button icon-only" type="button" disabled={busy === `environment-tool-reinstall:${tool.id}`} title={t("settings.environmentToolReinstall")} aria-label={t("settings.environmentToolReinstall")} onClick={() => void reinstallEnvironmentTool(tool)}><IconText icon={RefreshCw}>{t("settings.environmentToolReinstall")}</IconText></button>
+                                <button className="ghost-button danger-button icon-only" type="button" disabled={busy === `environment-tool-uninstall:${tool.id}`} title={t("settings.environmentToolUninstall")} aria-label={t("settings.environmentToolUninstall")} onClick={() => void uninstallEnvironmentTool(tool)}><IconText icon={PackageX}>{t("settings.environmentToolUninstall")}</IconText></button>
+                              </>
                             )}
                             <button className="ghost-button danger-button icon-only" type="button" disabled={busy === `environment-tool-delete:${tool.id}`} title={t("action.delete")} aria-label={t("action.delete")} onClick={() => void deleteEnvironmentToolRecord(tool)}><IconText icon={Trash2}>{t("action.delete")}</IconText></button>
                           </div>
