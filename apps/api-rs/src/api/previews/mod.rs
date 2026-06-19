@@ -7,7 +7,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -224,6 +224,10 @@ async fn remove(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<models::PreviewDeleteResponse>, (StatusCode, Json<serde_json::Value>)> {
+    if store::get(&state.db, &id).map_err(api_error)?.is_none() {
+        return Err(error(StatusCode::NOT_FOUND, "preview_not_found"));
+    }
+    let _ = runtime::stop(&state, &id).map_err(api_error)?;
     if store::delete(&state.db, &id).map_err(api_error)? {
         Ok(Json(models::PreviewDeleteResponse { ok: true }))
     } else {

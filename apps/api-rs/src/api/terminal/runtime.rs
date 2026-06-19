@@ -240,6 +240,9 @@ pub async fn run_command(command: &str, cwd: &str) -> TerminalSessionCommandResu
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (key, value) in managed_child_env() {
+        process.env(key, value);
+    }
 
     let child = match process.spawn() {
         Ok(child) => child,

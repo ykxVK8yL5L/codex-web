@@ -56,14 +56,25 @@ pub async fn start(state: AppState, preview: PreviewRecord) -> anyhow::Result<Pr
             cwd.display()
         ),
     )?;
-    let mut child = Command::new("/bin/sh")
+    let mut command = Command::new("/bin/sh");
+    command
         .arg("-lc")
         .arg(&rendered)
         .current_dir(&cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .stdin(Stdio::null())
-        .spawn()?;
+        .stdin(Stdio::null());
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let mut child = command.spawn()?;
     let (kill_tx, mut kill_rx) = tokio::sync::mpsc::unbounded_channel();
     state.previews.insert(PreviewHandle {
         preview_id: preview.id.clone(),
@@ -95,8 +106,7 @@ pub async fn start(state: AppState, preview: PreviewRecord) -> anyhow::Result<Pr
     tokio::spawn(async move {
         let exit_status = tokio::select! {
             _ = kill_rx.recv() => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                terminate_preview_child(&mut child).await;
                 None
             }
             result = child.wait() => result.ok().and_then(|status| status.code()),
@@ -105,6 +115,34 @@ pub async fn start(state: AppState, preview: PreviewRecord) -> anyhow::Result<Pr
         settle_process_exit(wait_state, wait_preview, exit_status).await;
     });
     Ok(starting)
+}
+
+async fn terminate_preview_child(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            signal_process_group(pid, libc::SIGTERM);
+            if tokio::time::timeout(std::time::Duration::from_millis(2500), child.wait())
+                .await
+                .is_err()
+            {
+                signal_process_group(pid, libc::SIGKILL);
+                let _ = child.wait().await;
+            }
+            return;
+        }
+    }
+
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+#[cfg(unix)]
+fn signal_process_group(pid: u32, signal: libc::c_int) {
+    let pgid = -(pid as libc::pid_t);
+    unsafe {
+        let _ = libc::kill(pgid, signal);
+    }
 }
 
 pub fn stop(state: &AppState, preview_id: &str) -> anyhow::Result<Option<PreviewRecord>> {

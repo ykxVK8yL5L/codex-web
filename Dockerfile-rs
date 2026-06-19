@@ -28,8 +28,13 @@ RUN cargo build --release --manifest-path apps/api-rs/Cargo.toml
 FROM node:24-bookworm-slim AS runtime
 
 ENV NODE_ENV=production
+ENV HOME=/root
+ENV MISE_BIN=/usr/local/bin/mise
+ENV MISE_DATA_DIR=/root/.local/share/mise
+ENV MISE_CONFIG_DIR=/root/.config/mise
+ENV MISE_CACHE_DIR=/root/.cache/mise
 ENV MISE_SHIMS_DIR="/root/.local/share/mise/shims"
-ENV PATH="$MISE_SHIMS_DIR:/root/.local/bin:$PATH"
+ENV PATH="$MISE_SHIMS_DIR:/root/.local/bin:/usr/local/bin:$PATH"
 ENV HOST=127.0.0.1
 ENV PORT=8787
 ENV CODEX_WEB_DATA_DIR=/app/data
@@ -39,9 +44,18 @@ WORKDIR /app
 RUN apt-get update \
   && apt-get install -y --no-install-recommends bash ca-certificates curl git libssl3 nginx procps rclone \
   && rm -rf /var/lib/apt/lists/* \
-  && bash -lc 'set -euo pipefail; tmp="$(mktemp)"; trap "rm -f \"$tmp\"" EXIT; curl -fsSL https://mise.run -o "$tmp"; MISE_INSTALL_PATH=/usr/local/bin/mise sh "$tmp"; /usr/local/bin/mise --version' \
-  && printf '%s\n' 'export MISE_SHIMS_DIR="${MISE_SHIMS_DIR:-$HOME/.local/share/mise/shims}"' 'case ":$PATH:" in *":$MISE_SHIMS_DIR:"*) ;; *) export PATH="$MISE_SHIMS_DIR:$HOME/.local/bin:$PATH" ;; esac' > /etc/profile.d/codex-web-mise.sh \
-  && printf '%s\n' 'export MISE_SHIMS_DIR="${MISE_SHIMS_DIR:-$HOME/.local/share/mise/shims}"' 'case ":$PATH:" in *":$MISE_SHIMS_DIR:"*) ;; *) export PATH="$MISE_SHIMS_DIR:$HOME/.local/bin:$PATH" ;; esac' >> /etc/bash.bashrc \
+  && mkdir -p "$MISE_DATA_DIR" "$MISE_CONFIG_DIR" "$MISE_CACHE_DIR" /root/.local/bin \
+  && bash -lc 'set -euo pipefail; tmp="$(mktemp)"; trap "rm -f \"$tmp\"" EXIT; curl -fsSL https://mise.run -o "$tmp"; MISE_INSTALL_PATH="$MISE_BIN" sh "$tmp"; "$MISE_BIN" --version; "$MISE_BIN" reshim || true' \
+  && printf '%s\n' \
+      'export HOME="${HOME:-/root}"' \
+      'export MISE_BIN="${MISE_BIN:-/usr/local/bin/mise}"' \
+      'export MISE_DATA_DIR="${MISE_DATA_DIR:-$HOME/.local/share/mise}"' \
+      'export MISE_CONFIG_DIR="${MISE_CONFIG_DIR:-$HOME/.config/mise}"' \
+      'export MISE_CACHE_DIR="${MISE_CACHE_DIR:-$HOME/.cache/mise}"' \
+      'export MISE_SHIMS_DIR="${MISE_SHIMS_DIR:-$MISE_DATA_DIR/shims}"' \
+      'case ":$PATH:" in *":$MISE_SHIMS_DIR:"*) ;; *) export PATH="$MISE_SHIMS_DIR:$HOME/.local/bin:/usr/local/bin:$PATH" ;; esac' \
+      > /etc/profile.d/codex-web-mise.sh \
+  && cat /etc/profile.d/codex-web-mise.sh >> /etc/bash.bashrc \
   && npm install -g @openai/codex pm2 \
   && mkdir -p /app/data /app/restore-backups \
   && rm -f /etc/nginx/sites-enabled/default
@@ -49,8 +63,9 @@ RUN apt-get update \
 COPY --from=build /app/apps/api-rs/target/release/codex-web-rs /usr/local/bin/codex-web-rs
 COPY docker/nginx-rs.conf /etc/nginx/conf.d/default.conf
 COPY docker/start-rs.sh /usr/local/bin/codex-web-start-rs
+COPY docker/sync.sh /usr/local/bin/codex-web-sync
 
-RUN chmod +x /usr/local/bin/codex-web-start-rs
+RUN chmod +x /usr/local/bin/codex-web-start-rs /usr/local/bin/codex-web-sync
 
 VOLUME ["/app/data"]
 
