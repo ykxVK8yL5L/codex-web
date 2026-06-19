@@ -421,14 +421,14 @@ pub fn automation_ids_with_due_queued_runs(db: &Db, now: &str) -> anyhow::Result
     Ok(rows)
 }
 
-pub fn latest_run_for_session(
+pub fn running_run_for_session(
     db: &Db,
     session_id: &str,
 ) -> anyhow::Result<Option<AutomationRunSummary>> {
     let connection = db.open_read_write()?;
     ensure_runs_schema(&connection)?;
     Ok(connection.query_row(
-        "select id, automation_id, session_id, status, exit_code, started_at, finished_at from automation_runs where session_id = ? order by started_at desc, id desc limit 1",
+        "select id, automation_id, session_id, status, exit_code, started_at, finished_at from automation_runs where session_id = ? and status = 'running' order by started_at desc, id desc limit 1",
         [session_id],
         row_to_run,
     ).optional()?)

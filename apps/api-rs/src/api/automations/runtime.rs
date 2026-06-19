@@ -295,12 +295,9 @@ pub fn finish_run_for_session(
     exit_code: Option<i64>,
     stopped: bool,
 ) -> anyhow::Result<()> {
-    let Some(run) = store::latest_run_for_session(&state.db, session_id)? else {
+    let Some(run) = store::running_run_for_session(&state.db, session_id)? else {
         return Ok(());
     };
-    if run.status != "running" {
-        return Ok(());
-    }
     let status = if stopped {
         "stopped"
     } else if exit_code == Some(0) {
@@ -544,10 +541,10 @@ async fn start_command_run(
                 reply_to_message_id: None,
             },
         );
-        let status = if exit_code == Some(0) {
-            "done"
-        } else if stopped {
+        let status = if stopped {
             "stopped"
+        } else if exit_code == Some(0) {
+            "done"
         } else {
             "failed"
         };
