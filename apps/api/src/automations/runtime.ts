@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { AutomationRunSummary, AutomationSummary, SessionSummary } from "@codex-web/protocol";
 
 type AutomationRuntimeDeps = Record<string, any>;
+const processStartupKey = `process:${process.pid}:${new Date().toISOString()}`;
 
 export function createAutomationRuntime(deps: AutomationRuntimeDeps) {
   const {
@@ -258,12 +259,35 @@ function checkScheduledAutomations() {
 function runStartupAutomations() {
   for (const automation of appData.automations) {
     if (automation.status !== "active" || automation.schedule.trim().toLowerCase() !== "startup") continue;
+    if (automationHasActiveRun(automation.id)) continue;
+    if (!claimStartupAutomationRun(automation.id, processStartupKey)) continue;
     try {
       runAutomationNow(automation);
     } catch (error) {
       console.error("automation startup failed", automation.id, error);
     }
   }
+}
+
+function automationHasActiveRun(automationId: string) {
+  const row = db.prepare("select 1 from automation_runs where automation_id = ? and status in ('queued', 'running') limit 1").get(automationId) as Record<string, unknown> | undefined;
+  return Boolean(row);
+}
+
+function claimStartupAutomationRun(automationId: string, startupKey: string) {
+  db.prepare(`
+    create table if not exists automation_startup_claims (
+      automation_id text not null,
+      startup_key text not null,
+      claimed_at text not null,
+      primary key (automation_id, startup_key)
+    )
+  `).run();
+  const result = db.prepare(`
+    insert or ignore into automation_startup_claims (automation_id, startup_key, claimed_at)
+    values (?, ?, ?)
+  `).run(automationId, startupKey, new Date().toISOString());
+  return result.changes > 0;
 }
 
 function emitAutomationCommandNotification(automation: AutomationSummary, session: SessionSummary, result: { exitCode: number | null; timedOut?: boolean; stopped?: boolean; command?: string; cwd?: string; stdout?: string; stderr?: string; durationMs?: number }) {

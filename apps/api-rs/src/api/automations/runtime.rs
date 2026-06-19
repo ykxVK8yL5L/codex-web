@@ -319,41 +319,26 @@ pub fn check_scheduled_work_threaded(state: AppState) {
     let now = time::OffsetDateTime::now_utc();
     for automation in store::list(&state.db).unwrap_or_default() {
         if store::should_run_now(&state.db, &automation, now).unwrap_or(false) {
-            std::thread::spawn({
-                let state = state.clone();
-                move || {
-                    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        runtime.block_on(async move {
-                            let _ = run_now(state, automation).await;
-                        });
-                    }
-                }
-            });
+            start_automation_run_threaded(state.clone(), automation, None);
         }
     }
 }
 
 pub fn run_startup_automations_threaded(state: AppState) {
+    let startup_key = process_startup_key();
     for automation in store::list(&state.db).unwrap_or_default() {
         if automation.status == "active"
             && automation.schedule.trim().eq_ignore_ascii_case("startup")
         {
-            std::thread::spawn({
-                let state = state.clone();
-                move || {
-                    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        runtime.block_on(async move {
-                            let _ = run_now(state, automation).await;
-                        });
-                    }
-                }
-            });
+            if store::has_active_run(&state.db, &automation.id).unwrap_or(false) {
+                continue;
+            }
+            if !store::claim_startup_run(&state.db, &automation.id, &startup_key)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            start_automation_run_threaded(state.clone(), automation, None);
         }
     }
 }
@@ -387,13 +372,35 @@ fn start_next_queued_run_threaded(state: AppState, automation_id: String) {
     if automation.status != "active" {
         return;
     }
+    start_automation_run_threaded(state, automation, Some(queued.id));
+}
+
+fn start_automation_run_threaded(
+    state: AppState,
+    automation: AutomationSummary,
+    queued_run_id: Option<String>,
+) {
     std::thread::spawn(move || {
         if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         {
             runtime.block_on(async move {
-                let _ = run_now_with_queued(state, automation, Some(queued.id)).await;
+                let response = match queued_run_id {
+                    Some(queued_run_id) => {
+                        run_now_with_queued(state.clone(), automation, Some(queued_run_id)).await
+                    }
+                    None => run_now(state.clone(), automation).await,
+                };
+                let Ok(response) = response else {
+                    return;
+                };
+                if response.automation_run_status != "running" {
+                    return;
+                }
+                while state.tasks.get(&response.session.id).is_some() {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
             });
         }
     });
@@ -554,9 +561,9 @@ async fn start_command_run(
             "failed"
         };
         let session_status = if status == "done" {
-            "completed".to_string()
+            "done".to_string()
         } else {
-            "paused".to_string()
+            "interrupted".to_string()
         };
         let _ = finish_run_for_session(&state, &session.id, exit_code, stopped);
         let _ = write_automation_meta(&state, &session.id, exit_code, status).await;
@@ -594,6 +601,11 @@ async fn start_command_run(
         }
     });
     Ok(())
+}
+
+fn process_startup_key() -> String {
+    let started_at = crate::api::common::timestamp();
+    format!("process:{}:{started_at}", std::process::id())
 }
 
 struct CommandWaitOutcome {

@@ -215,7 +215,6 @@ export function registerPreviewRoutes(app: Hono, deps: PreviewRoutesDeps) {
   app.post("/api/previews/:id/start", async (c) => {
     const preview = deps.previews.get(c.req.param("id"));
     if (!preview) return c.json({ error: "preview_not_found" }, 404);
-    if (preview.status === "running" || preview.status === "starting") return c.json(deps.publicPreview(preview));
     const detected = await deps.markPreviewRunningIfReachable(preview);
     if (detected) return c.json(deps.publicPreview(detected));
     const risk = deps.previewCommandRisk(preview);

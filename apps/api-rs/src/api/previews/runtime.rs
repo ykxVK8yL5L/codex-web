@@ -14,13 +14,14 @@ use crate::state::{AppState, PreviewHandle};
 use super::{models::PreviewRecord, store};
 
 pub async fn start(state: AppState, preview: PreviewRecord) -> anyhow::Result<PreviewRecord> {
-    if preview.status == "running" || preview.status == "starting" {
+    let has_handle = state.previews.get(&preview.id).is_some();
+    if has_handle && (preview.status == "running" || preview.status == "starting") {
         return Ok(preview);
     }
     if let Some(running) = mark_running_if_reachable(&state, &preview).await? {
         return Ok(running);
     }
-    if state.previews.get(&preview.id).is_some() {
+    if has_handle {
         return Ok(preview);
     }
     let command = preview

@@ -375,6 +375,19 @@ pub fn running_runs(db: &Db, automation_id: &str) -> anyhow::Result<Vec<Automati
     Ok(rows)
 }
 
+pub fn has_active_run(db: &Db, automation_id: &str) -> anyhow::Result<bool> {
+    let connection = db.open_read_write()?;
+    ensure_runs_schema(&connection)?;
+    Ok(connection
+        .query_row(
+            "select 1 from automation_runs where automation_id = ? and status in ('queued', 'running') limit 1",
+            [automation_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
 pub fn stop_running_runs(db: &Db, automation_id: &str) -> anyhow::Result<i64> {
     let connection = db.open_read_write()?;
     ensure_runs_schema(&connection)?;
@@ -432,6 +445,16 @@ pub fn running_run_for_session(
         [session_id],
         row_to_run,
     ).optional()?)
+}
+
+pub fn claim_startup_run(db: &Db, automation_id: &str, startup_key: &str) -> anyhow::Result<bool> {
+    let connection = db.open_read_write()?;
+    ensure_startup_claim_schema(&connection)?;
+    let changed = connection.execute(
+        "insert or ignore into automation_startup_claims (automation_id, startup_key, claimed_at) values (?, ?, ?)",
+        params![automation_id, startup_key, crate::api::common::timestamp()],
+    )?;
+    Ok(changed > 0)
 }
 
 fn upsert(db: &Db, automation: &AutomationSummary) -> anyhow::Result<()> {
@@ -520,6 +543,20 @@ fn ensure_runs_schema(connection: &rusqlite::Connection) -> anyhow::Result<()> {
           exit_code integer,
           started_at text not null,
           finished_at text
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+fn ensure_startup_claim_schema(connection: &rusqlite::Connection) -> anyhow::Result<()> {
+    connection.execute_batch(
+        "
+        create table if not exists automation_startup_claims (
+          automation_id text not null,
+          startup_key text not null,
+          claimed_at text not null,
+          primary key (automation_id, startup_key)
         );
         ",
     )?;
