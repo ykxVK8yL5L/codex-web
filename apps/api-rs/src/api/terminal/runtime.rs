@@ -321,6 +321,44 @@ pub struct TerminalSessionCommandResult {
 /// command history does not bleed into the user's real shell history.
 fn managed_child_env() -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = Vec::new();
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/root"));
+    let mise_data_dir = std::env::var_os("MISE_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share/mise"));
+    let mise_shims_dir = std::env::var_os("MISE_SHIMS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| mise_data_dir.join("shims"));
+    let mise_bin = std::env::var_os("MISE_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/local/bin/mise"));
+    let mise_config_dir = std::env::var_os("MISE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config/mise"));
+    let mise_cache_dir = std::env::var_os("MISE_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".cache/mise"));
+
+    env.push(("HOME".to_string(), home.display().to_string()));
+    env.push(("MISE_BIN".to_string(), mise_bin.display().to_string()));
+    env.push((
+        "MISE_DATA_DIR".to_string(),
+        mise_data_dir.display().to_string(),
+    ));
+    env.push((
+        "MISE_CONFIG_DIR".to_string(),
+        mise_config_dir.display().to_string(),
+    ));
+    env.push((
+        "MISE_CACHE_DIR".to_string(),
+        mise_cache_dir.display().to_string(),
+    ));
+    env.push((
+        "MISE_SHIMS_DIR".to_string(),
+        mise_shims_dir.display().to_string(),
+    ));
+
     let current = std::env::var("PATH").unwrap_or_default();
     let current_parts: Vec<String> = current
         .split(':')
@@ -328,18 +366,14 @@ fn managed_child_env() -> Vec<(String, String)> {
         .map(|s| s.to_string())
         .collect();
     let mut additions: Vec<String> = Vec::new();
-    if let Some(dir) = std::env::var_os("MISE_SHIMS_DIR") {
-        additions.push(PathBuf::from(dir).display().to_string());
-    }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        for rel in [
-            ".local/share/mise/shims",
-            ".mise/shims",
-            ".local/bin",
-            ".mise/bin",
-        ] {
-            additions.push(home.join(rel).display().to_string());
-        }
+    additions.push(mise_shims_dir.display().to_string());
+    for rel in [
+        ".local/share/mise/shims",
+        ".mise/shims",
+        ".local/bin",
+        ".mise/bin",
+    ] {
+        additions.push(home.join(rel).display().to_string());
     }
     additions.push("/usr/local/bin".to_string());
     let mut next_path: Vec<String> = additions

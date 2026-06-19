@@ -1,4 +1,4 @@
-use std::process::Command;
+use std::{path::PathBuf, process::Command};
 
 use serde::{Deserialize, Serialize};
 
@@ -328,7 +328,10 @@ pub fn restore_missing(
         else {
             continue;
         };
-        let status = Command::new("/bin/sh").arg("-lc").arg(command).status();
+        let status = command_with_mise_env("/bin/sh")
+            .arg("-lc")
+            .arg(command)
+            .status();
         match status {
             Ok(status) if status.success() => success += 1,
             _ => failed += 1,
@@ -376,7 +379,10 @@ pub fn registry(query: Option<&str>) -> EnvironmentToolRegistryResponse {
     } else {
         vec!["search", trimmed]
     };
-    if let Ok(output) = Command::new(resolve_mise_command()).args(args).output() {
+    if let Ok(output) = command_with_mise_env(resolve_mise_command())
+        .args(args)
+        .output()
+    {
         if output.status.success() {
             let text = String::from_utf8_lossy(&output.stdout).to_string()
                 + &String::from_utf8_lossy(&output.stderr);
@@ -508,11 +514,13 @@ pub fn install_mise(db: &Db) -> anyhow::Result<EnvironmentOverview> {
         "\"$HOME/.local/bin/mise\" --version",
     ]
     .join(" && ");
-    let result = Command::new("/bin/bash")
+    let result = command_with_mise_env("/bin/bash")
         .arg("-lc")
         .arg(&install_script)
         .output();
-    let verification = Command::new(&install_path).arg("--version").output();
+    let verification = command_with_mise_env(&install_path)
+        .arg("--version")
+        .output();
     let installed = matches!(&result, Ok(out) if out.status.success())
         && matches!(&verification, Ok(out) if out.status.success());
 
@@ -552,7 +560,10 @@ pub fn list_tool_versions(tool: &str) -> EnvironmentToolVersionsResponse {
         };
     }
     let mise = resolve_mise_command();
-    let output = Command::new(&mise).arg("ls-remote").arg(trimmed).output();
+    let output = command_with_mise_env(&mise)
+        .arg("ls-remote")
+        .arg(trimmed)
+        .output();
     match output {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout).to_string()
@@ -687,7 +698,7 @@ pub fn uninstall_tool(db: &Db, id: &str) -> anyhow::Result<EnvironmentOverview> 
         anyhow::bail!("environment_tool_uninstall_not_allowed");
     }
     let target = format!("{}@{}", tool.tool, tool.requested_version);
-    let result = Command::new(resolve_mise_command())
+    let result = command_with_mise_env(resolve_mise_command())
         .arg("uninstall")
         .arg(&target)
         .output();
@@ -1190,7 +1201,7 @@ fn fallback_registry_items() -> Vec<(&'static str, &'static str, &'static str)> 
 }
 
 fn command_output(command: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(command).args(args).output().ok()?;
+    let output = command_with_mise_env(command).args(args).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1273,6 +1284,77 @@ struct PackageCommand {
     text: String,
 }
 
+fn mise_env_vars() -> Vec<(String, String)> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/root"));
+    let mise_data_dir = std::env::var_os("MISE_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share/mise"));
+    let mise_shims_dir = std::env::var_os("MISE_SHIMS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| mise_data_dir.join("shims"));
+    let mise_bin = std::env::var_os("MISE_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/local/bin/mise"));
+    let mise_config_dir = std::env::var_os("MISE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config/mise"));
+    let mise_cache_dir = std::env::var_os("MISE_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".cache/mise"));
+
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let current_parts = current_path
+        .split(':')
+        .filter(|part| !part.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    let additions = [
+        mise_shims_dir.display().to_string(),
+        home.join(".local/share/mise/shims").display().to_string(),
+        home.join(".mise/shims").display().to_string(),
+        home.join(".local/bin").display().to_string(),
+        home.join(".mise/bin").display().to_string(),
+        "/usr/local/bin".to_string(),
+    ];
+    let mut next_path = additions
+        .into_iter()
+        .filter(|path| !current_parts.contains(path))
+        .collect::<Vec<_>>();
+    next_path.extend(current_parts);
+
+    vec![
+        ("HOME".to_string(), home.display().to_string()),
+        ("MISE_BIN".to_string(), mise_bin.display().to_string()),
+        (
+            "MISE_DATA_DIR".to_string(),
+            mise_data_dir.display().to_string(),
+        ),
+        (
+            "MISE_CONFIG_DIR".to_string(),
+            mise_config_dir.display().to_string(),
+        ),
+        (
+            "MISE_CACHE_DIR".to_string(),
+            mise_cache_dir.display().to_string(),
+        ),
+        (
+            "MISE_SHIMS_DIR".to_string(),
+            mise_shims_dir.display().to_string(),
+        ),
+        ("PATH".to_string(), next_path.join(":")),
+    ]
+}
+
+fn command_with_mise_env(command: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(command);
+    for (key, value) in mise_env_vars() {
+        command.env(key, value);
+    }
+    command
+}
+
 fn resolve_mise_command() -> String {
     let home = std::env::var("HOME").ok();
     let mut candidates: Vec<String> = Vec::new();
@@ -1291,7 +1373,7 @@ fn resolve_mise_command() -> String {
     candidates.push("/opt/homebrew/bin/mise".to_string());
     candidates.push("/usr/bin/mise".to_string());
     for candidate in &candidates {
-        if matches!(Command::new(candidate).arg("--version").output(), Ok(out) if out.status.success())
+        if matches!(command_with_mise_env(candidate).arg("--version").output(), Ok(out) if out.status.success())
         {
             return candidate.clone();
         }
@@ -1299,15 +1381,45 @@ fn resolve_mise_command() -> String {
     "mise".to_string()
 }
 
-fn run_mise_use_global(_tool: &str, target: &str) -> std::io::Result<std::process::Output> {
-    Command::new(resolve_mise_command())
+fn run_mise_use_global(tool: &str, target: &str) -> std::io::Result<std::process::Output> {
+    let mut output = command_with_mise_env(resolve_mise_command())
         .args(["use", "-g", target])
-        .output()
+        .output()?;
+    if !output.status.success()
+        && is_python_tool(tool)
+        && is_mise_python_attestation_failure(&output)
+    {
+        output = command_with_mise_env(resolve_mise_command())
+            .env("MISE_PYTHON_GITHUB_ATTESTATIONS", "false")
+            .args(["use", "-g", target])
+            .output()?;
+    }
+    if output.status.success() {
+        let _ = command_with_mise_env(resolve_mise_command())
+            .arg("reshim")
+            .output();
+    }
+    Ok(output)
+}
+
+fn is_python_tool(tool: &str) -> bool {
+    matches!(tool.trim().to_lowercase().as_str(), "python" | "python3")
+}
+
+fn is_mise_python_attestation_failure(output: &std::process::Output) -> bool {
+    let text = (String::from_utf8_lossy(&output.stderr).to_string()
+        + &String::from_utf8_lossy(&output.stdout))
+        .to_lowercase();
+    text.contains("github artifact attestations")
+        || text.contains("mise_python_github_attestations")
+        || text.contains("attestation verification")
 }
 
 /// Run `mise <args>` (args already include the `exec -- ...` prefix where needed).
 fn run_mise_exec(args: &[String]) -> std::io::Result<std::process::Output> {
-    Command::new(resolve_mise_command()).args(args).output()
+    command_with_mise_env(resolve_mise_command())
+        .args(args)
+        .output()
 }
 
 fn package_install_command(
@@ -1403,7 +1515,7 @@ struct ResolvedInvocation {
 
 /// Run `{command} {args}` and return trimmed non-empty stdout lines on success, else empty.
 fn run_lines(command: &str, args: &[String]) -> Vec<String> {
-    let output = match Command::new(command).args(args).output() {
+    let output = match command_with_mise_env(command).args(args).output() {
         Ok(out) => out,
         Err(_) => return Vec::new(),
     };
@@ -1419,7 +1531,7 @@ fn run_lines(command: &str, args: &[String]) -> Vec<String> {
 
 /// Run a command and return combined stdout+stderr trimmed, with success flag.
 fn run_combined(command: &str, args: &[String]) -> (bool, String) {
-    match Command::new(command).args(args).output() {
+    match command_with_mise_env(command).args(args).output() {
         Ok(out) => {
             let combined = format!(
                 "{}\n{}",
@@ -1441,7 +1553,8 @@ fn first_successful_command(
     for (command, args_prefix, text_prefix) in candidates {
         let mut args: Vec<String> = args_prefix.clone();
         args.extend(probe_args.iter().map(|value| value.to_string()));
-        if matches!(Command::new(command).args(&args).output(), Ok(out) if out.status.success()) {
+        if matches!(command_with_mise_env(command).args(&args).output(), Ok(out) if out.status.success())
+        {
             return Some(ResolvedCommandOwned {
                 command: command.clone(),
                 args_prefix: args_prefix.clone(),
@@ -1907,7 +2020,7 @@ fn inspect_deno(_pkg: &str) -> (bool, Option<String>) {
     };
     let mut args = resolved.args_prefix.clone();
     args.extend(["uninstall", "--help"].iter().map(ToString::to_string));
-    let installed = matches!(Command::new(&resolved.command).args(&args).output(), Ok(out) if out.status.success());
+    let installed = matches!(command_with_mise_env(&resolved.command).args(&args).output(), Ok(out) if out.status.success());
     (installed, None)
 }
 
