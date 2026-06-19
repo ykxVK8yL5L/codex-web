@@ -38,7 +38,8 @@ type PreviewRoutesDeps = {
   previewUsingPort: (preview: Pick<PreviewRecord, "id" | "targetHost" | "port">) => PreviewRecord | null;
   publicApproval: (approval: ApprovalRecord) => ApprovalSummary;
   publicPreview: (preview: PreviewRecord) => PreviewSummary;
-  startPreviewProcess: (preview: PreviewRecord) => void;
+  markPreviewRunningIfReachable: (preview: PreviewRecord) => Promise<PreviewRecord | null>;
+  startPreviewProcess: (preview: PreviewRecord) => Promise<PreviewRecord>;
   stopPreviewProcess: (previewId: string) => void;
   subscribePreviewLogEvents: (previewId: string, subscriber: (event: PreviewLogEvent) => void) => () => void;
   updatePreview: (preview: PreviewRecord) => void;
@@ -153,13 +154,16 @@ export function registerPreviewRoutes(app: Hono, deps: PreviewRoutesDeps) {
         deps.updatePreview(existing);
       }
       if (body.autoStart && existing.command && existing.status !== "running" && existing.status !== "starting") {
+        const detected = await deps.markPreviewRunningIfReachable(existing);
+        if (detected) return c.json(deps.publicPreview(detected));
         const risk = deps.previewCommandRisk(existing);
         if (risk && !deps.approvalAlwaysAllowed("preview-command-run", { previewId: existing.id, command: existing.command ?? "", cwd: existing.cwd ?? "", targetHost: existing.targetHost, port: existing.port, scopeType: existing.scopeType, scopeId: existing.scopeId })) {
           const approval = deps.createPreviewApproval(existing, risk);
           return c.json({ error: "approval_required", approval: deps.publicApproval(approval), preview: deps.publicPreview(existing) }, 409);
         }
         try {
-          deps.startPreviewProcess(existing);
+          const started = await deps.startPreviewProcess(existing);
+          return c.json(deps.publicPreview(started));
         } catch {
           existing.status = "error";
           deps.updatePreview(existing);
@@ -189,13 +193,16 @@ export function registerPreviewRoutes(app: Hono, deps: PreviewRoutesDeps) {
     };
     deps.insertPreview(preview);
     if (body.autoStart && preview.command) {
+      const detected = await deps.markPreviewRunningIfReachable(preview);
+      if (detected) return c.json(deps.publicPreview(detected), 201);
       const risk = deps.previewCommandRisk(preview);
       if (risk && !deps.approvalAlwaysAllowed("preview-command-run", { previewId: preview.id, command: preview.command ?? "", cwd: preview.cwd ?? "", targetHost: preview.targetHost, port: preview.port, scopeType: preview.scopeType, scopeId: preview.scopeId })) {
         const approval = deps.createPreviewApproval(preview, risk);
         return c.json({ error: "approval_required", approval: deps.publicApproval(approval), preview: deps.publicPreview(preview) }, 409);
       }
       try {
-        deps.startPreviewProcess(preview);
+        const started = await deps.startPreviewProcess(preview);
+        return c.json(deps.publicPreview(started), 201);
       } catch (error) {
         preview.status = "error";
         deps.updatePreview(preview);
@@ -205,23 +212,25 @@ export function registerPreviewRoutes(app: Hono, deps: PreviewRoutesDeps) {
     return c.json(deps.publicPreview(preview), 201);
   });
 
-  app.post("/api/previews/:id/start", (c) => {
+  app.post("/api/previews/:id/start", async (c) => {
     const preview = deps.previews.get(c.req.param("id"));
     if (!preview) return c.json({ error: "preview_not_found" }, 404);
     if (preview.status === "running" || preview.status === "starting") return c.json(deps.publicPreview(preview));
+    const detected = await deps.markPreviewRunningIfReachable(preview);
+    if (detected) return c.json(deps.publicPreview(detected));
     const risk = deps.previewCommandRisk(preview);
     if (risk && !deps.approvalAlwaysAllowed("preview-command-run", { previewId: preview.id, command: preview.command ?? "", cwd: preview.cwd ?? "", targetHost: preview.targetHost, port: preview.port, scopeType: preview.scopeType, scopeId: preview.scopeId })) {
       const approval = deps.createPreviewApproval(preview, risk);
       return c.json({ error: "approval_required", approval: deps.publicApproval(approval), preview: deps.publicPreview(preview) }, 409);
     }
     try {
-      deps.startPreviewProcess(preview);
+      const started = await deps.startPreviewProcess(preview);
+      return c.json(deps.publicPreview(started));
     } catch (error) {
       preview.status = "error";
       deps.updatePreview(preview);
       return c.json({ error: error instanceof Error ? error.message : "preview_start_failed", preview: deps.publicPreview(preview) }, 400);
     }
-    return c.json(deps.publicPreview(preview));
   });
 
   app.post("/api/previews/:id/access", (c) => {

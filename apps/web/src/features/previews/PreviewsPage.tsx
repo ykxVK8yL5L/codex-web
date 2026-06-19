@@ -361,6 +361,7 @@ export function PreviewsPage({
             <button className="modal-head-close" type="button" aria-label={t("action.close")} onClick={() => { setDetailPreview(null); setDetailLogs(null); setDetailLogSearch(""); }}><X size={16} /></button>
           </div>
           <div className="preview-detail">
+            <PreviewDetailRow label={t("preview.id")} value={detailPreview.id} />
             <PreviewDetailRow label={t("preview.status")} value={detailPreview.status} />
             <PreviewDetailRow label={t("preview.access")} value={detailPreview.access} />
             <PreviewDetailRow label={t("preview.port")} value={String(detailPreview.port)} />

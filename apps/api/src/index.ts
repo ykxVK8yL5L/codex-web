@@ -1302,6 +1302,7 @@ const previewProcessRuntime = createPreviewProcessRuntime({
 const {
   appendPreviewLog,
   isPreviewReachable,
+  markPreviewRunningIfReachable,
   previewFromReferer,
   previewProcessGroups,
   previewProcesses,
@@ -1659,6 +1660,7 @@ const settingsRouteDeps = {
   getPreviews: () => previews,
   rmSync,
   systemBackupPreviewFromArchive,
+  markPreviewRunningIfReachable,
   startPreviewProcess,
   updatePreview,
   upsertPreviewAccessRequest,
@@ -1905,6 +1907,7 @@ const previewRouteDeps = {
   previewUsingPort,
   publicApproval,
   publicPreview,
+  markPreviewRunningIfReachable,
   startPreviewProcess,
   stopPreviewProcess,
   subscribePreviewLogEvents,

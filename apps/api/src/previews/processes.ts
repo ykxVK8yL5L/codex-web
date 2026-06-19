@@ -168,6 +168,15 @@ async function isPreviewReachable(preview: PreviewRecord) {
   }
 }
 
+async function markPreviewRunningIfReachable(preview: PreviewRecord) {
+  const response = await isPreviewReachable(preview);
+  if (!response) return null;
+  preview.status = "running";
+  updatePreview(preview);
+  appendPreviewLog(preview.id, `\n[detect] upstream already responds with ${response.status}, marked running without starting command\n`);
+  return preview;
+}
+
 async function waitForPreviewReady(preview: PreviewRecord) {
   for (let attempt = 0; attempt < 24; attempt += 1) {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
@@ -206,7 +215,10 @@ async function settlePreviewProcessExit(previewId: string, exitCode: number | nu
   appendPreviewLog(previewId, `\n[exit] ${exitCode}\n`);
 }
 
-function startPreviewProcess(preview: PreviewRecord) {
+async function startPreviewProcess(preview: PreviewRecord) {
+  const detected = await markPreviewRunningIfReachable(preview);
+  if (detected) return detected;
+  if (previewProcesses.has(preview.id)) return preview;
   if (!preview.command?.trim()) throw new Error("preview_command_required");
   const cwd = resolvePreviewCwd(preview, preview.cwd);
   if (!cwd) throw new Error("invalid_preview_cwd");
@@ -238,6 +250,7 @@ function startPreviewProcess(preview: PreviewRecord) {
     void settlePreviewProcessExit(preview.id, exitCode);
   });
   void waitForPreviewReady(preview);
+  return preview;
 }
 
 
@@ -245,6 +258,7 @@ function startPreviewProcess(preview: PreviewRecord) {
   return {
     appendPreviewLog,
     isPreviewReachable,
+    markPreviewRunningIfReachable,
     previewFromReferer,
     previewProcessGroups,
     previewProcesses,

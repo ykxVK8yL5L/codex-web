@@ -385,6 +385,7 @@ const dictionaries = {
       disconnected: "已断开连接",
     },
     preview: {
+      id: "预览 ID",
       source: "来源",
       actions: "预览操作",
       details: "详情",
@@ -2332,6 +2333,7 @@ const dictionaries = {
       disconnected: "disconnected",
     },
     preview: {
+      id: "ID",
       source: "Source",
       actions: "Preview actions",
       details: "Details",

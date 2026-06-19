@@ -17,6 +17,9 @@ pub async fn start(state: AppState, preview: PreviewRecord) -> anyhow::Result<Pr
     if preview.status == "running" || preview.status == "starting" {
         return Ok(preview);
     }
+    if let Some(running) = mark_running_if_reachable(&state, &preview).await? {
+        return Ok(running);
+    }
     if state.previews.get(&preview.id).is_some() {
         return Ok(preview);
     }
@@ -115,6 +118,26 @@ pub async fn start(state: AppState, preview: PreviewRecord) -> anyhow::Result<Pr
         settle_process_exit(wait_state, wait_preview, exit_status).await;
     });
     Ok(starting)
+}
+
+pub async fn mark_running_if_reachable(
+    state: &AppState,
+    preview: &PreviewRecord,
+) -> anyhow::Result<Option<PreviewRecord>> {
+    let Some(status) = is_preview_reachable(preview).await else {
+        return Ok(None);
+    };
+    let running = update_preview_status(state, &preview.id, "running")?
+        .unwrap_or_else(|| preview.clone());
+    append_preview_log(
+        state,
+        &running,
+        &format!(
+            "\n[detect] upstream already responds with {}, marked running without starting command\n",
+            status.as_u16()
+        ),
+    )?;
+    Ok(Some(running))
 }
 
 async fn terminate_preview_child(child: &mut tokio::process::Child) {

@@ -166,6 +166,13 @@ fn route_permission_for_request(method: &str, path: &str) -> Option<&'static str
             "goals.manage"
         });
     }
+    if path.starts_with("/api/previews") {
+        return Some(if method == "GET" {
+            "previews.read"
+        } else {
+            "previews.manage"
+        });
+    }
     if path.starts_with("/api/files") || path.starts_with("/api/file-mounts") {
         return Some(if method == "GET" {
             "files.read"

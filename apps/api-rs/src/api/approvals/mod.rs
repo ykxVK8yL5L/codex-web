@@ -73,10 +73,18 @@ async fn approve(
                     Json(serde_json::json!({ "error": "preview_not_found" })),
                 )
             })?;
-        let started = crate::api::previews::runtime::start(state.clone(), record)
-            .await
-            .map_err(approval_error)?;
-        preview = Some(started.public());
+        if let Some(running) =
+            crate::api::previews::runtime::mark_running_if_reachable(&state, &record)
+                .await
+                .map_err(approval_error)?
+        {
+            preview = Some(running.public());
+        } else {
+            let started = crate::api::previews::runtime::start(state.clone(), record)
+                .await
+                .map_err(approval_error)?;
+            preview = Some(started.public());
+        }
     }
     if pending.action_type == "preview-access" {
         let request_id = payload_string(&pending, "requestId");

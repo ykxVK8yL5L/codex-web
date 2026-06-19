@@ -375,7 +375,13 @@ async fn preview_referer_proxy_middleware(
             .body(Body::from("private preview requires Codex Web access"))
             .unwrap_or_else(|_| Response::new(Body::empty()));
     }
-    proxy_preview_response(state, preview, path.trim_start_matches('/').to_string(), request).await
+    proxy_preview_response(
+        state,
+        preview,
+        path.trim_start_matches('/').to_string(),
+        request,
+    )
+    .await
 }
 
 /// Catch-all parity with apps/api/src/server/routes.ts `app.all("*")`:
@@ -414,7 +420,13 @@ async fn preview_referer_or_static_handler(
             .unwrap_or_else(|_| Response::new(Body::empty()));
     }
 
-    proxy_preview_response(state, preview, path.trim_start_matches('/').to_string(), request).await
+    proxy_preview_response(
+        state,
+        preview,
+        path.trim_start_matches('/').to_string(),
+        request,
+    )
+    .await
 }
 
 async fn proxy_preview_response(

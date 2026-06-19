@@ -85,6 +85,7 @@ export function registerSettingsRoutes(app: Hono, deps: SettingsRoutesDeps) {
     saveApprovalGrant,
     saveNotificationTestSettings,
     saveSystemBackupSettings,
+    markPreviewRunningIfReachable,
     startPreviewProcess,
     setCodexRuntimeSettings,
     setNotificationTestSettings,
@@ -449,7 +450,7 @@ export function registerSettingsRoutes(app: Hono, deps: SettingsRoutesDeps) {
     return c.json(publicApproval(restored));
   });
   
-  app.post("/api/approvals/:id/approve", (c) => {
+  app.post("/api/approvals/:id/approve", async (c) => {
     const approval = getApproval(c.req.param("id"));
     if (!approval) return c.json({ error: "approval_not_found" }, 404);
     if (approval.status !== "pending") return c.json({ error: "approval_already_resolved", approval: publicApproval(approval) }, 409);
@@ -467,13 +468,18 @@ export function registerSettingsRoutes(app: Hono, deps: SettingsRoutesDeps) {
       const payload = approval.payload && typeof approval.payload === "object" ? approval.payload as { previewId?: unknown } : {};
       const record = previews.get(String(payload.previewId ?? ""));
       if (!record) return c.json({ error: "preview_not_found" }, 404);
-      try {
-        startPreviewProcess(record);
-        preview = publicPreview(record);
-      } catch (error) {
-        record.status = "error";
-        updatePreview(record);
-        return c.json({ error: error instanceof Error ? error.message : "preview_start_failed", preview: publicPreview(record) }, 400);
+      const detected = await markPreviewRunningIfReachable(record);
+      if (detected) {
+        preview = publicPreview(detected);
+      } else {
+        try {
+          const started = await startPreviewProcess(record);
+          preview = publicPreview(started);
+        } catch (error) {
+          record.status = "error";
+          updatePreview(record);
+          return c.json({ error: error instanceof Error ? error.message : "preview_start_failed", preview: publicPreview(record) }, 400);
+        }
       }
     }
     if (approval.actionType === "preview-access") {

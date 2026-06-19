@@ -98,11 +98,18 @@ async fn create(
 ) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
     let auto_start = body.auto_start.unwrap_or(false);
     let (preview, created) = store::create_with_status(&state.db, body).map_err(preview_error)?;
-    if auto_start
-        && preview.command.is_some()
-        && preview.status != "running"
-        && preview.status != "starting"
-    {
+    if auto_start && preview.command.is_some() {
+        if let Some(running) = runtime::mark_running_if_reachable(&state, &preview)
+            .await
+            .map_err(preview_error)?
+        {
+            let status = if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            return Ok((status, Json(running.public())).into_response());
+        }
         if let Some(response) = preview_command_approval_response(&state, &preview)? {
             return Ok(response.into_response());
         }
@@ -194,9 +201,12 @@ async fn start(
     let Some(preview) = store::get(&state.db, &id).map_err(api_error)? else {
         return Err(error(StatusCode::NOT_FOUND, "preview_not_found"));
     };
-    if preview.status == "running" || preview.status == "starting" {
+    if let Some(running) = runtime::mark_running_if_reachable(&state, &preview)
+        .await
+        .map_err(preview_error)?
+    {
         return Ok(Json(
-            serde_json::to_value(preview.public()).unwrap_or_else(|_| serde_json::json!({})),
+            serde_json::to_value(running.public()).unwrap_or_else(|_| serde_json::json!({})),
         ));
     }
     if let Some(response) = preview_command_approval_value(&state, &preview)? {

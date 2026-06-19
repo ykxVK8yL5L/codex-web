@@ -24,8 +24,9 @@ pub fn list(
     let needle = q
         .map(|value| value.trim().to_lowercase())
         .filter(|value| !value.is_empty());
-    let mut statement =
-        connection.prepare(&format!("{PREVIEW_SELECT} order by updated_at desc, id desc"))?;
+    let mut statement = connection.prepare(&format!(
+        "{PREVIEW_SELECT} order by updated_at desc, id desc"
+    ))?;
     let mut items = statement
         .query_map([], preview_from_row)?
         .collect::<Result<Vec<_>, _>>()?
@@ -478,9 +479,10 @@ fn preview_using_port_with_connection(
 }
 
 pub fn proxy_path_matches(preview: &PreviewRecord, path: &str) -> bool {
-    preview.proxy_paths.iter().any(|prefix| {
-        path == prefix || path.starts_with(&format!("{prefix}/"))
-    })
+    preview
+        .proxy_paths
+        .iter()
+        .any(|prefix| path == prefix || path.starts_with(&format!("{prefix}/")))
 }
 
 fn proxy_paths_from_json(value: Option<&str>) -> Vec<String> {
