@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Copy, Download, FilePlus2, FolderOpen, FolderPlus, Globe, MoreHorizontal, Pencil, Play, Save, Terminal as TerminalIcon, Trash2, Upload, X } from "lucide-react";
 import { useAppDialog } from "@/components/AppDialog";
-import { CodeEditor, preferredCodeEditorMode, type CodeEditorMode } from "@/components/CodeEditor";
+import type { CodeEditorMode } from "@/components/CodeEditor";
 import { IconText } from "@/components/IconText";
 import { PageHeader } from "@/components/PageHeader";
 import { PreviewDirectoryPicker } from "@/components/PreviewDirectoryPicker";
@@ -13,6 +13,18 @@ import type { TranslationKey } from "@/lib/i18n";
 import type { ArchiveIgnoreTemplate, CreateFileMountRequest, CreateFileRequest, CreatePreviewRequest, FileArchivePreviewResponse, FileArchiveRequest, FileContentResponse, FileEntry, FileListResponse, FileMount, PreviewAccess, PreviewSummary, RenameFileRequest, UpdateFileMountRequest } from "@codex-web/protocol";
 
 type TFunction = (key: TranslationKey) => string;
+const CodeEditor = React.lazy(async () => {
+  const module = await import("@/components/CodeEditor");
+  return { default: module.CodeEditor };
+});
+
+function preferredCodeEditorMode() {
+  if (typeof window === "undefined") return "monaco" as CodeEditorMode;
+  const coarsePointer = window.matchMedia?.("(pointer: coarse)")?.matches;
+  const narrow = window.matchMedia?.("(max-width: 760px)")?.matches;
+  return coarsePointer || narrow ? "codemirror" : "monaco";
+}
+
 type UploadProgress = {
   destinationPath: string;
   fileCount: number;
@@ -895,15 +907,17 @@ export function FilesPage({
             </div>
           </div>
           {selectedFile ? (
-            <CodeEditor
-              mode={editorMode}
-              value={draft}
-              path={selectedFile.path}
-              onChange={(value) => {
-                setDraft(value);
-                setDirty(true);
-              }}
-            />
+            <React.Suspense fallback={<textarea name="file-editor-loading" className="large-code file-editor" value={draft} spellCheck={false} readOnly />}>
+              <CodeEditor
+                mode={editorMode}
+                value={draft}
+                path={selectedFile.path}
+                onChange={(value) => {
+                  setDraft(value);
+                  setDirty(true);
+                }}
+              />
+            </React.Suspense>
           ) : (
             <div className="empty-state">{t("file.chooseTextFile")}</div>
           )}

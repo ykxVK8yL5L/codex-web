@@ -51,7 +51,6 @@ import "./styles.css";
 import { useAppDialog } from "@/components/AppDialog";
 import { AppErrorBoundary } from "@/components/AppErrorBoundary";
 import { Button } from "@/components/ui/button";
-import { CodeEditor, preferredCodeEditorMode, type CodeEditorMode } from "@/components/CodeEditor";
 import { FilterSearchInput, FilterToolbar } from "@/components/FilterControls";
 import { IconText } from "@/components/IconText";
 import { LanguageSelect } from "@/components/LanguageSelect";

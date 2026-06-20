@@ -8,11 +8,14 @@ import { html } from "@codemirror/lang-html";
 import { css } from "@codemirror/lang-css";
 import { sql } from "@codemirror/lang-sql";
 import { xml } from "@codemirror/lang-xml";
-import { useEffect, useMemo, useRef, useState } from "react";
-import * as monaco from "monaco-editor";
-import EditorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type * as Monaco from "monaco-editor";
 
 export type CodeEditorMode = "monaco" | "codemirror" | "textarea";
+type MonacoBundle = {
+  monaco: typeof Monaco;
+  EditorWorker: { new (): Worker };
+};
 
 type CodeEditorProps = {
   mode: CodeEditorMode;
@@ -30,6 +33,38 @@ declare global {
   }
 }
 
+let monacoBundlePromise: Promise<MonacoBundle> | null = null;
+
+function loadMonacoBundle() {
+  monacoBundlePromise ??= Promise.all([
+    import("monaco-editor/esm/vs/editor/editor.api"),
+    import("monaco-editor/esm/vs/basic-languages/typescript/typescript.contribution"),
+    import("monaco-editor/esm/vs/basic-languages/javascript/javascript.contribution"),
+    import("monaco-editor/esm/vs/basic-languages/python/python.contribution"),
+    import("monaco-editor/esm/vs/language/json/monaco.contribution"),
+    import("monaco-editor/esm/vs/basic-languages/html/html.contribution"),
+    import("monaco-editor/esm/vs/basic-languages/css/css.contribution"),
+    import("monaco-editor/esm/vs/basic-languages/markdown/markdown.contribution"),
+    import("monaco-editor/esm/vs/basic-languages/sql/sql.contribution"),
+    import("monaco-editor/esm/vs/basic-languages/shell/shell.contribution"),
+    import("monaco-editor/esm/vs/basic-languages/yaml/yaml.contribution"),
+    import("monaco-editor/esm/vs/basic-languages/xml/xml.contribution"),
+    import("monaco-editor/esm/vs/basic-languages/go/go.contribution"),
+    import("monaco-editor/esm/vs/basic-languages/rust/rust.contribution"),
+    import("monaco-editor/esm/vs/basic-languages/java/java.contribution"),
+    import("monaco-editor/esm/vs/basic-languages/dockerfile/dockerfile.contribution"),
+    import("monaco-editor/esm/vs/basic-languages/ini/ini.contribution"),
+    import("monaco-editor/esm/vs/editor/editor.worker?worker"),
+  ]).then(([monaco, ...modules]) => {
+    const workerModule = modules[modules.length - 1] as { default: { new (): Worker } };
+    return {
+      monaco,
+      EditorWorker: workerModule.default,
+    };
+  });
+  return monacoBundlePromise;
+}
+
 function languageFromPath(path?: string | null) {
   const file = (path ?? "").toLowerCase();
   if (/\.(ts|tsx|mts|cts)$/.test(file)) return "typescript";
@@ -43,8 +78,12 @@ function languageFromPath(path?: string | null) {
   if (/\.sql$/.test(file)) return "sql";
   if (/\.(xml|svg)$/.test(file)) return "xml";
   if (/\.ya?ml$/.test(file)) return "yaml";
-  if (/\.toml$/.test(file)) return "toml";
-  if (/\.sh$/.test(file)) return "shell";
+  if (/\.(toml|ini|env)$/.test(file) || /(^|\/)\.env(\.|$)/.test(file)) return "ini";
+  if (/\.(sh|bash|zsh)$/.test(file)) return "shell";
+  if (/\.go$/.test(file)) return "go";
+  if (/\.rs$/.test(file)) return "rust";
+  if (/\.java$/.test(file)) return "java";
+  if (/(^|\/)(dockerfile|containerfile)$/.test(file) || /\.(dockerfile|containerfile)$/.test(file)) return "dockerfile";
   return "plaintext";
 }
 
@@ -69,9 +108,10 @@ export function preferredCodeEditorMode() {
   return coarsePointer || narrow ? "codemirror" : "monaco";
 }
 
-function MonacoCodeEditor({ value, path, readOnly, onChange }: Omit<CodeEditorProps, "mode">) {
+function MonacoCodeEditor({ value, path, readOnly, onChange, onLoadError }: Omit<CodeEditorProps, "mode"> & { onLoadError: () => void }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
+  const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
+  const [bundle, setBundle] = useState<MonacoBundle | null>(null);
   const changeRef = useRef(onChange);
 
   useEffect(() => {
@@ -79,13 +119,24 @@ function MonacoCodeEditor({ value, path, readOnly, onChange }: Omit<CodeEditorPr
   }, [onChange]);
 
   useEffect(() => {
-    window.MonacoEnvironment ??= {};
-    window.MonacoEnvironment.getWorker = () => new EditorWorker();
-  }, []);
+    let cancelled = false;
+    loadMonacoBundle()
+      .then((loadedBundle) => {
+        if (!cancelled) setBundle(loadedBundle);
+      })
+      .catch(() => {
+        if (!cancelled) onLoadError();
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [onLoadError]);
 
   useEffect(() => {
-    if (!containerRef.current) return;
-    const editor = monaco.editor.create(containerRef.current, {
+    if (!containerRef.current || !bundle) return;
+    window.MonacoEnvironment ??= {};
+    window.MonacoEnvironment.getWorker = () => new bundle.EditorWorker();
+    const editor = bundle.monaco.editor.create(containerRef.current, {
       value,
       language: languageFromPath(path),
       readOnly,
@@ -105,7 +156,7 @@ function MonacoCodeEditor({ value, path, readOnly, onChange }: Omit<CodeEditorPr
       editor.dispose();
       editorRef.current = null;
     };
-  }, []);
+  }, [bundle]);
 
   useEffect(() => {
     const editor = editorRef.current;
@@ -117,8 +168,8 @@ function MonacoCodeEditor({ value, path, readOnly, onChange }: Omit<CodeEditorPr
     const editor = editorRef.current;
     if (!editor) return;
     const model = editor.getModel();
-    if (model) monaco.editor.setModelLanguage(model, languageFromPath(path));
-  }, [path]);
+    if (model && bundle) bundle.monaco.editor.setModelLanguage(model, languageFromPath(path));
+  }, [path, bundle]);
 
   useEffect(() => {
     editorRef.current?.updateOptions({ readOnly });
@@ -181,6 +232,7 @@ function CodeMirrorEditor({ value, path, readOnly, onChange }: Omit<CodeEditorPr
 export function CodeEditor({ mode, value, path, readOnly, onChange }: CodeEditorProps) {
   const [failedMode, setFailedMode] = useState<CodeEditorMode | null>(null);
   const activeMode = failedMode === mode ? "textarea" : mode;
+  const handleMonacoLoadError = useCallback(() => setFailedMode("monaco"), []);
 
   useEffect(() => {
     setFailedMode(null);
@@ -188,7 +240,7 @@ export function CodeEditor({ mode, value, path, readOnly, onChange }: CodeEditor
 
   if (activeMode === "monaco") {
     try {
-      return <MonacoCodeEditor value={value} path={path} readOnly={readOnly} onChange={onChange} />;
+      return <MonacoCodeEditor value={value} path={path} readOnly={readOnly} onChange={onChange} onLoadError={handleMonacoLoadError} />;
     } catch {
       setFailedMode("monaco");
     }
