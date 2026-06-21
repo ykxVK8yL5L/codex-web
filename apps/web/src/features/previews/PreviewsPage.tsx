@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Copy, Download, Globe, Info, Lock, MoreHorizontal, Pencil, Play, RefreshCw, Square, Trash2, Unlock, X } from "lucide-react";
+import { Copy, Download, ExternalLink, Globe, Info, Lock, MoreHorizontal, Pencil, Play, RefreshCw, Share2, Square, Trash2, Unlock, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAppDialog } from "@/components/AppDialog";
 import { FilterSearchInput, FilterToolbar } from "@/components/FilterControls";
@@ -15,6 +15,15 @@ import type { PageResponse, PreviewAccess, PreviewLogsResponse, PreviewSummary, 
 
 type TFunction = (key: TranslationKey) => string;
 type ToastTone = "info" | "success" | "error";
+type PreviewShareSummary = {
+  previewId: string;
+  status: "starting" | "running" | "stopped" | "error";
+  publicUrl?: string;
+  gatewayPort?: number;
+  error?: string;
+  createdAt?: string;
+  updatedAt?: string;
+};
 
 function newestLinesFirst(log: string) {
   return log.split(/\r?\n/).reverse().join("\n");
@@ -42,6 +51,7 @@ export function PreviewsPage({
   const [previewSearch, setPreviewSearch] = useState("");
   const [previewStatusFilter, setPreviewStatusFilter] = useState("");
   const [previewScopeFilter, setPreviewScopeFilter] = useState("");
+  const [previewShares, setPreviewShares] = useState<Record<string, PreviewShareSummary>>({});
   const [detailPreview, setDetailPreview] = useState<PreviewSummary | null>(null);
   const [detailLogs, setDetailLogs] = useState<string | null>(null);
   const [detailLogSearch, setDetailLogSearch] = useState("");
@@ -83,6 +93,12 @@ export function PreviewsPage({
     const timer = window.setTimeout(() => void loadPreviews(false, false), 1500);
     return () => window.clearTimeout(timer);
   }, [previews, sessionToken, previewSearch, previewStatusFilter, previewScopeFilter]);
+
+  useEffect(() => {
+    if (!previews?.length || !Object.values(previewShares).some((share) => share.status === "starting")) return;
+    const timer = window.setTimeout(() => void loadPreviewShares(previews), 1500);
+    return () => window.clearTimeout(timer);
+  }, [previews, previewShares, sessionToken]);
 
   useEffect(() => {
     if (!detailPreview) return;
@@ -141,9 +157,23 @@ export function PreviewsPage({
       return;
     }
     const page = (await response.json()) as PageResponse<PreviewSummary>;
-    setPreviews((items) => older ? [...(items ?? []), ...page.items] : page.items);
+    const nextItems = older ? [...(previews ?? []), ...page.items] : page.items;
+    setPreviews(nextItems);
     setPreviewCursor(page.nextCursor);
     setPreviewHasMore(page.hasMore);
+    void loadPreviewShares(nextItems);
+  }
+
+  async function loadPreviewShares(items: PreviewSummary[]) {
+    const pairs = await Promise.all(items.map(async (preview) => {
+      const response = await fetch(`/api/previews/${preview.id}/share`, {
+        headers: { authorization: `Bearer ${sessionToken}` },
+      });
+      if (!response.ok) return [preview.id, { previewId: preview.id, status: "stopped" } satisfies PreviewShareSummary] as const;
+      const share = (await response.json().catch(() => null)) as PreviewShareSummary | null;
+      return [preview.id, share ?? { previewId: preview.id, status: "stopped" }] as const;
+    }));
+    setPreviewShares(Object.fromEntries(pairs));
   }
 
   function sourceForPreview(preview: PreviewSummary) {
@@ -182,6 +212,7 @@ export function PreviewsPage({
     const nextPreview = (await response.json()) as PreviewSummary;
     setPreviews((items) => (items ?? []).map((item) => item.id === nextPreview.id ? nextPreview : item));
     setDetailPreview((current) => current?.id === nextPreview.id ? nextPreview : current);
+    setPreviewShares((items) => ({ ...items, [preview.id]: { previewId: preview.id, status: "stopped" } }));
   }
 
   async function stopPreview(preview: PreviewSummary) {
@@ -213,6 +244,11 @@ export function PreviewsPage({
       return;
     }
     setPreviews((items) => (items ?? []).filter((item) => item.id !== preview.id));
+    setPreviewShares((items) => {
+      const next = { ...items };
+      delete next[preview.id];
+      return next;
+    });
   }
 
   async function renamePreview(preview: PreviewSummary) {
@@ -276,6 +312,64 @@ export function PreviewsPage({
     notify(copied ? t("action.copied") : t("settings.copyFailed"), copied ? "success" : "error");
   }
 
+  async function startPreviewShare(preview: PreviewSummary) {
+    setPreviewShares((items) => ({ ...items, [preview.id]: { ...(items[preview.id] ?? { previewId: preview.id }), status: "starting" } }));
+    const response = await fetch(`/api/previews/${preview.id}/share/start`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    const share = (await response.json().catch(() => null)) as PreviewShareSummary | null;
+    if (!response.ok || !share) {
+      const errorText = share?.error ? `：${share.error}` : "";
+      notify(`${t("preview.shareStartFailed")}${errorText}`, "error");
+      setPreviewShares((items) => ({ ...items, [preview.id]: { previewId: preview.id, status: "error", error: share?.error } }));
+      return;
+    }
+    setPreviewShares((items) => ({ ...items, [preview.id]: share }));
+    notify(share.publicUrl ? t("preview.shareStarted") : t("preview.shareStarting"), "success");
+  }
+
+  async function stopPreviewShare(preview: PreviewSummary) {
+    const response = await fetch(`/api/previews/${preview.id}/share/stop`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${sessionToken}` },
+    });
+    const share = (await response.json().catch(() => null)) as PreviewShareSummary | null;
+    if (!response.ok) {
+      notify(t("preview.shareStopFailed"), "error");
+      return;
+    }
+    setPreviewShares((items) => ({ ...items, [preview.id]: share ?? { previewId: preview.id, status: "stopped" } }));
+    notify(t("preview.shareStopped"), "success");
+  }
+
+  async function copyPreviewShareUrl(preview: PreviewSummary) {
+    const url = previewShares[preview.id]?.publicUrl;
+    if (!url) return;
+    const copied = await copyText(url);
+    notify(copied ? t("action.copied") : t("settings.copyFailed"), copied ? "success" : "error");
+  }
+
+  async function openPreviewShare(preview: PreviewSummary) {
+    const share = previewShares[preview.id];
+    if (!share?.publicUrl) return;
+    if (preview.access !== "private") {
+      window.open(share.publicUrl, "_blank", "noopener,noreferrer");
+      return;
+    }
+    const response = await fetch(`/api/previews/${preview.id}/share/grant`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${sessionToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ returnTo: "/" }),
+    });
+    const result = (await response.json().catch(() => null)) as { url?: string; error?: string } | null;
+    if (!response.ok || !result?.url) {
+      notify(result?.error ? `${t("preview.shareGrantFailed")}：${result.error}` : t("preview.shareGrantFailed"), "error");
+      return;
+    }
+    window.open(result.url, "_blank", "noopener,noreferrer");
+  }
+
   async function updatePreviewAccess(preview: PreviewSummary, access: PreviewAccess) {
     const response = await fetch(`/api/previews/${preview.id}/access`, {
       method: "PUT",
@@ -317,14 +411,17 @@ export function PreviewsPage({
       <section className="preview-list preview-list-full">
         {message && <div className="subtle">{message}</div>}
           {!previews && <div className="subtle">{t("project.loadingPreviews")}</div>}
-          {previews?.map((preview) => (
+          {previews?.map((preview) => {
+            const share = previewShares[preview.id];
+            return (
             <article className="preview-item" key={preview.id}>
               <div className="preview-item-main">
                 <strong>{preview.label}</strong>
-                <span>{sourceForPreview(preview)} · {preview.access}</span>
+                <span>{sourceForPreview(preview)} · {preview.access}{share?.publicUrl ? ` · ${share.publicUrl}` : share?.status === "starting" ? ` · ${t("preview.shareStarting")}` : ""}</span>
               </div>
               <div className="preview-item-signal">
                 <span className={`preview-status ${preview.status}`}>{preview.status}</span>
+                {share && share.status !== "stopped" && <span className={`preview-status ${share.status}`}>{share.status}</span>}
                 <code>{preview.port}</code>
               </div>
               <button className="ghost-button icon-only" type="button" title={t("preview.details")} aria-label={t("preview.details")} onClick={() => setDetailPreview(preview)}><IconText icon={Info}>{t("preview.details")}</IconText></button>
@@ -334,6 +431,10 @@ export function PreviewsPage({
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
                   <DropdownMenuItem disabled={preview.status !== "running"} onSelect={() => void openPreviewUrl(preview, sessionToken, notify, t)}><IconText icon={Globe}>{t("project.openPreview")}</IconText></DropdownMenuItem>
+                  <DropdownMenuItem disabled={preview.status !== "running" || share?.status === "starting" || share?.status === "running"} onSelect={() => void startPreviewShare(preview)}><IconText icon={Share2}>{t("preview.startShare")}</IconText></DropdownMenuItem>
+                  <DropdownMenuItem disabled={!share?.publicUrl} onSelect={() => void openPreviewShare(preview)}><IconText icon={ExternalLink}>{t("preview.openShare")}</IconText></DropdownMenuItem>
+                  <DropdownMenuItem disabled={!share?.publicUrl} onSelect={() => void copyPreviewShareUrl(preview)}><IconText icon={Copy}>{t("preview.copyShareUrl")}</IconText></DropdownMenuItem>
+                  <DropdownMenuItem disabled={!share || share.status === "stopped"} onSelect={() => void stopPreviewShare(preview)}><IconText icon={Square}>{t("preview.stopShare")}</IconText></DropdownMenuItem>
                   <DropdownMenuItem onSelect={() => void renamePreview(preview)}><IconText icon={Pencil}>{t("action.rename")}</IconText></DropdownMenuItem>
                   <DropdownMenuItem onSelect={() => void editPreviewProxyPaths(preview)}><IconText icon={Globe}>{t("preview.proxyPaths")}</IconText></DropdownMenuItem>
                   <DropdownMenuItem onSelect={() => void copyPreviewUrl(preview)}><IconText icon={Copy}>{t("action.copy")}</IconText></DropdownMenuItem>
@@ -347,7 +448,8 @@ export function PreviewsPage({
                 </DropdownMenuContent>
               </DropdownMenu>
             </article>
-          ))}
+            );
+          })}
           {previewHasMore && <button className="ghost-button load-more" type="button" onClick={() => void loadPreviews(true)}>{t("session.loadMore")}</button>}
           {previews && !previews.length && <div className="empty-state">{t("project.noPreviews")}</div>}
       </section>
@@ -366,6 +468,7 @@ export function PreviewsPage({
             <PreviewDetailRow label={t("preview.access")} value={detailPreview.access} />
             <PreviewDetailRow label={t("preview.port")} value={String(detailPreview.port)} />
             <PreviewDetailRow label={t("preview.url")} value={`${window.location.origin}${detailPreview.url}`} />
+            <PreviewDetailRow label={t("preview.shareUrl")} value={previewShares[detailPreview.id]?.publicUrl ?? "-"} />
             <PreviewDetailRow label={t("project.previewCommand")} value={detailPreview.command ?? "-"} />
             <PreviewDetailRow label={t("project.previewDirectory")} value={detailPreview.cwd ?? "-"} />
             <PreviewDetailRow label={t("preview.target")} value={`${detailPreview.targetHost}:${detailPreview.port}`} />

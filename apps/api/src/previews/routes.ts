@@ -15,6 +15,15 @@ import type {
 import { decodePageCursor, pageFromRows, parsePageLimit } from "../pagination.js";
 
 type PreviewRecord = Omit<PreviewSummary, "url"> & { token: string };
+type PreviewShareSummary = {
+  previewId: string;
+  status: "starting" | "running" | "stopped" | "error";
+  publicUrl?: string;
+  gatewayPort?: number;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+};
 type PreviewLogEvent =
   | { type: "snapshot"; preview: PreviewSummary; logs: string }
   | { type: "log"; previewId: string; chunk: string; at: string }
@@ -40,6 +49,10 @@ type PreviewRoutesDeps = {
   publicPreview: (preview: PreviewRecord) => PreviewSummary;
   markPreviewRunningIfReachable: (preview: PreviewRecord) => Promise<PreviewRecord | null>;
   startPreviewProcess: (preview: PreviewRecord) => Promise<PreviewRecord>;
+  createPreviewShareGrantUrl: (preview: PreviewRecord, returnTo?: string) => string;
+  getPreviewShare: (previewId: string) => PreviewShareSummary | null;
+  startPreviewShare: (preview: PreviewRecord) => Promise<PreviewShareSummary>;
+  stopPreviewShare: (previewId: string) => PreviewShareSummary | null;
   stopPreviewProcess: (previewId: string) => void;
   subscribePreviewLogEvents: (previewId: string, subscriber: (event: PreviewLogEvent) => void) => () => void;
   updatePreview: (preview: PreviewRecord) => void;
@@ -232,6 +245,39 @@ export function registerPreviewRoutes(app: Hono, deps: PreviewRoutesDeps) {
     }
   });
 
+  app.get("/api/previews/:id/share", (c) => {
+    const preview = deps.previews.get(c.req.param("id"));
+    if (!preview) return c.json({ error: "preview_not_found" }, 404);
+    return c.json(deps.getPreviewShare(preview.id) ?? { previewId: preview.id, status: "stopped" });
+  });
+
+  app.post("/api/previews/:id/share/start", async (c) => {
+    const preview = deps.previews.get(c.req.param("id"));
+    if (!preview) return c.json({ error: "preview_not_found" }, 404);
+    const detected = await deps.markPreviewRunningIfReachable(preview);
+    const current = detected ?? preview;
+    if (current.status !== "running") return c.json({ error: "preview_not_running" }, 409);
+    const share = await deps.startPreviewShare(current);
+    return c.json(share, share.status === "error" ? 500 : 200);
+  });
+
+  app.post("/api/previews/:id/share/stop", (c) => {
+    const preview = deps.previews.get(c.req.param("id"));
+    if (!preview) return c.json({ error: "preview_not_found" }, 404);
+    return c.json(deps.stopPreviewShare(preview.id) ?? { previewId: preview.id, status: "stopped" });
+  });
+
+  app.post("/api/previews/:id/share/grant", async (c) => {
+    const preview = deps.previews.get(c.req.param("id"));
+    if (!preview) return c.json({ error: "preview_not_found" }, 404);
+    const body = await c.req.json<{ returnTo?: string }>().catch(() => null);
+    try {
+      return c.json({ url: deps.createPreviewShareGrantUrl(preview, body?.returnTo) });
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : "preview_share_grant_failed" }, 409);
+    }
+  });
+
   app.post("/api/previews/:id/access", (c) => {
     const preview = deps.previews.get(c.req.param("id"));
     if (!preview) return c.json({ error: "preview_not_found" }, 404);
@@ -268,6 +314,7 @@ export function registerPreviewRoutes(app: Hono, deps: PreviewRoutesDeps) {
   app.post("/api/previews/:id/stop", (c) => {
     const preview = deps.previews.get(c.req.param("id"));
     if (!preview) return c.json({ error: "preview_not_found" }, 404);
+    deps.stopPreviewShare(preview.id);
     deps.stopPreviewProcess(preview.id);
     preview.status = "stopped";
     deps.updatePreview(preview);
@@ -277,6 +324,7 @@ export function registerPreviewRoutes(app: Hono, deps: PreviewRoutesDeps) {
   app.delete("/api/previews/:id", (c) => {
     const preview = deps.previews.get(c.req.param("id"));
     if (!preview) return c.json({ error: "preview_not_found" }, 404);
+    deps.stopPreviewShare(preview.id);
     deps.deletePreview(preview.id);
     return c.json({ ok: true });
   });

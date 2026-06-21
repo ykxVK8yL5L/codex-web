@@ -1,6 +1,7 @@
 pub(crate) mod events;
 pub(crate) mod models;
 pub(crate) mod runtime;
+pub(crate) mod shares;
 pub(crate) mod store;
 
 use axum::{
@@ -21,6 +22,10 @@ pub fn router() -> Router<AppState> {
         .route("/:id/access", post(grant_access).put(update_access))
         .route("/:id/logs", get(logs))
         .route("/:id/logs/events", get(logs_events))
+        .route("/:id/share", get(share))
+        .route("/:id/share/start", post(start_share))
+        .route("/:id/share/stop", post(stop_share))
+        .route("/:id/share/grant", post(share_grant))
         .route("/:id/start", post(start))
         .route("/:id/stop", post(stop))
         .route("/:id", patch(update).delete(remove))
@@ -224,6 +229,7 @@ async fn stop(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<models::PreviewSummary>, (StatusCode, Json<serde_json::Value>)> {
+    let _ = shares::stop(&state, &id);
     runtime::stop(&state, &id)
         .map_err(api_error)?
         .map(|preview| Json(preview.public()))
@@ -237,12 +243,80 @@ async fn remove(
     if store::get(&state.db, &id).map_err(api_error)?.is_none() {
         return Err(error(StatusCode::NOT_FOUND, "preview_not_found"));
     }
+    let _ = shares::stop(&state, &id);
     let _ = runtime::stop(&state, &id).map_err(api_error)?;
     if store::delete(&state.db, &id).map_err(api_error)? {
         Ok(Json(models::PreviewDeleteResponse { ok: true }))
     } else {
         Err(error(StatusCode::NOT_FOUND, "preview_not_found"))
     }
+}
+
+async fn share(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if store::get(&state.db, &id).map_err(api_error)?.is_none() {
+        return Err(error(StatusCode::NOT_FOUND, "preview_not_found"));
+    }
+    let share =
+        shares::get(&state, &id).unwrap_or_else(|| shares::PreviewShareSummary::stopped(id));
+    Ok(Json(
+        serde_json::to_value(share).unwrap_or_else(|_| serde_json::json!({})),
+    ))
+}
+
+async fn start_share(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    let Some(preview) = store::get(&state.db, &id).map_err(api_error)? else {
+        return Err(error(StatusCode::NOT_FOUND, "preview_not_found"));
+    };
+    let detected = runtime::mark_running_if_reachable(&state, &preview)
+        .await
+        .map_err(preview_error)?;
+    let current = detected.unwrap_or(preview);
+    if current.status != "running" {
+        return Err(error(StatusCode::CONFLICT, "preview_not_running"));
+    }
+    let share = shares::start(state, current).await.map_err(api_error)?;
+    let status = if share.status == "error" {
+        StatusCode::INTERNAL_SERVER_ERROR
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(serde_json::to_value(share).unwrap_or_else(|_| serde_json::json!({}))),
+    ))
+}
+
+async fn stop_share(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if store::get(&state.db, &id).map_err(api_error)?.is_none() {
+        return Err(error(StatusCode::NOT_FOUND, "preview_not_found"));
+    }
+    let share =
+        shares::stop(&state, &id).unwrap_or_else(|| shares::PreviewShareSummary::stopped(id));
+    Ok(Json(
+        serde_json::to_value(share).unwrap_or_else(|_| serde_json::json!({})),
+    ))
+}
+
+async fn share_grant(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<shares::CreateShareGrantRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(preview) = store::get(&state.db, &id).map_err(api_error)? else {
+        return Err(error(StatusCode::NOT_FOUND, "preview_not_found"));
+    };
+    shares::create_grant_url(&state, &preview, body.return_to)
+        .map(|url| Json(serde_json::json!({ "url": url })))
+        .map_err(|err| error(StatusCode::CONFLICT, err.to_string()))
 }
 
 fn preview_command_risk(preview: &models::PreviewRecord) -> Option<&'static str> {

@@ -428,6 +428,7 @@ import { cleanupTokenUsageRecords, ensureTokenUsageSchema, readCodexUsage, recor
 import { createPreviewAccessService } from "./previews/access.js";
 import { createPreviewLogEventBus } from "./previews/events.js";
 import { createPreviewProcessRuntime } from "./previews/processes.js";
+import { createPreviewShareRuntime } from "./previews/shares.js";
 import { registerProjectRoutes } from "./projects/routes.js";
 import { createProjectGitRuntime } from "./projects/git-runtime.js";
 import { createRoomRuntimeService } from "./rooms/runtime.js";
@@ -1320,6 +1321,21 @@ const {
   validPreviewHost,
   waitForPreviewReady,
 } = previewProcessRuntime;
+const previewShareRuntime = createPreviewShareRuntime({
+  appendPreviewLog,
+  createPreviewAccessRequest,
+  expirePreviewAccessRequests,
+  getPreviewAccessRequest,
+  previewAccessCookie,
+  previews,
+  requestHasPreviewAccess,
+});
+const {
+  createPreviewShareGrantUrl,
+  getPreviewShare,
+  startPreviewShare,
+  stopPreviewShare,
+} = previewShareRuntime;
 const roomRuntimeService = createRoomRuntimeService({
   agentFromRow,
   agentPermissionsForRun: resolvedAgentPermissions,
@@ -1908,7 +1924,11 @@ const previewRouteDeps = {
   publicApproval,
   publicPreview,
   markPreviewRunningIfReachable,
+  createPreviewShareGrantUrl,
+  getPreviewShare,
   startPreviewProcess,
+  startPreviewShare,
+  stopPreviewShare,
   stopPreviewProcess,
   subscribePreviewLogEvents,
   updatePreview,

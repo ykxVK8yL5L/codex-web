@@ -209,6 +209,7 @@ impl Default for RoomRuntimeState {
 #[derive(Clone)]
 pub struct PreviewRuntimeState {
     previews: Arc<Mutex<HashMap<String, PreviewHandle>>>,
+    shares: Arc<Mutex<HashMap<String, crate::api::previews::shares::PreviewShareHandle>>>,
     events: Arc<Mutex<HashMap<String, broadcast::Sender<serde_json::Value>>>>,
 }
 
@@ -216,6 +217,7 @@ impl Default for PreviewRuntimeState {
     fn default() -> Self {
         Self {
             previews: Arc::new(Mutex::new(HashMap::new())),
+            shares: Arc::new(Mutex::new(HashMap::new())),
             events: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -325,6 +327,26 @@ impl PreviewRuntimeState {
 
     pub fn remove(&self, preview_id: &str) -> Option<PreviewHandle> {
         self.previews.lock().ok()?.remove(preview_id)
+    }
+
+    pub fn get_share(
+        &self,
+        preview_id: &str,
+    ) -> Option<crate::api::previews::shares::PreviewShareHandle> {
+        self.shares.lock().ok()?.get(preview_id).cloned()
+    }
+
+    pub fn insert_share(&self, handle: crate::api::previews::shares::PreviewShareHandle) {
+        if let Ok(mut shares) = self.shares.lock() {
+            shares.insert(handle.preview_id.clone(), handle);
+        }
+    }
+
+    pub fn remove_share(
+        &self,
+        preview_id: &str,
+    ) -> Option<crate::api::previews::shares::PreviewShareHandle> {
+        self.shares.lock().ok()?.remove(preview_id)
     }
 
     pub fn publish_event(&self, preview_id: &str, event: serde_json::Value) {
