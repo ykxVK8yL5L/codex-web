@@ -118,6 +118,10 @@ export function createPreviewShareRuntime(deps: PreviewShareRuntimeDeps) {
         record.tunnel = undefined;
         if (record.status === "stopped") return;
         record.status = code === 0 ? "stopped" : "error";
+        if (record.status === "stopped") {
+          record.publicUrl = undefined;
+          record.gatewayPort = undefined;
+        }
         record.error = code === 0 ? undefined : `cftunnel exited with ${code ?? "null"}`;
         record.updatedAt = new Date().toISOString();
         appendPreviewLog(preview.id, `[share exit] ${code ?? "null"}\n`);
@@ -138,6 +142,9 @@ export function createPreviewShareRuntime(deps: PreviewShareRuntimeDeps) {
     const record = shares.get(previewId);
     if (!record) return null;
     record.status = "stopped";
+    record.publicUrl = undefined;
+    record.gatewayPort = undefined;
+    record.error = undefined;
     record.updatedAt = new Date().toISOString();
     killTunnel(record.tunnel);
     closeGateway(record);

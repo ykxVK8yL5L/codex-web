@@ -195,7 +195,7 @@ pub async fn start(state: AppState, preview: PreviewRecord) -> anyhow::Result<Pr
 
 pub fn stop(state: &AppState, preview_id: &str) -> Option<PreviewShareSummary> {
     let handle = state.previews.remove_share(preview_id)?;
-    update_summary(&handle.summary, "stopped", None, None);
+    clear_stopped_summary(&handle.summary);
     let _ = handle.stop.send(());
     if let Ok(Some(preview)) = store::get(&state.db, preview_id) {
         append_share_log(state, &preview, "[share] stopped\n");
@@ -593,7 +593,7 @@ fn spawn_cftunnel(
             return;
         }
         if exit_code == Some(0) {
-            update_summary(&summary, "stopped", None, None);
+            clear_stopped_summary(&summary);
         } else {
             update_summary(
                 &summary,
@@ -711,6 +711,16 @@ fn update_summary(
             summary.public_url = public_url;
         }
         summary.error = error;
+        summary.updated_at = crate::api::common::timestamp();
+    }
+}
+
+fn clear_stopped_summary(summary: &Arc<Mutex<PreviewShareSummary>>) {
+    if let Ok(mut summary) = summary.lock() {
+        summary.status = "stopped".to_string();
+        summary.public_url = None;
+        summary.gateway_port = None;
+        summary.error = None;
         summary.updated_at = crate::api::common::timestamp();
     }
 }
